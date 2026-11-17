@@ -7,6 +7,7 @@ export class UserMessage extends Text {
     this.update(item);
   }
   update(item: ConversationItem) {
-    this.setText(theme.user(sanitizeDisplayText(item.text)));
+    // 被摘要替代的 Prompt 淡化：仍在审计历史中，但不再是上下文原文。
+    this.setText((item.compacted ? theme.muted : theme.user)(sanitizeDisplayText(item.text)));
   }
 }

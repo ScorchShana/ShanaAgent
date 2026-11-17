@@ -173,6 +173,31 @@ describe("V12 priorContent 快照", () => {
     expect(loaded.records[2]).toEqual(appended);
   });
 
+  it("新建文件的空串快照追加后可原样读回", async () => {
+    const { store } = makeStore({ now: fixedNow() });
+    const ref = sessionRef("s-prior-empty");
+    await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: "s-prior-empty" });
+    await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
+    await store.appendRecord(ref, {
+      type: "assistant_message",
+      runId: "run-1",
+      message: makeAssistantMessage([{ id: "c1", name: "write" }]),
+    });
+    const appended = await store.appendRecord(ref, {
+      type: "tool_result",
+      assistantRecordSeq: 2,
+      runId: "run-1",
+      toolCallId: "c1",
+      toolName: "write",
+      status: "success",
+      content: "ok",
+      priorContent: "",
+    });
+    expect(appended.priorContent).toBe("");
+    const loaded = await store.loadSession(ref);
+    expect(loaded.records[2]).toEqual(appended);
+  });
+
   it("持锁重新打开原 Session 保留 priorContent", async () => {
     const { store } = makeStore({ now: fixedNow() });
     const source = sessionRef("s-prior-src");

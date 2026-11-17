@@ -1,5 +1,6 @@
 import {
-  isTurnComplete,
+  isTurnContextComplete,
+  normalizeAbortedMessage,
   toolCallsOfMessage,
   type AssistantMessageRecord,
   type CheckpointRecord,
@@ -52,7 +53,8 @@ export function responseExclusionReason(assistant: AssistantMessageRecord): Resp
   if (
     assistant.message.stopReason !== "toolUse" &&
     assistant.message.stopReason !== "stop" &&
-    assistant.message.stopReason !== "length"
+    assistant.message.stopReason !== "length" &&
+    assistant.message.stopReason !== "aborted"
   ) {
     return "incomplete_response";
   }
@@ -71,10 +73,14 @@ export function findUnknownSideEffects(records: readonly SessionRecord[]): Unkno
     }));
 
   for (const assistant of records.filter(isAssistant)) {
-    if (assistant.message.stopReason !== "toolUse" && assistant.message.stopReason !== "stop") continue;
-    const calls = toolCallsOfMessage(assistant.message);
+    const stop = assistant.message.stopReason;
+    if (stop !== "toolUse" && stop !== "stop" && stop !== "aborted") continue;
+    // aborted 的可配对 call 均会合成 not_executed 结果；缺结果即崩溃窗口，需门控（不论 parse 是否完整）。
+    const message = stop === "aborted" ? normalizeAbortedMessage(assistant.message) : assistant.message;
+    const calls = toolCallsOfMessage(message);
     for (const call of calls) {
-      if (call.parse.status !== "parsed" || !call.id || !call.name) continue;
+      if (!call.id || !call.name) continue;
+      if (stop !== "aborted" && call.parse.status !== "parsed") continue;
       const hasResult = results.some(
         (result) =>
           result.assistantRecordSeq === assistant.recordSeq &&
@@ -132,7 +138,7 @@ function assertCheckpointValid(records: readonly SessionRecord[], checkpoint: Ch
     if (record.recordSeq > coveredUpTo) break;
     if (record.type === "user_prompt") blocked = false;
     if (record.type !== "assistant_message") continue;
-    if (!isTurnComplete(record, toolResults)) blocked = true;
+    if (!isTurnContextComplete(record, toolResults)) blocked = true;
     if (!blocked) eligible.add(record.recordSeq);
   }
 
@@ -163,7 +169,26 @@ function assertCheckpointValid(records: readonly SessionRecord[], checkpoint: Ch
   }
 
   if (boundary.type === "assistant_message") {
-    if (!eligible.has(boundary.recordSeq) || toolCallsOfMessage(boundary.message).length > 0) {
+    if (!eligible.has(boundary.recordSeq)) {
+      throw new CheckpointInvalidError(checkpoint, `边界 Turn 不完整 #${coveredUpTo}`);
+    }
+    const message =
+      boundary.message.stopReason === "aborted"
+        ? normalizeAbortedMessage(boundary.message)
+        : boundary.message;
+    const calls = toolCallsOfMessage(message);
+    if (calls.length === 0) return;
+    // 纯缺结果 Turn（崩溃窗口）可作边界：Run 已死且不重放，结果永不再现，上下文按 unknown 占位合成。
+    // 任一 call 已有结果（含 unknown）时边界必须落在最后一条 tool_result，否则覆盖在 Turn 中途结束。
+    const callIds = new Set(calls.map((call) => call.id));
+    const hasAnyResult = records.some(
+      (record) =>
+        record.type === "tool_result" &&
+        record.assistantRecordSeq === boundary.recordSeq &&
+        record.runId === boundary.runId &&
+        callIds.has(record.toolCallId),
+    );
+    if (hasAnyResult) {
       throw new CheckpointInvalidError(
         checkpoint,
         `边界是含工具调用的 assistant_message #${coveredUpTo}，Turn 未结束`,

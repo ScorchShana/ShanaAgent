@@ -20,6 +20,7 @@ ShanaAgent 是单 Agent、仅 TUI 的本地编码代理：TypeScript · Node.js 
 - **架构红线**：Core 禁止依赖 TUI（含内置框架）；状态变更只归 `SessionController`；`run.finished` 每 Run 恰一次。不变量 I1–I9 与已确认设计决策以架构正文为准，重新打开、变通或修改必须经用户同意。
 - SDK（pi-ai）无法满足架构承诺时，回到架构层修订并告知用户；**禁止在 Provider Adapter 里静默兜底**。
 - **诚实性**：不捏造文件、工具执行结果、模型响应、测试通过或成功状态；未用真实 Provider 验证的能力一律标记"未验证"。凭据仅 `~/.shana/model.json` 明文 `apiKey` 一种方式；配置展示、Provider 错误与诊断日志须脱敏，诊断日志永不包含 API Key；工具调用参数保留原文。诊断日志只写 `~/.shana/logs/`，与 Session JSONL 物理分离。
+- 所有提交的文件里面不能有任何有关本机和api的信息
 
 ## 4. 代码风格与测试
 

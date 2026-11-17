@@ -3,6 +3,12 @@ import { SessionController, type CompactionDriver } from "../../src/core/session
 import type { CompactionOutcome } from "../../src/sessions/compaction-store.js";
 import { parseSettings } from "../../src/llm/settings-store.js";
 import { TuiStore } from "../../src/tui/store.js";
+import {
+  INTERRUPTED_RESPONSE_ANNOTATION,
+  CANCELLED_REQUEST_ANNOTATION,
+  FAILED_REQUEST_ANNOTATION,
+  UNKNOWN_RESULT_ANNOTATION,
+} from "../../src/core/context-builder.js";
 import { UnknownSideEffectsError } from "../../src/sessions/recovery.js";
 import type { SessionRecord } from "../../src/sessions/records.js";
 import { makeAssistantMessage } from "../sessions/helpers.js";
@@ -841,7 +847,8 @@ it("does not mark the in-flight turn as excluded while its tool awaits a result"
     release();
     await run;
     await vi.waitFor(() => expect(store.getSnapshot().core.status.kind).toBe("idle"));
-    expect(store.items().some((item) => item.role === "failure")).toBe(true);
+    // 缺结果 Turn 受控进入上下文（合成 unknown 占位），idle 后也不再标 failure。
+    expect(store.items().some((item) => item.role === "failure")).toBe(false);
   } finally {
     release();
     await store.dispose();
@@ -908,7 +915,7 @@ it("places a failed retry before its own Turn rather than after later Turn tools
   }
 });
 
-it("removes cancelled attempts while keeping retry failures and showing the cancel marker", async () => {
+it("keeps cancelled partial as a persisted aborted Turn with retry failures and cancel marker", async () => {
   const records: SessionRecord[] = [];
   const core = controller(async (handle, signal) => {
     handle.beginAttempt(1, 1);
@@ -935,9 +942,17 @@ it("removes cancelled attempts while keeping retry failures and showing the canc
     await run;
     await vi.waitFor(() => expect(store.getSnapshot().core.status.kind).toBe("idle"));
     const last = core.getSnapshot().lastRun!;
+    // 真实流程会把半截响应落盘为 aborted Turn；此处模拟该持久化结果。
+    records.push({
+      type: "assistant_message",
+      recordSeq: 1,
+      ts: "now",
+      runId: last.runId,
+      message: makeAssistantMessage([], "partial answer", { stopReason: "aborted" }),
+    });
     records.push({
       type: "run_finished",
-      recordSeq: 1,
+      recordSeq: 2,
       ts: "now",
       runId: last.runId,
       outcome: last.outcome,
@@ -946,10 +961,187 @@ it("removes cancelled attempts while keeping retry failures and showing the canc
     });
     await store.refreshHistory();
     const items = store.items();
-    expect(items.some((item) => item.text === "partial answer")).toBe(false);
+    // 半截响应保留为持久化 aborted 项（cancelled streaming attempt 去重，不重复）。
+    const partials = items.filter((item) => item.text === "partial answer");
+    expect(partials).toHaveLength(1);
+    expect(partials[0]).toMatchObject({ role: "assistant", cancelled: true });
+    expect(items.some((item) => item.text === INTERRUPTED_RESPONSE_ANNOTATION)).toBe(true);
     expect(items.find((item) => item.text === "retry fragment")).toMatchObject({ failed: true });
     expect(items.filter((item) => item.text === "✗ 已取消")).toHaveLength(1);
     expect(items.find((item) => item.text === "✗ 已取消")).toMatchObject({ cancelled: true });
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("shows the cancelled-request annotation for a zero-turn cancelled Run", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 2, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
+      { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    expect(items.find((item) => item.text === "task")).toMatchObject({ role: "user" });
+    expect(items.some((item) => item.text === CANCELLED_REQUEST_ANNOTATION)).toBe(true);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("shows the failed-request annotation for a zero-turn failed Run", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 2, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
+      { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "failed", persisted: true },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    expect(items.find((item) => item.text === "task")).toMatchObject({ role: "user" });
+    expect(items.some((item) => item.text === FAILED_REQUEST_ANNOTATION)).toBe(true);
+    expect(items.some((item) => item.role === "failure" && item.text === "此轮未进入有效上下文")).toBe(false);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("shows unknown annotations and synthetic placeholders isomorphic to the model context", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 2, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
+      {
+        type: "assistant_message",
+        recordSeq: 2,
+        ts: "now",
+        runId: "r1",
+        message: makeAssistantMessage([{ id: "u", name: "bash", arguments: { command: "x" } }], "", {
+          stopReason: "toolUse",
+        }),
+      },
+      {
+        type: "tool_result",
+        recordSeq: 3,
+        ts: "now",
+        runId: "r1",
+        assistantRecordSeq: 2,
+        toolCallId: "u",
+        toolName: "bash",
+        status: "unknown",
+        content: "Error: termination unconfirmed",
+      },
+      { type: "run_finished", recordSeq: 4, ts: "now", runId: "r1", outcome: "failed", persisted: true },
+      { type: "user_prompt", recordSeq: 5, ts: "now", runId: "r2", text: "retry" },
+      {
+        type: "assistant_message",
+        recordSeq: 6,
+        ts: "now",
+        runId: "r2",
+        message: makeAssistantMessage([{ id: "m", name: "bash", arguments: { command: "y" } }], "", {
+          stopReason: "toolUse",
+        }),
+      },
+      // 崩溃窗口：m 无结果记录。
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    // 真实 unknown 结果原文展示；缺结果 call 展示合成占位标记。
+    expect(items.find((item) => item.id === "tool-2-u")).toMatchObject({
+      syntheticUnknown: false,
+      result: { status: "unknown" },
+    });
+    expect(items.find((item) => item.id === "tool-6-m")).toMatchObject({ syntheticUnknown: true });
+    expect(items.find((item) => item.id === "tool-6-m")?.result).toBeUndefined();
+    expect(items.filter((item) => item.text === UNKNOWN_RESULT_ANNOTATION)).toHaveLength(2);
+    // 受控进入的 Turn 不再标"未进入有效上下文"。
+    expect(items.some((item) => item.text === "此轮未进入有效上下文")).toBe(false);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("dims tool cards of excluded turns (G2)", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 2, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
+      {
+        type: "assistant_message",
+        recordSeq: 2,
+        ts: "now",
+        runId: "r1",
+        message: makeAssistantMessage([{ id: "x", name: "read", arguments: { path: "a" } }], "", {
+          stopReason: "error",
+        }),
+      },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    expect(items.find((item) => item.id === "tool-2-x")).toMatchObject({ failed: true });
+    expect(items.some((item) => item.text === "此轮未进入有效上下文")).toBe(true);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("dims records covered by the checkpoint summary and keeps the tail verbatim (G3/G9)", async () => {
+  const { records, core } = compactionFixture(async () => ({
+    status: "noop",
+    coveredUpTo: null,
+    path: "primary",
+  }));
+  records.push(
+    checkpointRecord(3, 2),
+    { type: "user_prompt", recordSeq: 4, ts: "now", runId: "r2", text: "new task" },
+    {
+      type: "assistant_message",
+      recordSeq: 5,
+      ts: "now",
+      runId: "r2",
+      message: makeAssistantMessage([], "retained answer"),
+    },
+  );
+  const store = await loadedStore(core);
+  try {
+    const items = store.items();
+    expect(items.find((item) => item.id === "prompt-1")).toMatchObject({ compacted: true });
+    expect(items.find((item) => item.id === "assistant-2")).toMatchObject({ compacted: true });
+    const separator = items.find((item) => item.role === "compaction");
+    expect(separator).toMatchObject({ id: "compaction-3", text: "以上历史已由摘要替代", summary: "SUMMARY" });
+    expect(items.find((item) => item.id === "prompt-4")?.compacted).toBeFalsy();
+    expect(items.find((item) => item.id === "assistant-5")?.compacted).toBeFalsy();
+    // 摘要默认折叠，点击分隔线展开/再折叠（复用 expanded 机制）。
+    expect(store.getSnapshot().expanded.has("compaction-3")).toBe(false);
+    store.toggle("compaction-3");
+    expect(store.getSnapshot().expanded.has("compaction-3")).toBe(true);
+    store.toggle("compaction-3");
+    expect(store.getSnapshot().expanded.has("compaction-3")).toBe(false);
   } finally {
     await store.dispose();
   }
@@ -1076,7 +1268,8 @@ it("enables /compact when idle and derives the separator after the covered block
     const items = store.items();
     const separators = items.filter((item) => item.role === "compaction");
     expect(separators).toHaveLength(1);
-    expect(separators[0]).toMatchObject({ id: "compaction-3", text: "compacted" });
+    expect(separators[0]).toMatchObject({ id: "compaction-3", text: "以上历史已由摘要替代" });
+    expect(separators[0]?.summary).toBeTruthy();
     expect(items[items.indexOf(separators[0]!) - 1]).toMatchObject({ id: "assistant-2" });
     expect(items.some((item) => item.id === "prompt-1")).toBe(true);
     expect(items.some((item) => item.id === "assistant-2")).toBe(true);
@@ -1260,7 +1453,9 @@ it("shows a live compacting separator and replaces it with the checkpoint-derive
     records.push(checkpointRecord(3, 2));
     finish({ status: "completed", coveredUpTo: 2, path: "primary" });
     await pending;
-    await vi.waitFor(() => expect(store.items().some((item) => item.text === "compacted")).toBe(true));
+    await vi.waitFor(() =>
+      expect(store.items().some((item) => item.text === "以上历史已由摘要替代")).toBe(true),
+    );
     expect(store.items().some((item) => item.text === "compacting")).toBe(false);
     expect(store.items().filter((item) => item.role === "compaction")).toHaveLength(1);
   } finally {

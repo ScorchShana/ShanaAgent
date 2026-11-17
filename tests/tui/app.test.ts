@@ -404,7 +404,6 @@ it.each(["missing", "failure"])("keeps approval controls reachable after delayed
     let frame = (await test.terminal.flushAndGetViewport()).join("\n");
     expect(frame).toContain("loading draft");
     expect(frame).toContain("\u5141\u8bb8\u4e00\u6b21");
-    test.store.toggle("fixture-tool");
     release(Object.assign(new Error("preview probe"), { code: outcome === "missing" ? "ENOENT" : "EACCES" }));
     await vi.waitFor(async () => {
       frame = (await test.terminal.flushAndGetViewport()).join("\n");
@@ -511,17 +510,20 @@ it("keeps a newer approval and its selected action when an effort save finishes"
   }
 });
 
-it.each([24,40])("locates an approval once and permits clicking without changing authorization at height %s", async height => {
+it.each([24,40])("auto-expands an approval once and lets clicking take over without changing authorization at height %s", async height => {
  const test=setup(true); const run=test.core.submitPrompt("approve");
  try {
    test.terminal.resize(80,height);
    await vi.waitFor(()=>expect(test.store.getSnapshot().modal?.kind).toBe("approval"));
+   await vi.waitFor(()=>expect(test.store.getSnapshot().expanded.has("fixture-tool")).toBe(true));
    const reveal=vi.spyOn(test.app.scroll,"reveal");
    let frame=await test.terminal.flushAndGetViewport();
    const row=frame.findIndex(line=>line.includes("Waiting for permission")); expect(row).toBeGreaterThanOrEqual(0);
    test.terminal.sendInput(`\x1b[<0;3;${row+1}M`); test.terminal.sendInput(`\x1b[<0;3;${row+1}m`);
-   await vi.waitFor(()=>expect(test.store.getSnapshot().expanded.has("fixture-tool")).toBe(true));
+   await vi.waitFor(()=>expect(test.store.getSnapshot().expanded.has("fixture-tool")).toBe(false));
    expect(test.store.getSnapshot().modal).toMatchObject({kind:"approval",selection:0});
+   test.app.update();
+   expect(test.store.getSnapshot().expanded.has("fixture-tool")).toBe(false);
    test.terminal.sendInput("\x1b[B");
    test.terminal.sendInput("\x0c");
    expect(reveal).toHaveBeenCalledOnce();

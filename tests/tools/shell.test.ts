@@ -225,6 +225,8 @@ describe("V8 Shell 取消", () => {
     expect(result.errorCategory).toBe("cancelled");
     expect(result.termination).toEqual({ trigger: "cancelled", kill: "terminated" });
     expect(result.content).toContain("process termination confirmed");
+    expect(result.content).toContain("partially executed");
+    expect(result.content).toContain("Verify its effects");
     expect(result.content).toContain("working");
     expect(fake.terminationCalls).toHaveLength(1);
     expect(fake.terminationCalls[0].confirmTimeoutMs).toBe(SHELL_KILL_CONFIRM_TIMEOUT_MS);

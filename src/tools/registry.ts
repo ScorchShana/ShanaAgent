@@ -73,7 +73,7 @@ export interface ToolOutcome {
   content: string;
   category?: ToolOutcomeCategory;
   termination?: TerminationDetails;
-  // write/edit 写入前旧文件全量快照，仅供 tool_result.priorContent，不进入模型可见 content
+  // write/edit 写入前旧文件全量快照（新建文件为空串），仅供 tool_result.priorContent，不进入模型可见 content
   priorContent?: string;
 }
 

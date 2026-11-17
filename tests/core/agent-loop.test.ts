@@ -1,7 +1,8 @@
-﻿import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { createAgentSession } from "../../src/core/agent-loop.js";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import type { StreamTurnOptions, TurnResult } from "../../src/llm/model-service.js";
+import { TurnError } from "../../src/llm/model-service.js";
 import { parseSettings } from "../../src/llm/settings-store.js";
 import { SHELL_LIVE_OUTPUT_INTERVAL_MS } from "../../src/tools/shell.js";
 import { fakeShellRun } from "../tools/helpers.js";
@@ -191,6 +192,91 @@ it("persists not_executed for the remainder when cancellation arrives on tool co
     (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result").map((r) => r.status),
   ).toEqual(["error", "not_executed"]);
   expect((await f.controller.listSessions())[0]?.runCount).toBe(1);
+});
+
+describe("取消后的上下文落盘（A/B）", () => {
+  async function cancelFixture(streamTurn: (cancel: () => void) => Promise<TurnResult>) {
+    const { store } = makeStore();
+    const ref = sessionRef("cancel-ctx");
+    await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: ref.sessionId });
+    const session = await createAgentSession({
+      store,
+      ref,
+      workspaceId: ref.workspaceId,
+      workspaceRoot: tempDir(),
+      getModel: () => model,
+      getSettings: () => parseSettings({}),
+      modelService: { streamTurn: async () => streamTurn(() => session.controller.cancel()) },
+    });
+    return { ...session, store, ref };
+  }
+
+  it("A：完整生成的响应不因取消竞态丢弃", async () => {
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      return turn(makeAssistantMessage([], "done"));
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.map((r) => r.type)).toEqual([
+      "user_prompt",
+      "run_started",
+      "assistant_message",
+      "run_finished",
+    ]);
+    expect(records.at(-1)).toMatchObject({ type: "run_finished", outcome: "cancelled" });
+  });
+
+  it("B：半截 aborted 响应落盘并为可配对 call 合成 not_executed", async () => {
+    const partial = makeAssistantMessage([{ id: "a", name: "read" }], "half", {
+      stopReason: "aborted",
+    });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.map((r) => r.type)).toEqual([
+      "user_prompt",
+      "run_started",
+      "assistant_message",
+      "tool_result",
+      "run_finished",
+    ]);
+    const assistant = records.find((r) => r.type === "assistant_message");
+    expect(assistant?.type === "assistant_message" && assistant.message.stopReason).toBe("aborted");
+    expect(records.find((r) => r.type === "tool_result")).toMatchObject({
+      toolCallId: "a",
+      status: "not_executed",
+      content: "Error: Cancelled by user.",
+    });
+  });
+
+  it("B：无实质内容的 partial 不落盘 assistant", async () => {
+    const partial = makeAssistantMessage([], "", { stopReason: "aborted" });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.map((r) => r.type)).toEqual(["user_prompt", "run_started", "run_finished"]);
+  });
+
+  it("B：半截 call（空 id）留 History 但不合成结果", async () => {
+    const partial = makeAssistantMessage([{ id: "", name: "read" }], "half", {
+      stopReason: "aborted",
+    });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.some((r) => r.type === "assistant_message")).toBe(true);
+    expect(records.some((r) => r.type === "tool_result")).toBe(false);
+  });
 });
 
 it("creates no Session until the first accepted prompt and resets to blank without creating another", async () => {

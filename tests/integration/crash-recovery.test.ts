@@ -75,22 +75,23 @@ interface Scenario {
 }
 
 // 三个崩溃点对应 §6.3 持久化顺序的不同截断位置，重载后的审计/门控/上下文过滤各不相同。
+// 缺结果崩溃点：门控仍报未知副作用，但 Turn 受控进入上下文（合成显式 unknown 占位 + 询问标注）。
 const scenarios: Record<string, Scenario> = {
   "after-intent": {
     types: ["user_prompt", "run_started", "assistant_message"],
     effectExists: false,
     unknown: 1,
-    eligibleTurns: 0,
-    excludedTurns: 1,
-    contextIncludesCrashedTurn: false,
+    eligibleTurns: 1,
+    excludedTurns: 0,
+    contextIncludesCrashedTurn: true,
   },
   "after-execute": {
     types: ["user_prompt", "run_started", "assistant_message"],
     effectExists: true,
     unknown: 1,
-    eligibleTurns: 0,
-    excludedTurns: 1,
-    contextIncludesCrashedTurn: false,
+    eligibleTurns: 1,
+    excludedTurns: 0,
+    contextIncludesCrashedTurn: true,
   },
   "after-result": {
     types: ["user_prompt", "run_started", "assistant_message", "tool_result"],
@@ -133,7 +134,7 @@ for (const [point, expected] of Object.entries(scenarios)) {
     // 缺结果崩溃点报未知副作用，结果已提交的崩溃点不报。
     expect(resumed.unknownSideEffects).toHaveLength(expected.unknown);
 
-    // 上下文过滤：不完整 Turn 被排除，完整 Turn 保留。
+    // 上下文过滤：缺结果 Turn 受控进入（合成 unknown 占位），完整 Turn 保留。
     const plan = planEffectiveContext(resumed.records);
     expect(plan.runs.flatMap((r) => r.turns)).toHaveLength(expected.eligibleTurns);
     expect(plan.runs.flatMap((r) => r.excludedTurns)).toHaveLength(expected.excludedTurns);
@@ -154,6 +155,11 @@ for (const [point, expected] of Object.entries(scenarios)) {
           const context = JSON.stringify(options.context.messages);
           if (expected.contextIncludesCrashedTurn) expect(context).toContain("call-1");
           else expect(context).not.toContain("call-1");
+          // 缺结果崩溃点：真实请求携带合成占位与询问标注，模型知情而非失忆。
+          if (expected.unknown > 0) {
+            expect(context).toContain("was not recorded");
+            expect(context).toContain("Ask the user to verify");
+          }
           return finalTurn();
         },
       },

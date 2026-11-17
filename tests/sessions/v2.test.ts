@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import { buildContext, planEffectiveContext } from "../../src/core/context-builder.js";
-import { isTurnComplete, parseSessionRecord } from "../../src/sessions/records.js";
+import { isTurnContextComplete, parseSessionRecord } from "../../src/sessions/records.js";
 import { resumeSession } from "../../src/sessions/recovery.js";
 import {
   cleanupTempDirs,
@@ -28,24 +28,25 @@ describe("Session v2", () => {
     Reflect.deleteProperty(a.message, key);
     expect(() => parseSessionRecord(a, { expectVersion: false })).toThrow();
   });
-  it("pairs repeated IDs by assistant record and rejects extra, duplicate and unknown results", () => {
+  it("pairs repeated IDs by assistant record; rejects duplicate/mismatched results, accepts unknown/missing", () => {
     const a = makeAssistantRecord(2, "r", [{ id: "same", name: "read" }]);
     const first = makeToolResultRecord(3, "r", "same", "success", { assistantRecordSeq: 2 });
     const b = makeAssistantRecord(4, "r", [{ id: "same", name: "read" }]);
     const second = makeToolResultRecord(5, "r", "same", "error", { assistantRecordSeq: 4 });
-    expect(isTurnComplete(b, [first])).toBe(false);
-    expect(isTurnComplete(b, [first, second])).toBe(true);
-    expect(isTurnComplete(b, [second, second])).toBe(false);
-    expect(isTurnComplete(a, [{ ...first, toolName: "write" }])).toBe(false);
-    expect(isTurnComplete(a, [{ ...first, status: "unknown" }])).toBe(false);
+    // first 归属 a：b 的 call 缺结果 → 受控完整（合成 unknown 占位）。
+    expect(isTurnContextComplete(b, [first])).toBe(true);
+    expect(isTurnContextComplete(b, [first, second])).toBe(true);
+    expect(isTurnContextComplete(b, [second, second])).toBe(false);
+    expect(isTurnContextComplete(a, [{ ...first, toolName: "write" }])).toBe(false);
+    expect(isTurnContextComplete(a, [{ ...first, status: "unknown" }])).toBe(true);
   });
   it("accepts paired invalid arguments and length tool turns but excludes truncated text", () => {
     const a = makeAssistantRecord(2, "r", [{ id: "x", name: "read" }], { stopReason: "length" });
     const call = a.message.content.find((b) => b.type === "toolCall")!;
     if (call.type === "toolCall") call.parse = { status: "invalid", error: "incomplete" };
     const result = makeToolResultRecord(3, "r", "x", "error");
-    expect(isTurnComplete(a, [result])).toBe(true);
-    expect(isTurnComplete(makeAssistantRecord(4, "r", [], { stopReason: "length" }), [])).toBe(false);
+    expect(isTurnContextComplete(a, [result])).toBe(true);
+    expect(isTurnContextComplete(makeAssistantRecord(4, "r", [], { stopReason: "length" }), [])).toBe(false);
     expect(
       planEffectiveContext([makeUserPromptRecord(1, "r", "hi"), a, result, makeCheckpointRecord(4, "S", 3)])
         .checkpoint?.summary,
@@ -108,7 +109,7 @@ describe("Session v2", () => {
   it("does not admit later turns in the same run through a checkpoint after an incomplete turn", () => {
     const records = [
       makeUserPromptRecord(1, "r", "hi"),
-      makeAssistantRecord(2, "r", [], { stopReason: "aborted" }),
+      makeAssistantRecord(2, "r", [], { stopReason: "error" }),
       makeAssistantRecord(3, "r", []),
       makeCheckpointRecord(4, "bad", 3),
     ];

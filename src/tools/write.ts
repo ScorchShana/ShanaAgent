@@ -50,7 +50,8 @@ export function failure(
   reason: string,
   category: "io" | "path" | "internal" | "cancelled" = "io",
 ): ToolOutcome {
-  return { status: "error", category, content: `Error: ${reason}` };
+  // cancelled 均发生在不可逆写入之前（文件从未改动），与 executor 前置检查统一为 not_executed。
+  return { status: category === "cancelled" ? "not_executed" : "error", category, content: `Error: ${reason}` };
 }
 
 export function formatSuccessPath(value: string): string {
@@ -194,7 +195,8 @@ export async function writeFileContent(
   if (invalid) return invalid;
   if (context.signal?.aborted) return failure("Cancelled by user.", "cancelled");
   if (target.danglingSymlink) return failure("Broken symbolic link.");
-  let priorContent: string | undefined;
+  // 新建文件记空快照，保证成功写入必带 priorContent，TUI 历史 Diff 才能重建全新增行。
+  let priorContent = "";
   try {
     await context.assertPathTarget?.();
     let parent;
@@ -254,6 +256,6 @@ export async function writeFileContent(
   return {
     status: "success",
     content: `Successfully wrote ${formatSuccessPath(args.path)}.`,
-    ...(priorContent !== undefined ? { priorContent } : {}),
+    priorContent,
   };
 }

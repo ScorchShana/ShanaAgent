@@ -1,7 +1,14 @@
 import { visibleWidth } from "./framework/index.js";
 import { SessionController } from "../core/session-controller.js";
-import type { ControllerSnapshot, SessionListEntry } from "../core/state.js";
-import { planEffectiveContext } from "../core/context-builder.js";
+import type { ApprovalDecision, ControllerSnapshot, SessionListEntry } from "../core/state.js";
+import {
+  CANCELLED_REQUEST_ANNOTATION,
+  FAILED_REQUEST_ANNOTATION,
+  INTERRUPTED_RESPONSE_ANNOTATION,
+  UNKNOWN_RESULT_ANNOTATION,
+  planEffectiveContext,
+  type EligibleTurn,
+} from "../core/context-builder.js";
 import { UnknownSideEffectsError } from "../sessions/recovery.js";
 import type { SessionHistory } from "../sessions/session-store.js";
 import type { StoredToolCall, ToolResultRecord } from "../sessions/records.js";
@@ -73,6 +80,12 @@ export interface ConversationItem {
   failed?: boolean;
   cancelled?: boolean;
   dim?: boolean;
+  // 已被压缩摘要替代（recordSeq <= coveredUpTo）：整段淡化，不再是上下文原文。
+  compacted?: boolean;
+  // 缺结果 call 的合成 unknown 占位（与模型所见同构）；真实记录仍缺失，审计细节见提示文案。
+  syntheticUnknown?: boolean;
+  // compaction 分隔线携带的摘要正文，默认折叠、点击展开。
+  summary?: string;
   call?: StoredToolCall;
   result?: ToolResultRecord;
   activity?: "queued" | "running";
@@ -88,6 +101,8 @@ export interface TuiState {
   expanded: ReadonlySet<string>;
   expandedResults: ReadonlySet<string>;
   expandedDiffs: ReadonlySet<string>;
+  // 仅展示层：审批结束后 app 依据 decision 决定追踪下一个工具还是追底。
+  lastResolvedApproval: { id: string; decision: ApprovalDecision } | null;
   notice: { id: string; text: string; error: boolean } | null;
   retryPrompt: string | null;
 }
@@ -111,6 +126,8 @@ export class TuiStore {
   private readonly exitNotices: string[] = [];
   private noticeId = 0;
   private readonly seenWarnings = new Set<string>();
+  // 审批自动展开的卡片；用户手动 toggle 即接管（移出此集合），自动折叠只碰仍带标记的。
+  private readonly autoExpanded = new Set<string>();
   private readonly attemptOwners = new Map<string, { runId: string; turn: number }>();
   private readonly executions = new Map<string, { completed: boolean; liveOutput?: string }[]>();
   private executionVersion = 0;
@@ -147,6 +164,8 @@ export class TuiStore {
     const subscription = controller.subscribe((event) => {
       this.clearInterrupt();
       if (event.type === "permission.requested" || event.type === "permission.resolved") { this.executionVersion++; this.historyDirty = true; }
+      if (event.type === "permission.resolved")
+        this.update({ lastResolvedApproval: { id: event.approvalId, decision: event.decision } });
       if (event.type === "run.started") {
         this.update({ notice: null });
       }
@@ -225,6 +244,7 @@ export class TuiStore {
       expanded: new Set(),
       expandedResults: new Set(),
       expandedDiffs: new Set(),
+      lastResolvedApproval: null,
       notice: null,
       retryPrompt: null,
     };
@@ -268,6 +288,7 @@ export class TuiStore {
     ) {
       this.attemptOwners.clear();
       this.executions.clear();
+      this.autoExpanded.clear();
       this.executionVersion++;
       this.compactionSeparators = [];
       this.compactionVersion++;
@@ -277,6 +298,7 @@ export class TuiStore {
         expanded: new Set(),
         expandedResults: new Set(),
         expandedDiffs: new Set(),
+        lastResolvedApproval: null,
         retryPrompt: null,
       };
     }
@@ -334,6 +356,7 @@ export class TuiStore {
         this.attemptOwners.delete(from);
       }
       if (changedSession) {
+        this.autoExpanded.clear();
         this.update({ expanded: new Set<string>(), retryPrompt: null });
       }
       this.update({
@@ -702,7 +725,21 @@ export class TuiStore {
     if (!expandedDiffs.delete(id)) expandedDiffs.add(id);
     this.update({ expandedDiffs });
   }
+  // 审批到达时自动展开；已被用户展开的不动也不标记，结束后不折叠它。
+  autoExpand(id: string): void {
+    if (this.state.expanded.has(id)) return;
+    this.autoExpanded.add(id);
+    this.update({ expanded: new Set([...this.state.expanded, id]) });
+  }
+  releaseAutoExpanded(): void {
+    if (this.autoExpanded.size === 0) return;
+    const expanded = new Set(this.state.expanded);
+    for (const id of this.autoExpanded) expanded.delete(id);
+    this.autoExpanded.clear();
+    this.update({ expanded });
+  }
   toggle(id: string): void {
+    this.autoExpanded.delete(id);
     const expanded = new Set(this.state.expanded);
     let expandedResults: ReadonlySet<string> = this.state.expandedResults;
     if (expanded.has(id)) {
@@ -739,6 +776,22 @@ export class TuiStore {
     const failed = new Set(plan.runs.flatMap((r) => r.excludedTurns.map((t) => t.assistant.recordSeq)));
     // The in-flight turn has no result yet; planEffectiveContext excludes it until the tool finishes.
     if (pendingSeq !== undefined) failed.delete(pendingSeq);
+    // 零 Turn 的取消/失败 Run：Prompt 恒进上下文，展示同构地附对应标注。
+    const cancelledPrompts = new Set(
+      plan.runs
+        .filter((r) => r.cancelled && r.turns.length === 0 && r.prompt !== null)
+        .map((r) => r.prompt!.recordSeq),
+    );
+    const failedPrompts = new Set(
+      plan.runs
+        .filter((r) => r.failed && r.turns.length === 0 && r.prompt !== null)
+        .map((r) => r.prompt!.recordSeq),
+    );
+    const eligibleTurns = new Map<number, EligibleTurn>(
+      plan.runs.flatMap((r) => r.turns).map((turn) => [turn.assistant.recordSeq, turn]),
+    );
+    // 压缩覆盖边界：其前的记录已被摘要替代，整段淡化（与上下文归属一致）。
+    const compacted = (recordSeq: number): boolean => recordSeq <= plan.coveredUpTo;
     const results = new Map(
       records
         .filter((r): r is ToolResultRecord => r.type === "tool_result")
@@ -750,7 +803,12 @@ export class TuiStore {
       if (record.type === "checkpoint")
         separators.push({
           anchor: record.recordSeq,
-          item: { id: `compaction-${record.recordSeq}`, role: "compaction", text: "compacted" },
+          item: {
+            id: `compaction-${record.recordSeq}`,
+            role: "compaction",
+            text: "以上历史已由摘要替代",
+            summary: record.summary,
+          },
         });
     for (const separator of this.compactionSeparators)
       separators.push({
@@ -770,23 +828,51 @@ export class TuiStore {
     for (const record of records) {
       // Run 收尾行（取消/失败标记、耗时）属于前面的展示块，分隔线不越过它们。
       if (record.type !== "run_finished") flushSeparators(record.recordSeq);
-      if (record.type === "user_prompt")
-        items.push({ id: `prompt-${record.recordSeq}`, role: "user", text: record.text });
+      if (record.type === "user_prompt") {
+        items.push({
+          id: `prompt-${record.recordSeq}`,
+          role: "user",
+          text: record.text,
+          compacted: compacted(record.recordSeq),
+        });
+        if (cancelledPrompts.has(record.recordSeq))
+          items.push({
+            id: `cancelled-prompt-${record.recordSeq}`,
+            role: "notice",
+            text: CANCELLED_REQUEST_ANNOTATION,
+            compacted: compacted(record.recordSeq),
+          });
+        if (failedPrompts.has(record.recordSeq))
+          items.push({
+            id: `failed-prompt-${record.recordSeq}`,
+            role: "notice",
+            text: FAILED_REQUEST_ANNOTATION,
+            compacted: compacted(record.recordSeq),
+          });
+      }
       if (record.type === "interruption")
         items.push({
           id: `interruption-${record.recordSeq}`,
           role: "notice",
           text: this.redact(`运行中断：${record.reason}`),
+          compacted: compacted(record.recordSeq),
         });
       if (record.type === "run_finished" && record.outcome !== "completed")
         items.push(
           record.outcome === "cancelled"
-            ? { id: `outcome-${record.recordSeq}`, role: "failure", text: "✗ 已取消", cancelled: true }
+            ? {
+                id: `outcome-${record.recordSeq}`,
+                role: "failure",
+                text: "✗ 已取消",
+                cancelled: true,
+                compacted: compacted(record.recordSeq),
+              }
             : {
                 id: `outcome-${record.recordSeq}`,
                 role: "failure",
                 text: this.redact(`运行${{ failed: "失败", turn_limit: "达到轮数上限" }[record.outcome]}`),
                 failed: true,
+                compacted: compacted(record.recordSeq),
               },
         );
       if (record.type === "run_finished" && record.elapsedMs !== undefined)
@@ -795,6 +881,7 @@ export class TuiStore {
           role: "duration",
           text: `Worked for ${formatDuration(record.elapsedMs)}`,
           dim: true,
+          compacted: compacted(record.recordSeq),
         });
       if (record.type !== "assistant_message") continue;
       const turn = (turns.get(record.runId) ?? 0) + 1;
@@ -817,6 +904,8 @@ export class TuiStore {
           text,
           thinking,
           failed: failed.has(record.recordSeq),
+          cancelled: record.message.stopReason === "aborted",
+          compacted: compacted(record.recordSeq),
         });
       if (failed.has(record.recordSeq))
         items.push({
@@ -826,7 +915,9 @@ export class TuiStore {
           role: "failure",
           text: "此轮未进入有效上下文",
           failed: true,
+          compacted: compacted(record.recordSeq),
         });
+      const eligible = eligibleTurns.get(record.recordSeq);
       for (const call of record.message.content.filter((b): b is StoredToolCall => b.type === "toolCall")) {
         const matched = results.get(`${record.recordSeq}:${call.id}`);
         const result =
@@ -844,11 +935,33 @@ export class TuiStore {
           text: call.name,
           call,
           result,
+          failed: failed.has(record.recordSeq),
+          syntheticUnknown: eligible?.missingCalls.some((missing) => missing.toolCallId === call.id) ?? false,
+          compacted: compacted(record.recordSeq),
           activity: execution && !execution.completed ? "running" : "queued",
           liveOutput: execution && !execution.completed ? execution.liveOutput : undefined,
           pendingApprovalId: !result && execution && !execution.completed && execution === this.executions.get(key)?.at(-1) && this.state.core.status.kind === "running" && record.runId === this.state.core.status.runId && this.state.core.pendingApproval?.toolCallId === call.id && this.state.core.pendingApproval.toolName === call.name ? this.state.core.pendingApproval.id : undefined,
         });
       }
+      // 进入上下文的 aborted/unknown Turn 同构展示标注（被排除的 Turn 不注入上下文，也不标注）。
+      if (record.message.stopReason === "aborted" && !failed.has(record.recordSeq))
+        items.push({
+          id: `interrupted-${record.recordSeq}`,
+          runId: record.runId,
+          turn,
+          role: "notice",
+          text: INTERRUPTED_RESPONSE_ANNOTATION,
+          compacted: compacted(record.recordSeq),
+        });
+      if (eligible?.hasUnknown)
+        items.push({
+          id: `unknown-${record.recordSeq}`,
+          runId: record.runId,
+          turn,
+          role: "notice",
+          text: UNKNOWN_RESULT_ANNOTATION,
+          compacted: compacted(record.recordSeq),
+        });
     }
     while (separatorIndex < separators.length) {
       items.push(separators[separatorIndex]!.item);
@@ -888,6 +1001,8 @@ export class TuiStore {
           text: "Diff",
           call: item.call,
           result: item.result,
+          failed: item.failed,
+          compacted: item.compacted,
         };
         this.diffItemCache.set(item, diff);
       }
@@ -930,12 +1045,14 @@ export class TuiStore {
         : this.state.core.lastRun?.runId;
     const committed = records.filter((r) => r.type === "assistant_message" && r.runId === runId).length;
     const idle = this.state.core.status.kind === "idle";
-    const cancelledRun = idle && this.state.core.lastRun?.outcome === "cancelled";
+    const outcome = this.state.core.lastRun?.outcome;
     const attempts: ConversationItem[] = [];
     for (const attempt of this.state.core.streamingAttempts) {
-      if (attempt.status === "cancelled") continue;
-      if (attempt.status === "completed" && attempt.turn <= committed) continue;
-      if (cancelledRun && attempt.status !== "failed") continue;
+      const persisted = attempt.turn <= committed;
+      if (attempt.status === "completed" && persisted) continue;
+      // cancelled attempt 落盘为 aborted Turn 后由持久化项展示；收尾窗口期内有内容的仍 transient 显示。
+      if (attempt.status === "cancelled" && (persisted || (!attempt.text && !attempt.thinking)))
+        continue;
       attempts.push({
         id: `attempt-${runId}-${attempt.turn}-${attempt.attempt}`,
         runId,
@@ -945,7 +1062,8 @@ export class TuiStore {
         thinking: attempt.thinking,
         failed:
           attempt.status === "failed" ||
-          (idle && !cancelledRun && this.state.core.lastRun?.outcome !== "completed"),
+          (idle && outcome !== "completed" && outcome !== "cancelled" && attempt.status !== "cancelled"),
+        cancelled: attempt.status === "cancelled",
         dim: attempt.status === "streaming",
       });
     }

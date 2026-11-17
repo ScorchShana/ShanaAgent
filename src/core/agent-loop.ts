@@ -19,10 +19,12 @@ import { ApprovalManager } from "../security/approval-manager.js";
 import { createRunStartGate, resumeSession } from "../sessions/recovery.js";
 import { compactHistory, type CompactionOutcome } from "../sessions/compaction-store.js";
 import {
+  normalizeAbortedMessage,
   toolCallsOfMessage,
   type NewSessionRecord,
   type SessionMeta,
   type SessionRecord,
+  type StoredAssistantMessage,
 } from "../sessions/records.js";
 import type { SessionRef, SessionStore, SessionLoadWarning } from "../sessions/session-store.js";
 import { createToolExecutor, type ToolExecutorOptions, type ToolExecutionResult } from "../tools/executor.js";
@@ -33,6 +35,7 @@ import {
   estimateMessageTokens,
   isRequestFeasible,
   loadRootAgentsMd,
+  measuredPromptTokens,
   reachesCompactionThreshold,
   toAgentsMdReference,
   CONTEXT_SAFETY_MARGIN_TOKENS,
@@ -99,6 +102,26 @@ function computeBaselineTokens(
     { ...context, messages: [], tools: toolDefinitions(platform, settings) },
     settings.tokenEstimate,
   );
+}
+
+// usage 只有出自本 Run 模型的真实响应才是可信测量；身份不符（如代理改写模型）时
+// tokenizer 可能不同，实测值不得用于锚定。
+function sameModelIdentity(message: StoredAssistantMessage, model: ResolvedModel): boolean {
+  return (
+    message.provider === model.providerId && message.model === model.id && message.api === model.api
+  );
+}
+
+// timestamp 不发送给 Provider（live Prompt 用发送时刻、重建用 record.ts），比较须忽略。
+function sameSentMessage(
+  a: StoredContext["messages"][number],
+  b: StoredContext["messages"][number],
+): boolean {
+  const strip = (message: StoredContext["messages"][number]) => {
+    const { timestamp: _timestamp, ...rest } = message;
+    return JSON.stringify(rest);
+  };
+  return strip(a) === strip(b);
 }
 
 export async function createAgentSession(options: AgentSessionOptions): Promise<{
@@ -238,7 +261,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let runModel: ResolvedModel;
   let runSettings: Settings;
   let built: Awaited<ReturnType<typeof buildContext>>;
-  // 不变量：contextTokens === estimateContextTokens(built.context)；built.context 的每处变更必须同步它。
+  // 不变量：contextTokens 是下一次请求输入的最佳已知 token 数——优先"最近一次实测 prompt +
+  // 未测量增量的估算"（锚定），实测不可用时为 estimateContextTokens(built.context)。
+  // built.context 的每处变更必须同步它。
   let contextTokens = 0;
   let contextBaselineTokens: number | null = null;
   // Session 级冻结快照：进程启动、/new、/resume 时读取，Session 内不再重读。
@@ -358,6 +383,39 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     recordsEpoch += 1;
     return record;
   };
+  // 用户取消时把已流式生成的部分响应落盘为受控中断 Turn：History 存原文（含半截 call）供审计，
+  // 仅对可配对 call 合成 not_executed 结果（它们从未进入 executor）。无实质内容则不落盘。
+  const persistAbortedTurn = async (
+    handle: RunHandle,
+    partial: StoredAssistantMessage | undefined,
+  ): Promise<void> => {
+    if (!partial) return;
+    const normalized = normalizeAbortedMessage(partial);
+    const calls = toolCallsOfMessage(normalized);
+    const hasText = normalized.content.some(
+      (block) =>
+        (block.type === "text" && block.text.trim().length > 0) ||
+        (block.type === "thinking" && block.thinking.trim().length > 0),
+    );
+    if (!hasText && calls.length === 0) return;
+    const assistant = await append({
+      type: "assistant_message",
+      runId: handle.runId,
+      message: partial,
+    });
+    for (const call of calls) {
+      await append({
+        type: "tool_result",
+        runId: handle.runId,
+        assistantRecordSeq: assistant.recordSeq,
+        toolCallId: call.id,
+        toolName: call.name,
+        status: "not_executed",
+        content: "Error: Cancelled by user.",
+      });
+      await handle.notifyToolCompleted(call.id);
+    }
+  };
   const resyncRecords = (): Promise<void> => {
     const target = ref;
     if (!target) return Promise.resolve();
@@ -383,6 +441,72 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       resyncPromise = null;
     });
     return resyncPromise;
+  };
+  // Run 起点锚定：最近一次实测 prompt 覆盖"当时发送的前缀"。仅当该前缀与当前重建上下文
+  // 逐条一致、模型身份与工具 Schema 未变时才可信；任何不符回退纯估算（等同无锚定行为）。
+  // 前缀重建比较自动覆盖 checkpoint 插入、标注/eligibility 差异等历史改写情形。
+  // 已知有界残差：System Prompt/environment 不落盘，跨进程版本变更引起的固定头部漂移
+  // 无法校验，误差以头部大小为界；工具 Schema 经 run_started 的 settings 快照校验。
+  const anchorContextTokens = async (context: StoredContext): Promise<number | null> => {
+    let reason = "no_measurement";
+    let anchored: number | null = null;
+    for (let index = records.length - 1; index >= 0; index -= 1) {
+      const record = records[index]!;
+      if (record.type !== "assistant_message") continue;
+      const measured = measuredPromptTokens(record.message.usage);
+      if (measured === null) continue;
+      if (!sameModelIdentity(record.message, runModel)) {
+        reason = "model_mismatch";
+        continue;
+      }
+      const started = records.find((r) => r.type === "run_started" && r.runId === record.runId);
+      if (started === undefined || started.type !== "run_started") {
+        reason = "run_started_missing";
+        break;
+      }
+      let previousTools: ToolDefinitions;
+      try {
+        previousTools = toolDefinitions(options.executorOptions?.platform, parseSettings(started.settings));
+      } catch {
+        reason = "run_settings_unreadable";
+        break;
+      }
+      if (JSON.stringify(previousTools) !== JSON.stringify(context.tools)) {
+        reason = "tools_changed";
+        break;
+      }
+      let prefix: Awaited<ReturnType<typeof buildContext>>;
+      try {
+        prefix = await buildContext({
+          records: records.slice(0, index),
+          workspacePath: options.workspaceRoot,
+          agentsMd: sessionAgentsMd,
+          systemPrompt: options.systemPrompt,
+          environment: options.environment,
+        });
+      } catch {
+        reason = "prefix_build_failed";
+        break;
+      }
+      const count = prefix.context.messages.length;
+      if (
+        prefix.context.systemPrompt !== context.systemPrompt ||
+        count >= context.messages.length ||
+        !prefix.context.messages.every((message, i) => sameSentMessage(message, context.messages[i]!))
+      ) {
+        reason = "prefix_mismatch";
+        break;
+      }
+      let suffixTokens = 0;
+      for (const message of context.messages.slice(count))
+        suffixTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
+      anchored = measured + suffixTokens;
+      break;
+    }
+    options.diagnostics?.debug(
+      JSON.stringify({ event: "context.anchor", anchored: anchored !== null, reason: anchored !== null ? null : reason }),
+    );
+    return anchored;
   };
   const compactForRun = async (
     handle: RunHandle,
@@ -434,19 +558,18 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     handle.reportPhase("streaming");
     if (outcome.status === "completed") {
       const tools = built.context.tools;
-      const hasCurrentRunTurn = records.some(
-        (record) => record.type === "assistant_message" && record.runId === handle.runId,
-      );
+      // Prompt 已持久化且恒进上下文：未被覆盖时由 plan 保留，被覆盖时已进摘要输入。
+      // 重建一律不传 currentPrompt，否则与记录中的 Prompt 重复。
       built = await buildContext({
         records,
         workspacePath: options.workspaceRoot,
         agentsMd: sessionAgentsMd,
         systemPrompt: options.systemPrompt,
         environment: options.environment,
-        ...(keepLatestTurn && hasCurrentRunTurn ? {} : { currentPrompt: handle.prompt }),
       });
       // 复用原数组保证与上一次正式请求逐字节一致。
       built.context.tools = tools;
+      // 压后上下文未发送过、无实测可用，只能纯估算；下一次响应返回后重新锚定。
       contextTokens = estimateContextTokens(built.context, tokenEstimate);
       if (!isRequestFeasible(contextTokens, runModel.contextWindow)) {
         throw new Error(
@@ -498,6 +621,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         parameters: Type.Unsafe(tool.parameters),
       }));
       contextTokens = estimateContextTokens(built.context, runSettings.tokenEstimate);
+      // 估算对代码/JSON 系统性偏低会让阈值触发漂移；有可信实测时以其锚定历史大头。
+      const anchored = await anchorContextTokens(built.context);
+      if (anchored !== null) contextTokens = anchored;
       try {
         let autoCompactionFailedThisRun = false;
         let overflowRemediedThisRun = false;
@@ -553,6 +679,10 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
               },
             });
           } catch (error) {
+            if (error instanceof TurnError && error.kind === "cancelled") {
+              await persistAbortedTurn(handle, error.partial);
+              throw error;
+            }
             if (
               !(error instanceof TurnError) ||
               error.kind !== "context_overflow" ||
@@ -578,10 +708,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             skipThresholdCheck = true;
             continue;
           }
-          if (signal.aborted) throw new TurnError("cancelled", response.attempts, "Run cancelled");
+          // 完整生成的响应不因取消竞态丢弃：取消只阻止后续工具执行，已发生的生成如实落盘进上下文。
           handle.beginAttempt(turn, response.attempts);
           handle.finishAttempt("completed");
-          if (signal.aborted) throw new TurnError("cancelled", response.attempts, "Run cancelled");
           currentIntent = response.message.content
             .filter((block) => block.type === "text")
             .map((block) => block.text)
@@ -675,9 +804,17 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             })),
           ];
           built.context.messages.push(...newMessages);
+          // usage 实测恰好覆盖刚发送的请求（前缀同一性由构造保证）；新增的 assistant/toolResults
+          // 无人测过，只能估算。实测缺失或身份不符时回退增量估算。
+          let deltaTokens = 0;
           for (const message of newMessages) {
-            contextTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
+            deltaTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
           }
+          const measured = measuredPromptTokens(response.usage);
+          contextTokens =
+            measured !== null && sameModelIdentity(response.message, runModel)
+              ? measured + deltaTokens
+              : contextTokens + deltaTokens;
           if (turn === runSettings.maxTurns) return { outcome: "turn_limit" };
           turn += 1;
         }

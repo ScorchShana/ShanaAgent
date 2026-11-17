@@ -1,14 +1,16 @@
 import type { StoredContext } from "../llm/history-replay.js";
 import fs from "node:fs";
 import path from "node:path";
-import type { ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import type { ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
 import {
-  isTurnComplete,
+  isTurnContextComplete,
+  normalizeAbortedMessage,
   toolCallsOfMessage,
   type AgentsMdReference,
   type AssistantMessageRecord,
   type CheckpointRecord,
   type SessionRecord,
+  type SessionRunOutcome,
   type ToolResultRecord,
   type UserPromptRecord,
 } from "../sessions/records.js";
@@ -18,12 +20,18 @@ import {
   type ResponseExclusionReason,
 } from "../sessions/recovery.js";
 
+// invalid_turn：协议损坏（非法 call 身份、多余/错配结果），正常落盘路径不会产生，防御性排除。
 export type TurnExclusionReason =
-  ResponseExclusionReason | "unknown_side_effect" | "incomplete_results" | "follows_incomplete_turn";
+  ResponseExclusionReason | "invalid_turn" | "follows_incomplete_turn";
 
 export interface EligibleTurn {
   assistant: AssistantMessageRecord;
+  // 配对的真实结果（任意 status，含 unknown），按 call 顺序。
   results: ToolResultRecord[];
+  // 缺结果的 call（崩溃窗口）：构建上下文时合成显式 unknown 占位，不落盘。
+  missingCalls: { toolCallId: string; toolName: string }[];
+  // 配对 unknown 或缺结果：Turn 末尾附询问标注。
+  hasUnknown: boolean;
 }
 
 export interface ExcludedTurn {
@@ -36,6 +44,9 @@ export interface ExcludedTurn {
 export interface RunPlan {
   prompt: UserPromptRecord | null;
   promptIncluded: boolean;
+  // Run 以用户取消/失败收尾；零 Turn 时分别附取消/失败标注，避免悬空 Prompt 误导模型。
+  cancelled: boolean;
+  failed: boolean;
   turns: EligibleTurn[];
   excludedTurns: ExcludedTurn[];
 }
@@ -108,15 +119,32 @@ export function reachesCompactionThreshold(
   return estimatedTokens >= contextWindow * thresholdRatio;
 }
 
+// Provider 实测的 prompt tokens：input 已扣除缓存命中/写入，须三项相加才等于请求输入
+// （pi-ai openai-completions 语义）。全零是时机 B 合成 partial 的"未计数"占位而非测量；
+// 缺失/非法字段同样不可信。返回 null 时调用方必须回退字符估算，不得把 0 当实测。
+export function measuredPromptTokens(usage: Usage | undefined): number | null {
+  if (usage === undefined) return null;
+  const parts = [usage.input, usage.cacheRead, usage.cacheWrite];
+  if (parts.some((value) => typeof value !== "number" || !Number.isFinite(value) || value < 0))
+    return null;
+  const total = usage.input + usage.cacheRead + usage.cacheWrite;
+  return total > 0 ? total : null;
+}
+
 type TurnClassification =
-  | { kind: "eligible"; results: ToolResultRecord[] }
+  | { kind: "eligible"; turn: EligibleTurn }
   | { kind: "excluded"; reason: TurnExclusionReason; toolCallIds: string[] };
 
 function classifyTurn(
   assistant: AssistantMessageRecord,
   toolResults: readonly ToolResultRecord[],
 ): TurnClassification {
-  const calls = toolCallsOfMessage(assistant.message);
+  // aborted 响应含半截 call，按归一化后的可配对 call 判定，与 isTurnContextComplete/turnMessages 一致。
+  const message =
+    assistant.message.stopReason === "aborted"
+      ? normalizeAbortedMessage(assistant.message)
+      : assistant.message;
+  const calls = toolCallsOfMessage(message);
   const callIds = new Set(calls.map((call) => call.id));
   const matching = toolResults.filter(
     (result) =>
@@ -124,38 +152,44 @@ function classifyTurn(
       result.runId === assistant.runId &&
       callIds.has(result.toolCallId),
   );
-  const missingToolCallIds = calls
-    .filter((call) => !matching.some((result) => result.toolCallId === call.id))
-    .map((call) => call.id);
-  const unknownToolCallIds = [
-    ...new Set(matching.filter((result) => result.status === "unknown").map((result) => result.toolCallId)),
-  ];
 
   const exclusion = responseExclusionReason(assistant);
   if (exclusion !== null) {
-    return {
-      kind: "excluded",
-      reason: exclusion,
-      toolCallIds: exclusion === "truncated" ? missingToolCallIds : [],
-    };
+    return { kind: "excluded", reason: exclusion, toolCallIds: [] };
   }
-  if (unknownToolCallIds.length > 0) {
-    return { kind: "excluded", reason: "unknown_side_effect", toolCallIds: unknownToolCallIds };
+  if (!isTurnContextComplete(assistant, toolResults)) {
+    const missingToolCallIds = calls
+      .filter((call) => !matching.some((result) => result.toolCallId === call.id))
+      .map((call) => call.id);
+    return { kind: "excluded", reason: "invalid_turn", toolCallIds: missingToolCallIds };
   }
-  if (!isTurnComplete(assistant, toolResults)) {
-    return { kind: "excluded", reason: "incomplete_results", toolCallIds: missingToolCallIds };
+
+  // unknown/缺结果不再排除 Turn：配对合法，缺结果合成显式 unknown 占位（I6 修订），门控另行保留。
+  const results: ToolResultRecord[] = [];
+  const missingCalls: { toolCallId: string; toolName: string }[] = [];
+  let hasUnknown = false;
+  for (const call of calls) {
+    const result = matching.find((candidate) => candidate.toolCallId === call.id);
+    if (result === undefined) {
+      missingCalls.push({ toolCallId: call.id, toolName: call.name });
+      hasUnknown = true;
+    } else {
+      results.push(result);
+      if (result.status === "unknown") hasUnknown = true;
+    }
   }
-  return {
-    kind: "eligible",
-    results: calls.map((call) => matching.find((result) => result.toolCallId === call.id)!),
-  };
+  return { kind: "eligible", turn: { assistant, results, missingCalls, hasUnknown } };
 }
 
 export function planEffectiveContext(records: readonly SessionRecord[]): EffectiveContextPlan {
   const checkpoint = findLatestCheckpoint(records);
   const coveredUpTo = checkpoint?.coveredUpTo ?? 0;
   const toolResults = records.filter((record): record is ToolResultRecord => record.type === "tool_result");
+  const outcomes = new Map<string, SessionRunOutcome>();
+  for (const record of records)
+    if (record.type === "run_finished") outcomes.set(record.runId, record.outcome);
   const runs: RunPlan[] = [];
+  const runIds = new Map<RunPlan, string | undefined>();
   let current: RunPlan | null = null;
   let blockedReason: TurnExclusionReason | null = null;
 
@@ -163,16 +197,18 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
     if (record.recordSeq <= coveredUpTo) continue;
 
     if (record.type === "user_prompt") {
-      current = { prompt: record, promptIncluded: false, turns: [], excludedTurns: [] };
+      current = { prompt: record, promptIncluded: false, cancelled: false, failed: false, turns: [], excludedTurns: [] };
       runs.push(current);
+      runIds.set(current, record.runId);
       blockedReason = null;
       continue;
     }
     if (record.type !== "assistant_message") continue;
 
     if (current === null) {
-      current = { prompt: null, promptIncluded: false, turns: [], excludedTurns: [] };
+      current = { prompt: null, promptIncluded: false, cancelled: false, failed: false, turns: [], excludedTurns: [] };
       runs.push(current);
+      runIds.set(current, record.runId);
     }
     if (blockedReason !== null) {
       current.excludedTurns.push({
@@ -185,7 +221,7 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
 
     const classification = classifyTurn(record, toolResults);
     if (classification.kind === "eligible") {
-      current.turns.push({ assistant: record, results: classification.results });
+      current.turns.push(classification.turn);
     } else {
       current.excludedTurns.push({
         assistant: record,
@@ -196,9 +232,13 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
     }
   }
 
-  // 失败 Run 的原始 Prompt 仅在至少一个完整 Turn 时进入上下文。
+  // Prompt 恒进上下文（含失败/取消的零 Turn Run）；零 Turn 时由 buildContext 附对应标注。
   for (const run of runs) {
-    run.promptIncluded = run.prompt !== null && run.turns.length > 0;
+    const runId = runIds.get(run);
+    const outcome = runId === undefined ? undefined : outcomes.get(runId);
+    run.cancelled = outcome === "cancelled";
+    run.failed = outcome === "failed";
+    run.promptIncluded = run.prompt !== null;
   }
 
   return { checkpoint, coveredUpTo, runs };
@@ -300,6 +340,66 @@ function toolResultMessage(record: ToolResultRecord): ToolResultMessage {
   };
 }
 
+// 取消/中断/未知标注：渲染期注入的 user 消息，不落盘。防止模型把半截响应当完整结论续写、
+// 把未知结果当未执行而盲目重试。
+export const INTERRUPTED_RESPONSE_ANNOTATION = "[The user interrupted this response.]";
+export const CANCELLED_REQUEST_ANNOTATION = "[The user cancelled this request before any response.]";
+export const FAILED_REQUEST_ANNOTATION = "[This request failed before any response was generated.]";
+export const UNKNOWN_RESULT_ANNOTATION =
+  "[Some tool results in this turn are unknown: the tools may have partially or fully executed, or may not have run at all. Do not retry them or assume their outcomes. Ask the user to verify the actual effects before continuing.]";
+
+// 缺结果（崩溃窗口）的合成占位：显式声明"是否执行过都未知"，绝不写成确定态；仅上下文使用，不落盘。
+export const MISSING_TOOL_RESULT_TEXT =
+  "Error: The result of this tool call was not recorded (the process was interrupted). It is unknown whether the tool executed at all; it may have partially or fully run.";
+
+function annotationMessage(text: string, ts: string): UserMessage {
+  return { role: "user", content: text, timestamp: Date.parse(ts) };
+}
+
+// 零 Turn 的取消/失败 Run：Prompt 后附标注，避免悬空 Prompt 误导模型。
+function zeroTurnAnnotations(run: RunPlan): StoredContext["messages"] {
+  if (run.prompt === null || run.turns.length > 0) return [];
+  if (run.cancelled) return [annotationMessage(CANCELLED_REQUEST_ANNOTATION, run.prompt.ts)];
+  if (run.failed) return [annotationMessage(FAILED_REQUEST_ANNOTATION, run.prompt.ts)];
+  return [];
+}
+
+function syntheticUnknownResultMessage(
+  call: { toolCallId: string; toolName: string },
+  ts: string,
+): ToolResultMessage {
+  return {
+    role: "toolResult",
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    content: [{ type: "text", text: MISSING_TOOL_RESULT_TEXT }],
+    isError: true,
+    timestamp: Date.parse(ts),
+  };
+}
+
+// eligible Turn → 上下文消息：assistant（aborted 归一化）+ 按 call 顺序的工具结果（缺结果合成
+// unknown 占位）+ 中断/未知标注。buildContext 与 planCompaction 共用，保证压缩与正式请求同构。
+export function turnMessages(turn: EligibleTurn): StoredContext["messages"] {
+  const aborted = turn.assistant.message.stopReason === "aborted";
+  const message = aborted
+    ? normalizeAbortedMessage(turn.assistant.message)
+    : turn.assistant.message;
+  const messages: StoredContext["messages"] = [message];
+  const byCallId = new Map(turn.results.map((result) => [result.toolCallId, result]));
+  for (const call of toolCallsOfMessage(message)) {
+    const result = byCallId.get(call.id);
+    messages.push(
+      result !== undefined
+        ? toolResultMessage(result)
+        : syntheticUnknownResultMessage({ toolCallId: call.id, toolName: call.name }, turn.assistant.ts),
+    );
+  }
+  if (aborted) messages.push(annotationMessage(INTERRUPTED_RESPONSE_ANNOTATION, turn.assistant.ts));
+  if (turn.hasUnknown) messages.push(annotationMessage(UNKNOWN_RESULT_ANNOTATION, turn.assistant.ts));
+  return messages;
+}
+
 function renderAgentsMd(load: AgentsMdLoad, warnings: ContextBuildWarning[]): string | null {
   if (!load.present) return null;
   if (load.readError !== undefined) {
@@ -323,12 +423,10 @@ export async function buildContext(input: BuildContextInput): Promise<BuiltConte
   for (const run of plan.runs) {
     if (run.promptIncluded && run.prompt !== null) {
       messages.push(promptMessage(run.prompt));
+      messages.push(...zeroTurnAnnotations(run));
     }
     for (const turn of run.turns) {
-      messages.push(turn.assistant.message);
-      for (const result of turn.results) {
-        messages.push(toolResultMessage(result));
-      }
+      messages.push(...turnMessages(turn));
     }
   }
   if (input.currentPrompt !== undefined) {
@@ -391,6 +489,13 @@ function estimateTurnTokens(turn: EligibleTurn, tokenEstimate: TokenEstimateOpti
   for (const result of turn.results) {
     total += estimateMessageTokens(toolResultMessage(result), tokenEstimate);
   }
+  // 合成占位与标注同样发送给 Provider，计入预算才不会高估可保留尾部。
+  for (const call of turn.missingCalls) {
+    total += estimateMessageTokens(syntheticUnknownResultMessage(call, turn.assistant.ts), tokenEstimate);
+  }
+  if (turn.assistant.message.stopReason === "aborted")
+    total += estimateTokens(INTERRUPTED_RESPONSE_ANNOTATION, tokenEstimate);
+  if (turn.hasUnknown) total += estimateTokens(UNKNOWN_RESULT_ANNOTATION, tokenEstimate);
   return total;
 }
 
@@ -453,17 +558,21 @@ export function planCompaction(
 
   const covered = planned.slice(0, tailStart);
   const coveredSeqs = new Set(covered.map(({ turn }) => turn.assistant.recordSeq));
+  const coveredUpTo = turnBoundary(covered[covered.length - 1]!.turn);
   const messages: StoredContext["messages"] = [];
   for (const run of plan.runs) {
     const turns = run.turns.filter((turn) => coveredSeqs.has(turn.assistant.recordSeq));
-    if (turns.length === 0) continue;
-    if (run.prompt !== null) messages.push(promptMessage(run.prompt));
+    // 零 Turn Run 的 Prompt 恒进上下文；落在覆盖范围内时同样进摘要输入，否则压缩会静默丢掉它。
+    const promptCovered = run.prompt !== null && run.prompt.recordSeq <= coveredUpTo;
+    if (turns.length === 0 && !promptCovered) continue;
+    if (promptCovered && run.prompt !== null) {
+      messages.push(promptMessage(run.prompt));
+      messages.push(...zeroTurnAnnotations(run));
+    }
     for (const turn of turns) {
-      messages.push(turn.assistant.message);
-      for (const result of turn.results) messages.push(toolResultMessage(result));
+      messages.push(...turnMessages(turn));
     }
   }
-  const coveredUpTo = turnBoundary(covered[covered.length - 1]!.turn);
   assertCandidateCheckpointValid(records, coveredUpTo);
   return { messages, coveredUpTo, previousSummary: plan.checkpoint?.summary ?? null };
 }

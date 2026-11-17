@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { RUN_OUTCOMES } from "../../src/core/state.js";
 import {
   DEFINITE_TOOL_RESULT_STATUSES,
-  isTurnComplete,
+  isTurnContextComplete,
+  normalizeAbortedMessage,
   parseSessionRecord,
   parseSessionMeta,
   RecordValidationError,
@@ -153,36 +154,43 @@ describe("V1 记录枚举与 Schema 校验", () => {
     expect(() => parseSessionRecord({ ...base, priorContent: 42 }, { expectVersion: false })).toThrow(
       /"priorContent"/,
     );
+    // 新建文件的空快照必须合法，否则成功写入的 Session 会被误判损坏。
+    const created = parseSessionRecord({ ...base, priorContent: "" }, { expectVersion: false });
+    if (created.type === "tool_result") expect(created.priorContent).toBe("");
   });
 });
 
-describe("V8 Turn 完整判据", () => {
+describe("V8 Turn 上下文完整判据", () => {
   it.each(DEFINITE_TOOL_RESULT_STATUSES)("确定状态 %s 判定完整", (status) => {
-    expect(isTurnComplete(assistant(), [toolResult(status)])).toBe(true);
+    expect(isTurnContextComplete(assistant(), [toolResult(status)])).toBe(true);
   });
 
-  it("unknown 不算确定结果", () => {
-    expect(isTurnComplete(assistant(), [toolResult("unknown")])).toBe(false);
+  it("配对 unknown 结果受控完整（进上下文 + 询问标注，门控另行保留）", () => {
+    expect(isTurnContextComplete(assistant(), [toolResult("unknown")])).toBe(true);
   });
 
-  it("缺少 tool_result 判定不完整", () => {
-    expect(isTurnComplete(assistant(), [])).toBe(false);
+  it("缺结果受控完整（崩溃窗口，构建上下文时合成 unknown 占位）", () => {
+    expect(isTurnContextComplete(assistant(), [])).toBe(true);
     expect(
-      isTurnComplete(
+      isTurnContextComplete(
         assistant([
           { id: "c1", name: "read" },
           { id: "c2", name: "write" },
         ]),
         [toolResult("success", "c1")],
       ),
-    ).toBe(false);
+    ).toBe(true);
   });
 
-  it("不同 runId 的同名 toolCallId 不计入", () => {
-    expect(isTurnComplete(assistant(), [toolResult("success", "c1", "run-2")])).toBe(false);
+  it("不同 runId 的同名 toolCallId 属错配，判定不完整", () => {
+    expect(isTurnContextComplete(assistant(), [toolResult("success", "c1", "run-2")])).toBe(false);
   });
 
-  it("interruption 不是 tool_result，不参与判定也不使 Turn 变完整", () => {
+  it("多余结果（引用不存在的 call）属协议损坏，判定不完整", () => {
+    expect(isTurnContextComplete(assistant(), [toolResult("success", "ghost")])).toBe(false);
+  });
+
+  it("interruption 不是 tool_result，不参与判定", () => {
     const interruption = {
       recordSeq: 3,
       ts: TS,
@@ -192,12 +200,65 @@ describe("V8 Turn 完整判据", () => {
       reason: "unknown side effect",
     };
     expect(interruption.type).toBe("interruption");
-    expect(isTurnComplete(assistant(), [])).toBe(false);
-    expect(isTurnComplete(assistant(), [toolResult("denied")])).toBe(true);
+    expect(isTurnContextComplete(assistant(), [])).toBe(true);
+    expect(isTurnContextComplete(assistant(), [toolResult("denied")])).toBe(true);
   });
 
   it("无工具调用的 assistant 消息判定完整", () => {
-    expect(isTurnComplete(assistant([]), [])).toBe(true);
+    expect(isTurnContextComplete(assistant([]), [])).toBe(true);
+  });
+});
+
+describe("aborted Turn 完整判据与归一化", () => {
+  function aborted(
+    toolCalls: Array<{ id: string; name: string }>,
+    text = "half",
+  ): AssistantMessageRecord {
+    return {
+      recordSeq: 2,
+      ts: TS,
+      type: "assistant_message",
+      runId: "run-1",
+      message: makeAssistantMessage(toolCalls, text, { stopReason: "aborted" }),
+    };
+  }
+
+  it("仅文本的 aborted 响应判定完整", () => {
+    expect(isTurnContextComplete(aborted([]), [])).toBe(true);
+  });
+
+  it("可配对 call 带确定结果判定完整", () => {
+    expect(
+      isTurnContextComplete(aborted([{ id: "c1", name: "read" }]), [toolResult("not_executed")]),
+    ).toBe(true);
+  });
+
+  it("可配对 call 缺结果受控完整（崩溃窗口，合成 unknown 占位；门控仍列出缺结果）", () => {
+    expect(isTurnContextComplete(aborted([{ id: "c1", name: "read" }]), [])).toBe(true);
+  });
+
+  it("半截 call（空 id）被剥离后不影响完整性", () => {
+    const record = aborted([{ id: "", name: "read" }]);
+    expect(isTurnContextComplete(record, [])).toBe(true);
+    const normalized = normalizeAbortedMessage(record.message);
+    expect(normalized.content.some((block) => block.type === "toolCall")).toBe(false);
+    expect(normalized.content.some((block) => block.type === "text")).toBe(true);
+  });
+
+  it("重复 id 的 call 仅保留首个", () => {
+    const record = aborted([
+      { id: "c1", name: "read" },
+      { id: "c1", name: "write" },
+    ]);
+    const normalized = normalizeAbortedMessage(record.message);
+    const calls = normalized.content.filter((block) => block.type === "toolCall");
+    expect(calls).toHaveLength(1);
+    expect(isTurnContextComplete(record, [toolResult("not_executed", "c1")])).toBe(true);
+  });
+
+  it("normalizeAbortedMessage 不改非 aborted 消息", () => {
+    const message = makeAssistantMessage([{ id: "c1", name: "read" }]);
+    expect(normalizeAbortedMessage(message)).toBe(message);
   });
 });
 
