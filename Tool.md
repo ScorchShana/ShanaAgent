@@ -1,0 +1,44 @@
+# ShanaAgent 工具边界（read / glob / grep / write / edit / bash）
+
+> 边界摘要。完整行为以代码为唯一依据：模型可见描述在 `prompts/tools/`，参数 Schema 在 `src/tools/registry.ts`，实现与错误模板在 `src/tools/*.ts`。数值限额为 settings.json 可配置项 + 代码命名常量，默认值以代码为准。权限与审批策略见架构 §5。
+
+## 总则
+
+- 按响应中的调用顺序逐个 `await`，不并行、不建调度队列。
+- 参数严格校验，不模糊纠正、不强制转换；非有限数值拒绝执行；参数解析与有限修复见 `src/llm/argument-parser.ts`。
+- 错误以 `Error:` 开头单行返回（bash 执行错误例外：错误首行 + Stdout/Stderr 区块）。模型可见信息只含修正调用所需内容；快照/Diff 机制、内部阶段、系统错误码、堆栈不进 Error，底层异常写 `~/.shana/logs/` 诊断日志并脱敏。
+- 拒绝分类：用户明确拒绝审批 `User denied.`；OS 权限不足 `Permission denied.`；执行前用户取消 `Cancelled by user.`。审批超时、取消与审批系统异常不得归为 User denied。
+- IO 失败无法可靠细分 `File operation failed.`；内部非预期异常 `Internal error. Stop and ask user.`（要求模型停止并询问用户，不新增门控或 Session 状态）。
+- read/glob/grep：正常裁剪返回成功；实际失败或取消只返回一条 Error，不附部分正文/路径/匹配，不误报无匹配。
+- 同批任一工具结果 unknown：保留真实结果，停止同批剩余调用并逐个记录 `not_executed`，进入 Run 收尾，不发下一 Turn、不自动重试。
+- **UTF-8 ground rule**：read/write/edit 只操作 UTF-8 文本；解码失败或含 NUL 即判二进制拒绝，不降级、不覆盖（架构 §5）。
+- **路径目标复验**：审批后及读取、破坏性打开、临时文件创建、rename 等关键操作前复验真实目标；变化返回 `Path target changed. Stop and ask user.`，不自动重试。复验与操作间的竞态窗口不承诺抵御。
+- 区外路径逐次审批；write/edit 经 path-policy 把符号链接解析为真实目标后判越区。
+- 结果路径的显示转义仅作用于展示，调用历史保留原文；模型再次调用前须还原真实路径。
+
+## read
+
+按行读取 UTF-8 文本，带行号。offset/limit 续读（默认 2000 行、上限 5000 行）；输出预算 24000 字符，单行超 2000 字符截断（增大 offset 不能恢复被截行内部分）；空文件与超 EOF offset 返回信息性结果。
+
+## glob
+
+globby 递归路径搜索，结果 newest first，每行一个路径。不跟随目录符号链接，文件符号链接返回；尊重 .gitignore，含非忽略隐藏文件，排除 .git/。搜索路径为相对时结果相对工作区，绝对搜索路径返回绝对路径。上限 200 文件且总输出 24000 字符；超时 `globTimeoutMs`（默认 30s）。`(No files found)` 是完成的空结果。
+
+## grep
+
+@vscode/ripgrep 内容搜索，默认正则引擎（无 PCRE2），输出 `path:line: content`。目录搜索尊重 ignore 文件、跳过隐藏与二进制文件、不跟随目录符号链接；显式文件路径与 glob 过滤按 ripgrep 过滤优先级。总预算 24000 字符，单行内容限 500 字符（保留首个匹配附近文本），超预算整条丢弃，不拆分 Unicode 与转义序列。诊断 stderr 独立预算 `grepStderrMaxChars`（默认 4000）。`No matches found.` 是完成的空结果；搜索失败只返回 Error。
+
+## write
+
+新建或全量覆盖 UTF-8 文件（部分修改用 edit）。父目录必须存在；已有文件须为有效 UTF-8 无 NUL 且不超过 `editMaxFileBytes`（默认 16 MiB）。保留 supplied 内容与行尾，不加 BOM/末尾换行。写入前捕获旧文件全量快照（priorContent，仅供 TUI 历史 Diff，不入模型上下文）；捕获失败（ENOENT 之外）不写入。
+
+## edit
+
+精确字符串替换。多匹配须 `replace_all`，否则返回匹配数量要求扩大上下文；编辑前须先 read。CRLF/孤立 CR 归一化为 LF 后匹配，其余空白有意义；去除文件头部 BOM，成功结果为 LF 行尾、无头部 BOM、不加末尾换行；old/new 归一化后必须不同，匹配失败不改文件。原文件与最终结果均受 `editMaxFileBytes` 限制；保留原 POSIX 权限位（取得/保留失败不提交）。临时文件 + rename 提交，失败只返回可可靠分类的简短原因，清理失败不追加到模型结果。不做版本快照比对，TOCTOU/丢失更新不在首发承诺内。
+
+## bash
+
+全平台统一 bash 语法：Windows → Git Bash，Linux/WSL → 系统 bash；固定工作区根目录执行，每调用独立子进程，不维持常驻 Shell。`timeout` 参数 1–1200 秒、默认 120 秒（代码常量 DEFAULT_SHELL_TIMEOUT_MS，不在 settings.json）。stdout/stderr 分别限 16000/4000 字符，各保头尾。正常退出返回真实退出码（含非零）；启动失败按原因分类，执行错误保留输出区块。
+
+- **超时混合收尾**：尝试终止进程树；确认终止 → 确定超时 ToolResult、Run 继续；无法确认 → 副作用 unknown 收尾，阻塞下个 Run 至用户知情确认。
+- 取消请求终止进程树；取消生效前进程已退出按真实退出结果处理。Session 关闭/退出主动终止受管进程树并等待收尾；确认失败如实提示可能遗留进程，不回滚副作用、不谎称清理完成。

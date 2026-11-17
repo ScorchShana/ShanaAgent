@@ -1,0 +1,194 @@
+# ShanaAgent — 架构设计
+
+> 整体架构基线：系统约束、模块责任、控制流程与已确认设计决策。**行为细节（Schema、数值默认、文案、展示交互）以代码实现为唯一依据**；工具边界摘要见 Tool.md。
+> 技术栈：TypeScript · Node.js >=22.19.0 · 内置 shana-tui · `@earendil-works/pi-ai`（固定 1.4.0）；主要面向 DeepSeek Flash / Qwen Flash，单 Agent、仅 TUI。
+
+## 1. 目标、边界与不变量
+
+目标：① 单进程单活动 Run，独占维护操作（手动压缩）不与 Run 重叠；② 多进程可共用工作区，无工作区锁、无跨进程调度、不承诺写文件事务隔离；③ TUI 与 Core 分离，仅经 Controller 命令、只读快照与事件通知交互；④ 直接 `await` 调用链，EventBus 只发通知，正式状态不依赖 UI 重建；⑤ 面向 Flash 模型的稳定多轮工具调用；⑥ 可审计可恢复：完整审计历史、Context 只选完整 Turn、关键记录在副作用前后提交、不自动重放结果未知的工具；⑦ 首发 Windows 与 Linux/WSL，无法同步验收时 Windows 优先。
+
+非目标：Web/RPC/远程 UI；Subagent/多 Agent/插件/动态扩展；工作区锁与跨进程协同；沙箱隔离恶意代码（定位为**可信开发环境中的误操作防护**）；Session 分支树、历史回退执行、凭据保险库；函数级 Scope Policy。辅助决策模型只做无工具执行能力的分类请求，不构成第二个 Agent。
+
+| 编号 | 不变量                                                                                                                    |
+| ---- | ------------------------------------------------------------------------------------------------------------------------- |
+| I1   | Controller 同步取得 Run 执行权（第一个 `await` 之前），拒绝并发提交；不存在 Prompt FIFO 队列。                            |
+| I2   | 运行中允许草稿、取消、审批及调整后续 Run 思考强度（当前快照不变）；不可提交 Prompt、切换 Session/模型或执行其他普通命令。 |
+| I3   | Run 结束前工具执行/终止与关键日志收尾必须得到明确结果；一个 Run 只产生一次终止事件。                                      |
+| I4   | 工具意图记录成功持久化后才可开始执行；正式完成事件不得早于相应成功持久化。                                                |
+| I5   | Session History 永久保留完整审计；LLM Context 仅含可用的完整 Turn 和对应用户请求。                                        |
+| I6   | 结果未知的工具不因补齐占位 ToolResult 成为可复用 Turn；恢复不自动重放工具。                                               |
+| I7   | 权限以实际 Tool Call 为对象；区内写入、区外只读及 bash 可自动决策；文件工具区外写入必须逐次人工审批（§5）。               |
+| I8   | `/resume` 原子抢独占锁后续写原历史，不复制不新建身份；同一 Session 同时仅一个持锁写者；异常残锁仅人工确认处理。           |
+| I9   | 模型切换只影响后续 Run；跨模型继续必须重新计算上下文预算。                                                                |
+
+## 2. 模块与职责
+
+三层位于同一 Node.js 进程。依赖方向从 Controller/AgentLoop 指向基础设施；允许合并小文件，不破坏边界、不做空泛抽象。
+
+```mermaid
+flowchart TD
+  subgraph TUI[内置 shana-tui]
+    VIEW[Components] --> UISTATE[TUI view state]
+  end
+  subgraph CORE[Agent Core]
+    CTRL[SessionController - authority] --> LOOP[AgentLoop]
+    LOOP --> CONTEXT[ContextBuilder]
+  end
+  subgraph INFRA[Infrastructure]
+    LLM[ModelService / pi-ai Adapter]
+    TOOLS[ToolRegistry + ToolExecutor] --> PERM[PermissionPolicy + ApprovalManager]
+    STORE[SessionStore / Recovery]
+    CONFIG[ModelConfigStore + SettingsStore]
+  end
+  VIEW -->|commands| CTRL
+  LOOP --> LLM & TOOLS & STORE
+  CTRL --> STORE
+  LLM --> CONFIG
+  CTRL & LOOP & PERM --> BUS[EventBus - notifications only]
+  BUS --> UISTATE
+  CTRL -->|snapshot/subscribe| UISTATE
+```
+
+- `SessionController`：活动 Session/Run/独占操作与状态转换的唯一权威；命令入口 + 快照/订阅。
+- `AgentLoop`：顺序驱动 Turn（流式 LLM → 完整响应 → 工具批次 → 下一 Turn），不拥有状态机。
+- `EventBus`：进程内有序通知，监听异常隔离，高频可合并；不做可靠队列、不隐式执行。
+- `ContextBuilder`：组装提示词、项目指令、有效完整 Turn、压缩检查点与模型预算。
+- `ModelService`/Adapter：pi-ai 对接、流式、重试与停止原因标准化；不做工具循环。
+- `ToolRegistry`/`ToolExecutor`：静态六工具注册；校验、路径策略、权限、执行、裁剪、结果标准化。
+- `PermissionPolicy`/`ApprovalManager`：allow/ask 判定与异步审批（允许一次/本会话/拒绝）。
+- `SessionStore`/Recovery：生命周期、持久化、独占锁、续写、校验、压缩检查点；唯一历史数据源。
+- `ModelConfigStore`/`SettingsStore`：配置读取校验与原子写回，不静默修复损坏配置。
+- TUI：交互与展示；不直接调用 LLM、不用 Token Delta 组装权威消息。
+
+## 3. Controller 状态与事件
+
+- 命令：Prompt 仅空闲可提交（Core 层再校验 Busy）；运行中可草稿/取消/审批/调整后续 Run 强度；`/model` `/new` `/resume` `/compact` `/exit` `/autodecision` 在空闲或其允许生命周期内处理；`/compact` 是独占维护操作；Run 结束后草稿保留、**绝不自动提交**。
+- 状态：`idle / running(phase) / compacting`；phase ∈ preparing/streaming/compacting/executing_tool/awaiting_approval/cancelling/finalizing；outcome ∈ completed/cancelled/failed/turn_limit。Controller 唯一改变状态；Run 计时用单调时钟。
+- 取消截止点：开始提交终止记录前取消有效；开始提交时冻结最终结果，此后取消不改结果。即使终止持久化失败，也在内存终结并发布 `failed`（注明未持久化）；`run.finished` 恰一次。
+- 事件三类：Command（有返回/异常）、正式生命周期 Event、流式展示 Event（可合并跳过）。一致性快照 + 订阅同一操作提供；快照轻量不含全量历史，历史由 TUI 按需经 Controller 读取已提交记录。审批摘要对 write/edit 携带**完整调用参数**供 Diff 预览，载体不截断（折叠仅展示层）。流式事件含 `tool.output.delta`（bash 运行中输出尾快照，~1Hz、整体替换语义、直发不合并）：仅展示，不入快照/Context/JSONL，取消即清除。
+
+## 4. AgentLoop 与 LLM 请求
+
+- Run 路径：提交 → 同步预留 → 模型/settings 快照 → 初始化或追加 Session（初始记录 fsync 后才发布身份）→ ContextBuilder → 流式请求 → 完整 Assistant 消息持久化 → 工具逐个「校验 → 权限 → 执行 → 结果持久化」→ 下一 Turn → 统一收尾。
+- Turn = 一次逻辑 LLM 响应及其完整工具批次；同批顺序执行，单项被拒不阻断其余；重试不计 Turn；`maxTurns` 命中时最后完整批次照常执行后以 `turn_limit` 收尾。工具普通错误不自动导致 Run 失败。
+- 重试：可重试错误有限次指数退避（每 Turn 单独计算）；SDK 客户端自带重试必须关闭或受控；错误分类依赖 pi-ai 字符串启发式，不假设稳定错误码。失败尝试片段仅临时展示、不拼接、不入 Context。
+- 执行与回放门控：流式片段只供展示；`stopReason=length` 整批不执行，为可配对调用返回未执行结果；仅整条消息可合法回放且所有调用闭合才进下一 Turn。参数解析与有限修复白名单见代码（`src/llm/argument-parser.ts`）。
+- 溢出：Context Length Exceeded 不可重试；每 Run 至多一次自动压缩补救并在同一 Turn 重发，失败则 Run failed 并建议 `/compact`；补救必须 TUI 可见，不得静默。
+- 跨模型继续：保证**可见上下文连续**，不保证思考连续（pi-ai 按设计丢弃其他模型 thinking 块）；适配失败明确报错，不静默丢可见历史。
+- 辅助决策：POST `<base_url>/v1/systemone` 非流式 choice 请求，应答仅 `ask_user`/`allow_once`；任何失败转人工、不重试；模型放行不生成会话授权；不计 Turn、不入 Context/JSONL。生命周期探测（启动、/new、/resume 完成、/autodecision on）仅确证信号（200 合法结构 / 501 / model 不符）改变可用状态。
+
+## 5. 工具系统与权限
+
+六工具固定：`read`（按行读取裁剪）、`glob`（路径搜索）、`grep`（内容搜索）、`write`（新建/覆盖）、`edit`（精确替换）、`bash`（Windows → Git Bash，Linux/WSL → 系统 bash）。边界摘要见 Tool.md，完整行为以代码为准。glob/grep 递归不跟随符号链接，实现分别为 globby 与 @vscode/ripgrep（缺失明确报错，不静默降级）。
+
+- **UTF-8 ground rule**：read/write/edit 只操作 UTF-8 文本；解码失败即判二进制并拒绝，不降级、不静默跳过、不覆盖；同为 priorContent 快照的二进制判据。
+- 模型可见错误以 `Error:` 开头；Session 只存实际发给模型的格式化裁剪后 ToolResult（priorContent 例外，见 §6）。edit 不做版本快照比对，TOCTOU/丢失更新不在首发强一致性承诺内。
+- 权限默认策略：
+
+| 操作                | 默认策略               | 会话级授权                                 |
+| ------------------- | ---------------------- | ------------------------------------------ |
+| 区内 read/glob/grep | 允许                   | 不请求决策模型                             |
+| 区外 read/glob/grep | 可逐次自动决策         | 不产生会话授权                             |
+| 区内 write/edit     | 无有效授权时可自动决策 | 人工可按工具名授予本会话                   |
+| 区外 write/edit     | **必须逐次人工审批**   | 模型与会话授权均不能豁免                   |
+| bash                | 无有效授权时可自动决策 | 仅完全相同命令字符串授权，固定工作区根执行 |
+| 未知工具 / 无审批器 | 人工审批 / 拒绝        | 自动决策不可用不构成放行依据               |
+
+- 门控顺序：默认允许 → 有效会话授权 → 区外写入/未知工具人工门控 → 其余可自动决策调用。区外写入由代码按真实路径强制人工；bash 无通用目标解析器，由模型依完整命令与决策提示词判断。
+- 审批后及关键操作前路径复验；目标变化返回错误不自动重试；复验与操作间的竞态窗口不承诺抵御。会话授权不持久化，仅同一内存持有者连续占用期间有效；外部写入为一次综合审批。
+- Diff 预览与历史回看是**纯 TUI 展示层**：不新增事件；预览旧内容按需读盘（预览≠执行时刻），历史回看用持久化参数 + priorContent 重建、不读盘；模型可见 ToolResult 不含 Diff。
+- Shell 边界：每调用独立子进程；超时混合收尾——确认终止 → 确定超时结果、Run 继续，无法确认 → 副作用未知收尾并阻塞下个 Run 至知情确认。取消/退出终止进程树并等待收尾，未确认如实提示可能遗留进程；不回滚副作用；结果未知按 §6 门控。运行中 TUI 以 ≤1Hz 尾快照展示实时输出，仅展示层，最终裁剪结果不变。
+
+## 6. Session：创建、恢复、保存
+
+```text
+~/.shana/
+├── model.json / decision-model.json / settings.json
+├── logs/                          # 诊断日志，与 Session 审计物理分离，永不包含 API Key
+└── sessions/<workspace-id>/<session-id>/
+    ├── meta.json / messages.jsonl / context-checkpoint.json
+    └── <session-id>.session.lock  # 写者占用标记
+```
+
+- `workspace-id` = 规范化路径末段 slug + sha256 短哈希，多进程推导一致；是历史组织标识，不是锁。产品名 ShanaAgent，CLI 名 `shana`，数据目录 `~/.shana/`。
+- Session v2：meta 与首条记录均 `version: 2`；未知版本拒载、不迁移、不降级。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
+- 独占占用锁：原子独占创建抢锁，整个占用期持有；`/resume` 抢锁后**续写原 Session**（不复制、不改身份、前缀不改写），recordSeq 从真实尾部重建；残锁仅人工确认移除，不自动删锁/偷锁；尾部截断可只读展示但拒绝续写。
+- History 与 Context 分离：History 永久完整审计（含失败 Run 原始 Prompt）；Context 以完整 Turn 为最小单位——失败 Run 保留原 Prompt 与前面连续完整 Turn，首完整 Turn 前失败则整个 Run 不入 Context；unknown 占位不使 Turn 完整。
+- 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
+- Turn 完整判据（回放/恢复/压缩共用）：响应已结束且可合法回放；工具调用 ID 非空、同轮唯一、名称完整，与确定且已提交的结果一一对应；参数错误不使 Turn 不完整；截断普通文本不完整；length 例外见 §4。
+- 关键提交：意图 fsync 后才执行工具；结果 fsync 后才宣布完成；写入 + fsync 是不可被取消中断的临界区；意图提交失败不执行未开始工具；结果提交失败停 Run 不重跑。
+- **priorContent 不变量**：write/edit 成功写入必带旧文件全量快照（新建除外）；捕获失败（ENOENT 之外）不写入；仅供 TUI 历史 Diff，不入 Context；存储恒全量，折叠仅展示层。
+- 恢复门控：缺确定结果/副作用未知须知情确认（仅确认知晓，不臆断成败）；记录保持 unknown 不改写；不自动重放、不继承旧授权、不重连旧 Shell 句柄。日志与文件系统副作用不构成原子事务，恢复提供可解释执行事实。
+
+## 7. ContextBuilder、指令与压缩
+
+```text
+System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
++ 有效上下文（checkpoint 摘要 + eligible 完整 Turn）+ 当前 User Prompt + 工具 Schema
+```
+
+- 提示词存 `prompts/` 独立英文文件，区块用英文 XML 标签；工具 description 在 `prompts/tools/`、Schema 在 `src/tools/registry.ts`、Error 模板在工具代码。只读工作区**根** AGENTS.md，每 Session 冻结快照；读取失败 Run 继续、省略区块、不向模型注入失败事实。
+- Checkpoint 摘要以 `<conversation_summary>` **头部 user 消息**注入，不落盘、不计 Turn、属低信任历史数据，不得改变权限或指令。
+- 请求可行性：`E + CONTEXT_SAFETY_MARGIN_TOKENS <= C`（余量为代码命名常量，不进 settings）；`maxTokens` 不作输出预留参与判定。Token 估算为近似（ASCII 4 字符/token、非 ASCII 1.5）。
+- 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；两次压缩间至少一个新 Turn；一次失败后该 Run 不再自动触发。
+- 保留策略：手动 /compact 与 (A) 覆盖全部 eligible Turn 不留尾；(B) 与溢出补救**逐字保留最新 eligible Turn**，保留预算按 Token 计并带 cap。
+- 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。
+- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。
+
+## 8. 配置与模型管理
+
+- `model.json`：自有格式，解析映射为 pi-ai Model；`api` 固定 openai-completions；`/model` 只列用户配置模型。凭据**仅明文 apiKey**，不支持 `$VAR`、不用 pi-ai 凭据链；TUI 掩码、日志与错误脱敏（Provider 回显可能含 Key 片段，须二次脱敏）；工具调用参数例外保留原文。`contextWindow`/`maxTokens` 必填，前者可有意低于官方上限、按配置生效。`compat` 不依赖 pi-ai 自动探测，`supportsDeveloperRole` 默认 false、显式配置优先。第一版不做费用记账。无有效模型可启动但禁提交；`/model` 与强度调整原子写回、只影响后续 Run；每 Run 固定模型快照。
+- `settings.json`：无 version，严格 Schema 拒损坏、不静默修复；数值参数 = 可配置项 + 代码命名常量，默认值与范围以代码（`src/llm/settings-store.ts`）为准；启动加载、重启生效；写入临时文件 + 原子替换，多进程不加锁。
+- `decision-model.json`：`base_url` 必填服务根地址（追加 `/v1/systemone`），`model`/`apiKey` 可选；严格校验，不自动创建/修复/写回；缺失=未配置、无效=配置错误，均不阻断主模型；仅支持单模型服务（llama.cpp）。探测与可用状态见 §4。
+
+## 9. 内置 shana-tui TUI
+
+- 框架优先：内置 shana-tui 位于 `src/tui/framework/`（来源与许可见同目录 SOURCE.md）。
+- 交互不变量：TUI 不是唯一安全门，Controller 仍校验状态/权限；审批为非遮挡面板、键盘焦点归审批；快照 + 订阅原子提供；高频流式聚合渲染，TUI 慢不影响 Core 推进；展示层不改写存储、SDK 消息与模型回放；TUI 意外退出请求取消并收尾，不让 Agent 无人管理继续执行。
+- 布局、键位、配色、折叠、鼠标等展示交互细节以代码（`src/tui/`）为准。
+
+## 10. 工程目录
+
+```text
+├── package.json / tsconfig.json / build-assets.mjs
+├── prompts/                      # 系统与专用提示词（英文，每词一个文件）+ tools/ 工具描述
+├── src/
+│   ├── main.ts / bootstrap.ts / workspace.ts / diagnostics.ts
+│   ├── core/                     # session-controller / agent-loop / context-builder / event-bus / events / state
+│   ├── llm/                      # model-service / provider-adapter / model-config-store / settings-store
+│   │                             # decision-service / decision-model-config-store / argument-parser / history-replay
+│   ├── tools/                    # registry / executor / prompts / read / glob / grep / write / edit / shell
+│   ├── security/                 # permissions / approval-manager / path-policy
+│   ├── sessions/                 # session-store / records / recovery / compaction-store
+│   └── tui/                      # app / store / theme / approval-preview / syntax-highlight
+│       ├── framework/            # 内置 shana-tui、native 与许可
+│       └── components/           # Conversation / AssistantMessage / UserMessage / SystemMessage
+│                                 # ToolExecution / ToolRenderers / ApprovalDialog / DiffView / StatusBar / BottomSelector
+└── tests/                        # 镜像 src/：core / llm / tools / security / sessions / tui / integration
+```
+
+不设 PromptQueue、WorkspaceLock、SessionBranchTree、PluginManager、RPC Server 或跨进程协调目录。
+
+## 11. 已确认设计决策（不得反向推翻）
+
+> 以下均经用户确认；反转、变通或修改必须经用户同意。细节以对应章节与代码为准。
+
+- 单 Agent、单进程单活动 Run；多进程共用工作区不加锁，同一 Session 仅一个写者 → §1、§6
+- 运行中不收新 Prompt、无 Prompt 队列；草稿/取消/审批可用 → I1/I2、§3
+- /resume 持锁续写 + 残锁人工确认；不继承旧内存授权、不自动续跑 → I8、§6
+- 权限门控与辅助决策（模型仅单次放行、失败转人工）→ §4、§5
+- Diff 两项独立决议：预览/历史回看纯展示层；模型可见结果不含 Diff → §3、§5、§6
+- 六工具固定；write 可覆盖；edit 精确匹配 + replace_all + 多重匹配报数量 → §5、Tool.md
+- UTF-8 ground rule → §5
+- 失败 Run 不全量排除；unknown Turn 不入 Context → §6
+- 意图先于执行、结果先于完成、fsync 临界区不可中断 → I4、§6
+- Session v2 七类记录与判据不由实现擅改；workspace-id 多进程一致 → §6
+- Shell 超时混合收尾与知情确认 → §5、§6
+- 溢出不可重试 + 每 Run 一次压缩补救 → §4
+- 压缩 A/B 触发、最新 Turn 保留、主路径/回退裁剪、摘要头部 user 消息 → §7
+- 配置：仅明文 apiKey、compat 不依赖自动探测、无费用记账、严格 Schema → §8
+- 跨模型保证可见上下文连续；错误分类依赖字符串启发式；SDK 重试受控 → §4
+- Controller 唯一状态权威、SessionStore 唯一历史源、EventBus 只通知 → §2、§3
+- 诊断日志独立脱敏；Session 权限尽力而为 → §6
+- 提示词与 Error 模板英文、prompts/ 独立文件；只读根 AGENTS.md → §7
+- 首发 Windows、Linux/WSL → §1

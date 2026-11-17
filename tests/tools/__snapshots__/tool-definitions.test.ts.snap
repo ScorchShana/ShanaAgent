@@ -1,0 +1,237 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`V4 六工具定义与确认稿一致 > 定义快照（name/access/description/parameters）与确认稿冻结一致 1`] = `
+[
+  {
+    "access": "read",
+    "description": "Read a UTF-8 text file with line numbers.
+
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Output is limited to 24000 characters. Lines longer than 2000 characters are truncated.
+- Use the returned continuation offset when more lines are available. Increasing offset cannot recover the omitted part of a truncated line.
+- Empty files and offsets beyond EOF return informational results.
+- Files must contain valid UTF-8 without NUL. Validation covers the content actually read.
+- Failures return an Error without partial content.
+",
+    "name": "read",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "default": 2000,
+          "description": "Maximum number of lines to return.",
+          "maximum": 5000,
+          "minimum": 1,
+          "type": "integer",
+        },
+        "offset": {
+          "default": 1,
+          "description": "First line to read, starting at 1.",
+          "minimum": 1,
+          "type": "integer",
+        },
+        "path": {
+          "description": "File path relative to the workspace or absolute.",
+          "minLength": 1,
+          "type": "string",
+        },
+      },
+      "required": [
+        "path",
+      ],
+      "type": "object",
+    },
+  },
+  {
+    "access": "read",
+    "description": "Find files by glob pattern. Returns one path per line, newest first.
+
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Directory patterns recursively find files beneath them. Directory symlinks are not followed; file symlinks are returned.
+- Respects .gitignore, includes non-ignored hidden files, and excludes .git/. Explicit patterns also respect .gitignore.
+- Paths are workspace-relative unless the search path is absolute.
+- Paths use visible escapes for backslashes and control characters. Decode display escapes before using a path in another tool call.
+- Returns at most 200 files within a 24000-character output budget. Narrow the search when results are truncated.
+- "(No files found)" indicates a completed search with no matches.
+- Failures return an Error without partial results.
+",
+    "name": "glob",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Search directory, workspace-relative or absolute. Defaults to the workspace root.",
+          "minLength": 1,
+          "type": "string",
+        },
+        "pattern": {
+          "description": "Case-sensitive glob pattern relative to path, e.g. '**/*.ts', 'src/*.{ts,tsx}', or 'src'. Supports *, ?, character classes, brace expansion, and ** directory segments. Use '/' separators. No absolute paths, '..' segments, backslashes, NUL, negation patterns, or extglobs.",
+          "minLength": 1,
+          "type": "string",
+        },
+      },
+      "required": [
+        "pattern",
+      ],
+      "type": "object",
+    },
+  },
+  {
+    "access": "read",
+    "description": "Search text files using regular expressions. Returns matching lines as path:line: content.
+
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Uses the default ripgrep regex engine without PCRE2.
+- Paths use visible escapes for backslashes and control characters. Decode display escapes before using a path in another tool call.
+- Directory searches respect ignore files, skip hidden and binary files, and do not follow directory symlinks. Explicit file paths and glob filters follow ripgrep's filtering precedence.
+- Total output is limited to 24000 characters, including paths, line numbers, separators, and notices. Each matching line's content is limited to 500 characters including truncation markers, keeping text around the first match.
+- Matches that do not fit the remaining total budget are omitted as whole entries. Unicode characters and escape sequences are never split.
+- Narrow the pattern or search scope when results are truncated.
+- "No matches found." indicates a completed search with no matches.
+- Failures return an Error without partial matches.
+",
+    "name": "grep",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "glob": {
+          "description": "File filter glob, for example '*.ts'.",
+          "minLength": 1,
+          "type": "string",
+        },
+        "limit": {
+          "default": 100,
+          "description": "Maximum number of matching lines to return.",
+          "maximum": 500,
+          "minimum": 1,
+          "type": "integer",
+        },
+        "path": {
+          "description": "File or directory relative to the workspace or absolute. Defaults to the workspace root.",
+          "minLength": 1,
+          "type": "string",
+        },
+        "pattern": {
+          "description": "Regular expression to search for. Matching is case-sensitive by default. Use (?i) for case-insensitive matching.",
+          "minLength": 1,
+          "type": "string",
+        },
+      },
+      "required": [
+        "pattern",
+      ],
+      "type": "object",
+    },
+  },
+  {
+    "access": "write",
+    "description": "Create or fully overwrite a UTF-8 text file. Use edit for partial changes.
+
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- The parent directory must exist.
+- Existing files must contain valid UTF-8 without NUL and fit within the 16777216-byte limit.
+- Writes preserve the supplied content, including line endings. No BOM or trailing newline is added.
+- Follow any instruction to stop and ask the user after a failure.
+",
+    "name": "write",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "description": "Complete new file content. Empty creates or overwrites with an empty file. Maximum 400000 Unicode code points. Must contain valid Unicode without NUL.",
+          "type": "string",
+        },
+        "path": {
+          "description": "File path relative to the workspace or absolute.",
+          "minLength": 1,
+          "type": "string",
+        },
+      },
+      "required": [
+        "path",
+        "content",
+      ],
+      "type": "object",
+    },
+  },
+  {
+    "access": "write",
+    "description": "Replace exact text in an existing UTF-8 text file. Use write to create a file or replace its entire contents.
+
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Read the file before editing. Use file text without read-output line numbers, wrappers, or truncation markers.
+- Include enough context to identify one match. Multiple matches require replace_all.
+- CRLF and standalone CR are normalized to LF before matching. Other whitespace remains significant.
+- The file's leading BOM is removed. BOM characters in arguments and within the file are preserved, except at the beginning of the final file.
+- Successful edits produce LF line endings and no leading BOM. No trailing newline is added.
+- old_string and new_string must differ after line-ending normalization. Failed matching does not modify the file.
+- Files must contain valid UTF-8 without NUL. Both the original file and final UTF-8 result must fit within the 16777216-byte limit.
+",
+    "name": "edit",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "new_string": {
+          "description": "Replacement text; empty deletes the match. Maximum 100000 Unicode code points before normalization. Must contain valid Unicode without NUL.",
+          "type": "string",
+        },
+        "old_string": {
+          "description": "Exact text to replace after newline normalization. Maximum 100000 Unicode code points before normalization. Must contain valid Unicode without NUL.",
+          "minLength": 1,
+          "type": "string",
+        },
+        "path": {
+          "description": "Existing file path relative to the workspace or absolute.",
+          "minLength": 1,
+          "type": "string",
+        },
+        "replace_all": {
+          "default": false,
+          "description": "Replace all matches. When false, exactly one match is required.",
+          "type": "boolean",
+        },
+      },
+      "required": [
+        "path",
+        "old_string",
+        "new_string",
+      ],
+      "type": "object",
+    },
+  },
+  {
+    "access": "shell",
+    "description": "Run a Bash command in the workspace root and return its exit code, stdout, and stderr.
+
+- Uses Git Bash on Windows and system Bash on Linux/WSL.
+- The full command is shown when approval is required. Use non-interactive commands.
+- Normal exit returns the actual exit code, including nonzero codes.
+- Stdout and stderr are limited to 16000 and 4000 characters respectively, preserving the beginning and end of each stream.
+- Execution errors return an Error with captured output.
+- Termination is reported as confirmed only when verified. Follow any instruction to stop and ask the user.
+",
+    "name": "bash",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "description": "Bash command to run in the workspace root.",
+          "minLength": 1,
+          "type": "string",
+        },
+        "timeout": {
+          "default": 120,
+          "description": "Execution timeout in seconds. Defaults to 120. Maximum 1200.",
+          "maximum": 1200,
+          "minimum": 1,
+          "type": "integer",
+        },
+      },
+      "required": [
+        "command",
+      ],
+      "type": "object",
+    },
+  },
+]
+`;

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.codebuddy/
+.test-results/
+
+# 日志与运行产物不入库
+*.log
+tests/llm/real-provider-*.txt
