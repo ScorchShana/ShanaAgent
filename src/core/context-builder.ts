@@ -11,6 +11,7 @@ import {
   type CheckpointRecord,
   type SessionRecord,
   type SessionRunOutcome,
+  type StoredAssistantMessage,
   type ToolResultRecord,
   type UserPromptRecord,
 } from "../sessions/records.js";
@@ -378,12 +379,19 @@ function syntheticUnknownResultMessage(
   };
 }
 
-// eligible Turn → 上下文消息：assistant（aborted 归一化）+ 按 call 顺序的工具结果（缺结果合成
-// unknown 占位）+ 中断/未知标注。buildContext 与 planCompaction 共用，保证压缩与正式请求同构。
+// 半截推理不进上下文：新记录已在落盘前剥离，旧记录在此读取时剥离（TUI 同构不显示）。
+// 仅含 thinking 时克隆，不改 Session 原文。
+function assistantWithoutThinking(message: StoredAssistantMessage): StoredAssistantMessage {
+  if (!message.content.some((block) => block.type === "thinking")) return message;
+  return { ...message, content: message.content.filter((block) => block.type !== "thinking") };
+}
+
+// eligible Turn → 上下文消息：assistant（aborted 归一化并剥离 thinking）+ 按 call 顺序的工具结果
+// （缺结果合成 unknown 占位）+ 中断/未知标注。buildContext 与 planCompaction 共用，保证压缩与正式请求同构。
 export function turnMessages(turn: EligibleTurn): StoredContext["messages"] {
   const aborted = turn.assistant.message.stopReason === "aborted";
   const message = aborted
-    ? normalizeAbortedMessage(turn.assistant.message)
+    ? assistantWithoutThinking(normalizeAbortedMessage(turn.assistant.message))
     : turn.assistant.message;
   const messages: StoredContext["messages"] = [message];
   const byCallId = new Map(turn.results.map((result) => [result.toolCallId, result]));
@@ -603,12 +611,9 @@ function trimToolResultText(text: string, limit: number): string {
 }
 
 function withoutThinking(messages: StoredContext["messages"]): StoredContext["messages"] {
-  return messages.map((message) => {
-    if (message.role !== "assistant" || !message.content.some((block) => block.type === "thinking")) {
-      return message;
-    }
-    return { ...message, content: message.content.filter((block) => block.type !== "thinking") };
-  });
+  return messages.map((message) =>
+    message.role === "assistant" ? assistantWithoutThinking(message) : message,
+  );
 }
 
 function trimToolResults(messages: StoredContext["messages"], limit: number): StoredContext["messages"] {

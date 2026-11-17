@@ -246,6 +246,34 @@ function removeHtmlCommentBlocks(tokens: Token[]): void {
   }
 }
 
+/** Toggle HTML-comment state across a line; comments may open and close several times per line. */
+function scanComments(line: string, inComment: boolean): boolean {
+  let pos = 0;
+  for (;;) {
+    if (inComment) {
+      const close = line.indexOf("-->", pos);
+      if (close < 0) break;
+      inComment = false;
+      pos = close + 3;
+    } else {
+      const open = line.indexOf("<!--", pos);
+      if (open < 0) break;
+      inComment = true;
+      pos = open + 4;
+    }
+  }
+  return inComment;
+}
+
+/** Whether text has more than max newlines, without allocating a split of a huge tail. */
+function exceedsLineBudget(text: string, max: number): boolean {
+  let count = 0;
+  for (let i = text.indexOf("\n"); i >= 0; i = text.indexOf("\n", i + 1)) {
+    if (++count > max) return true;
+  }
+  return false;
+}
+
 const markdownParser = new Marked();
 markdownParser.setOptions({
   tokenizer: new MarkdownTokenizer(),
@@ -325,16 +353,42 @@ interface RenderedBlock {
   highlightedCode: Map<string, string[]>;
 }
 
+/**
+ * Streaming stable-prefix state. The prefix keeps parsed markdown while only the tail is
+ * reparsed per delta; the scanner advances the boundary only where appending text cannot
+ * change earlier blocks (blank lines outside fences/latex/comments, closed fences, ATX
+ * headings, thematic breaks). Completion always reparses the full source exactly.
+ */
+interface StreamState {
+  /** Normalized source at the last scan; a non-append edit resets the state. */
+  source: string;
+  /** Offset up to which complete lines have been scanned. */
+  scanned: number;
+  /** End of the stabilized prefix; always a complete-line boundary. */
+  stableEnd: number;
+  fence: { char: string; length: number } | null;
+  latex: "$$" | "\\[" | null;
+  comment: boolean;
+  /** Last non-blank line: an indented one may continue an indented code block across a blank line. */
+  prevNonBlank: string | null;
+  /** Lexed stable prefix, held weakly like the exact-path tokens; rebuilt from chunks if collected. */
+  tokens: WeakRef<{ source: string; tokens: Token[]; links: TokensList["links"] }> | null;
+}
+
 export class Markdown implements Component {
   private text: string;
   private streaming = false;
   private preview?: { source: string; width: number; lines: string[]; prefix: string; prefixLines: string[] };
+  private stream?: StreamState;
+  private streamPreview?: { source: string; width: number; lines: string[] };
 
   /** Enable bounded, approximate previews; ending streaming defers exact parsing until render(). */
   setStreaming(streaming: boolean): void {
     if (this.streaming === streaming) return;
     this.streaming = streaming;
     this.preview = undefined;
+    this.streamPreview = undefined;
+    this.stream = undefined;
     this.clearRenderCache();
     // Completion must lex the full current source, even if a weak token entry survives.
     if (!streaming) this.cachedTokens = undefined;
@@ -382,11 +436,13 @@ export class Markdown implements Component {
   setText(text: string): void {
     if (this.text === text) return;
     this.text = text;
+    this.streamPreview = undefined;
     this.clearRenderCache();
   }
 
   invalidate(): void {
     this.preview = undefined;
+    this.streamPreview = undefined;
     this.clearRenderCache();
     // The theme may have changed, which changes every styled line and the default style's prefix.
     this.blocks = undefined;
@@ -473,7 +529,7 @@ export class Markdown implements Component {
   }
 
   render(width: number): string[] {
-    if (this.streaming && !this.options.transform) return this.renderPreview(width);
+    if (this.streaming && !this.options.transform) return this.renderStreaming(width);
     // Check cache
     if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
       return this.cachedLines;
@@ -510,23 +566,7 @@ export class Markdown implements Component {
     // A reference link resolves through a definition anywhere in the text, so blocks with the same source can render
     // differently; such texts are rare in practice and render without reusing blocks.
     const reuseBlocks = Object.keys(tokens.links).length === 0;
-    const previousBlocks = this.blocks?.deref();
-    const blocks = new Map<string, RenderedBlock>();
-    this.blocks = new WeakRef(blocks);
-    const contentLines: string[] = [];
-    for (let i = 0; i < tokens.length; i++) {
-      const token = tokens[i]!;
-      const nextTokenType = tokens[i + 1]?.type;
-      const reused = reuseBlocks ? (blocks.get(token.raw) ?? previousBlocks?.get(token.raw)) : undefined;
-      const block = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: new Map() };
-      if (block.width !== width || block.nextTokenType !== nextTokenType) {
-        this.renderBlock(block, token, nextTokenType, width, contentWidth);
-      }
-      if (reuseBlocks) blocks.set(token.raw, block);
-      for (const line of block.lines) {
-        contentLines.push(line);
-      }
-    }
+    const contentLines = this.renderBlockList(tokens, reuseBlocks, width, contentWidth);
 
     // Add top/bottom padding (empty lines)
     const bgFn = this.defaultTextStyle?.bgColor;
@@ -547,6 +587,169 @@ export class Markdown implements Component {
     this.cachedLines = result;
 
     return result.length > 0 ? result : [""];
+  }
+
+  /** Style and wrap a top-level token list, reusing cached block lines keyed by source. */
+  private renderBlockList(
+    tokens: readonly Token[],
+    reuseBlocks: boolean,
+    width: number,
+    contentWidth: number,
+  ): string[] {
+    const previousBlocks = this.blocks?.deref();
+    const blocks = new Map<string, RenderedBlock>();
+    this.blocks = new WeakRef(blocks);
+    const contentLines: string[] = [];
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i]!;
+      const nextTokenType = tokens[i + 1]?.type;
+      const reused = reuseBlocks ? (blocks.get(token.raw) ?? previousBlocks?.get(token.raw)) : undefined;
+      const block = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: new Map() };
+      if (block.width !== width || block.nextTokenType !== nextTokenType) {
+        this.renderBlock(block, token, nextTokenType, width, contentWidth);
+      }
+      if (reuseBlocks) blocks.set(token.raw, block);
+      for (const line of block.lines) {
+        contentLines.push(line);
+      }
+    }
+    return contentLines;
+  }
+
+  /**
+   * Streaming render: the stabilized prefix keeps parsed markdown (blocks rendered once and
+   * cached), only the tail is reparsed per delta. A pathological tail (one huge line or a huge
+   * unclosed block) degrades to the bounded plain preview; completion reparses exactly either way.
+   */
+  private renderStreaming(width: number): string[] {
+    if (this.streamPreview?.source === this.text && this.streamPreview.width === width)
+      return this.streamPreview.lines;
+    const source = this.text.replace(/\r\n?/g, "\n").replace(/\t/g, "   ");
+    if (!this.stream || !source.startsWith(this.stream.source)) {
+      this.stream = {
+        source: "",
+        scanned: 0,
+        stableEnd: 0,
+        fence: null,
+        latex: null,
+        comment: false,
+        prevNonBlank: null,
+        tokens: null,
+      };
+    }
+    this.advanceStream(source);
+    const tail = source.slice(this.stream.stableEnd);
+    if (tail.length > 16384 || exceedsLineBudget(tail, 32)) return this.renderPreview(width);
+    const contentWidth = Math.max(1, width - this.paddingX * 2);
+    const prefix = this.stableTokens(source);
+    const prefixLines = prefix.tokens.length
+      ? this.renderBlockList(prefix.tokens, Object.keys(prefix.links).length === 0, width, contentWidth)
+      : [];
+    // A separate instance keeps tail tokens and blocks out of the prefix caches.
+    const tailLines = new Markdown(
+      tail,
+      this.paddingX,
+      0,
+      this.theme,
+      this.defaultTextStyle,
+      this.options,
+    ).render(width);
+    const blank = this.defaultTextStyle?.bgColor
+      ? applyBackgroundToLine(" ".repeat(width), width, this.defaultTextStyle.bgColor)
+      : " ".repeat(width);
+    const padding = Array.from({ length: this.paddingY }, () => blank);
+    const lines = [...padding, ...prefixLines, ...tailLines, ...padding];
+    this.streamPreview = { source: this.text, width, lines };
+    return lines;
+  }
+
+  /**
+   * Scan newly appended complete lines and advance the stable boundary. Conservative rules:
+   * never inside a fence/latex block/comment; blank lines qualify unless the previous non-blank
+   * line is indented (indented code can span blank lines); closed fences, ATX headings and
+   * thematic breaks are self-contained. Loose-list/blockquote continuation across a boundary
+   * only drifts spacing and is corrected by the completion reparse.
+   */
+  private advanceStream(source: string): void {
+    const s = this.stream!;
+    let i = s.scanned;
+    while (i < source.length) {
+      const nl = source.indexOf("\n", i);
+      if (nl < 0) break;
+      const line = source.slice(i, nl);
+      const lineEnd = nl + 1;
+      let closedFence = false;
+      if (s.fence) {
+        const close = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+        if (close && close[1]![0] === s.fence.char && close[1]!.length >= s.fence.length) {
+          s.fence = null;
+          closedFence = true;
+        }
+      } else if (s.latex) {
+        if (line.includes(s.latex === "$$" ? "$$" : "\\]")) s.latex = null;
+      } else {
+        s.comment = scanComments(line, s.comment);
+        if (!s.comment) {
+          if (/^ {0,3}\$\$/.test(line) && line.indexOf("$$", 2) < 0) s.latex = "$$";
+          else if (/^ {0,3}\\\[/.test(line) && !line.includes("\\]")) s.latex = "\\[";
+          else {
+            const open = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+            // A backtick fence's info string cannot contain backticks (CommonMark).
+            if (open && !(open[1]![0] === "`" && line.slice(open[0].length).includes("`")))
+              s.fence = { char: open[1]![0]!, length: open[1]!.length };
+          }
+        }
+      }
+      const blank = line.trim() === "";
+      const safe = !s.fence && !s.latex && !s.comment;
+      const selfContained =
+        closedFence || /^ {0,3}#{1,6}(?:[ \t]|$)/.test(line) || /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/.test(line);
+      if (
+        safe &&
+        (selfContained || (blank && !(s.prevNonBlank !== null && /^ {4}/.test(s.prevNonBlank))))
+      )
+        s.stableEnd = lineEnd;
+      if (!blank) s.prevNonBlank = line;
+      i = lineEnd;
+    }
+    s.scanned = i;
+    s.source = source;
+  }
+
+  /**
+   * Lex the stable prefix incrementally: only newly stabilized text is lexed, split at blank
+   * lines into bounded chunks. A blank-free block larger than the budget is lexed whole once
+   * (one-time cost, not per delta). If the weak entry was collected, rebuild from chunks.
+   */
+  private stableTokens(source: string): { tokens: Token[]; links: TokensList["links"] } {
+    const s = this.stream!;
+    const needed = source.slice(0, s.stableEnd);
+    const cached = s.tokens?.deref();
+    if (cached && cached.source === needed) return cached;
+    const tokens: Token[] = [];
+    const links: TokensList["links"] = {};
+    const reusable = cached && needed.startsWith(cached.source) ? cached : undefined;
+    let offset = reusable?.source.length ?? 0;
+    if (reusable) {
+      for (const token of reusable.tokens) tokens.push(token);
+      Object.assign(links, reusable.links);
+    }
+    while (offset < needed.length) {
+      let end = Math.min(needed.length, offset + 16384);
+      if (end < needed.length) {
+        const blank = needed.lastIndexOf("\n\n", end - 1);
+        if (blank > offset) end = blank + 2;
+      }
+      const lexed = markdownParser.lexer(needed.slice(offset, end));
+      trimPartialClosingFences(lexed);
+      removeHtmlCommentBlocks(lexed);
+      for (const token of lexed) tokens.push(token);
+      Object.assign(links, lexed.links);
+      offset = end;
+    }
+    const result = { source: needed, tokens, links };
+    s.tokens = new WeakRef(result);
+    return result;
   }
 
   /** Render one top-level block to output lines: wrapped, with margins, and padded or backgrounded to the width. */

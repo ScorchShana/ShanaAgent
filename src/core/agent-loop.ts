@@ -385,23 +385,27 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   };
   // 用户取消时把已流式生成的部分响应落盘为受控中断 Turn：History 存原文（含半截 call）供审计，
   // 仅对可配对 call 合成 not_executed 结果（它们从未进入 executor）。无实质内容则不落盘。
+  // 半截 thinking 在落盘前剥离（经授权修订 I5 审计范围）：推理草稿无续写价值，回传可能误导
+  // 模型与压缩摘要。纯思考取消剥离后无实质内容 → 不落盘，Run 走零 Turn 取消标注。
   const persistAbortedTurn = async (
     handle: RunHandle,
     partial: StoredAssistantMessage | undefined,
   ): Promise<void> => {
     if (!partial) return;
-    const normalized = normalizeAbortedMessage(partial);
+    const stripped: StoredAssistantMessage = {
+      ...partial,
+      content: partial.content.filter((block) => block.type !== "thinking"),
+    };
+    const normalized = normalizeAbortedMessage(stripped);
     const calls = toolCallsOfMessage(normalized);
     const hasText = normalized.content.some(
-      (block) =>
-        (block.type === "text" && block.text.trim().length > 0) ||
-        (block.type === "thinking" && block.thinking.trim().length > 0),
+      (block) => block.type === "text" && block.text.trim().length > 0,
     );
     if (!hasText && calls.length === 0) return;
     const assistant = await append({
       type: "assistant_message",
       runId: handle.runId,
-      message: partial,
+      message: stripped,
     });
     for (const call of calls) {
       await append({
@@ -447,6 +451,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   // 前缀重建比较自动覆盖 checkpoint 插入、标注/eligibility 差异等历史改写情形。
   // 已知有界残差：System Prompt/environment 不落盘，跨进程版本变更引起的固定头部漂移
   // 无法校验，误差以头部大小为界；工具 Schema 经 run_started 的 settings 快照校验。
+  // 旧记录的 aborted thinking 读取时剥离：历史实测含当时发送的 thinking，锚定偏高，
+  // 误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
   const anchorContextTokens = async (context: StoredContext): Promise<number | null> => {
     let reason = "no_measurement";
     let anchored: number | null = null;
@@ -550,32 +556,43 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       handle.reportPhase("streaming");
       throw error;
     }
-    handle.notifyCompactionFinished(
-      outcome.status === "completed" && outcome.coveredUpTo !== null
-        ? { status: "completed", path: outcome.path, coveredUpTo: outcome.coveredUpTo }
-        : { status: outcome.status },
-    );
-    handle.reportPhase("streaming");
-    if (outcome.status === "completed") {
-      const tools = built.context.tools;
-      // Prompt 已持久化且恒进上下文：未被覆盖时由 plan 保留，被覆盖时已进摘要输入。
-      // 重建一律不传 currentPrompt，否则与记录中的 Prompt 重复。
-      built = await buildContext({
-        records,
-        workspacePath: options.workspaceRoot,
-        agentsMd: sessionAgentsMd,
-        systemPrompt: options.systemPrompt,
-        environment: options.environment,
-      });
-      // 复用原数组保证与上一次正式请求逐字节一致。
-      built.context.tools = tools;
-      // 压后上下文未发送过、无实测可用，只能纯估算；下一次响应返回后重新锚定。
-      contextTokens = estimateContextTokens(built.context, tokenEstimate);
-      if (!isRequestFeasible(contextTokens, runModel.contextWindow)) {
-        throw new Error(
-          "Context length still exceeded after compaction. Use /compact or start a new Session.",
-        );
+    // 压后估算随 finished 事件上报供状态栏立即更新；try/finally 保证重建抛错时事件仍恰发一次。
+    let contextEstimate: number | undefined;
+    try {
+      if (outcome.status === "completed") {
+        const tools = built.context.tools;
+        // Prompt 已持久化且恒进上下文：未被覆盖时由 plan 保留，被覆盖时已进摘要输入。
+        // 重建一律不传 currentPrompt，否则与记录中的 Prompt 重复。
+        built = await buildContext({
+          records,
+          workspacePath: options.workspaceRoot,
+          agentsMd: sessionAgentsMd,
+          systemPrompt: options.systemPrompt,
+          environment: options.environment,
+        });
+        // 复用原数组保证与上一次正式请求逐字节一致。
+        built.context.tools = tools;
+        // 压后上下文未发送过、无实测可用，只能纯估算；下一次响应返回后重新锚定。
+        contextTokens = estimateContextTokens(built.context, tokenEstimate);
+        contextEstimate = contextTokens;
       }
+    } finally {
+      handle.notifyCompactionFinished(
+        outcome.status === "completed" && outcome.coveredUpTo !== null
+          ? {
+              status: "completed",
+              path: outcome.path,
+              coveredUpTo: outcome.coveredUpTo,
+              ...(contextEstimate !== undefined ? { contextTokens: contextEstimate } : {}),
+            }
+          : { status: outcome.status },
+      );
+      handle.reportPhase("streaming");
+    }
+    if (outcome.status === "completed" && !isRequestFeasible(contextTokens, runModel.contextWindow)) {
+      throw new Error(
+        "Context length still exceeded after compaction. Use /compact or start a new Session.",
+      );
     }
     return outcome;
   };
@@ -892,7 +909,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         ...fresh.context,
         tools: toolDefinitions(options.executorOptions?.platform, settings),
       };
-      return compactHistory({
+      const outcome = await compactHistory({
         records,
         context,
         model,
@@ -903,6 +920,27 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         modelService: options.modelService,
         appendRecord: append,
       });
+      if (outcome.status !== "completed") return outcome;
+      // 压后估算仅供状态栏即时显示；重建/估算失败不影响压缩结果本身。
+      try {
+        const rebuilt = await buildContext({
+          records,
+          workspacePath: options.workspaceRoot,
+          agentsMd: sessionAgentsMd,
+          systemPrompt: options.systemPrompt,
+          environment: options.environment,
+        });
+        const estimatedContextTokens = estimateContextTokens(
+          {
+            ...rebuilt.context,
+            tools: toolDefinitions(options.executorOptions?.platform, settings),
+          },
+          settings.tokenEstimate,
+        );
+        return { ...outcome, estimatedContextTokens };
+      } catch {
+        return outcome;
+      }
     },
   };
   const controller = new SessionController({

@@ -891,10 +891,14 @@ export class TuiStore {
         .filter((b) => b.type === "text")
         .map((b) => b.text)
         .join("");
-      const thinking = record.message.content
-        .filter((b) => b.type === "thinking")
-        .map((b) => b.thinking)
-        .join("");
+      // aborted 的半截推理与上下文同构不显示（构建上下文时剥离）；旧记录盘上可能仍含 thinking。
+      const thinking =
+        record.message.stopReason === "aborted"
+          ? ""
+          : record.message.content
+              .filter((b) => b.type === "thinking")
+              .map((b) => b.thinking)
+              .join("");
       if (text || thinking)
         items.push({
           id,
@@ -1050,16 +1054,16 @@ export class TuiStore {
     for (const attempt of this.state.core.streamingAttempts) {
       const persisted = attempt.turn <= committed;
       if (attempt.status === "completed" && persisted) continue;
-      // cancelled attempt 落盘为 aborted Turn 后由持久化项展示；收尾窗口期内有内容的仍 transient 显示。
-      if (attempt.status === "cancelled" && (persisted || (!attempt.text && !attempt.thinking)))
-        continue;
+      // cancelled attempt 落盘为 aborted Turn 后由持久化项展示；收尾窗口期内有正文的仍 transient 显示，
+      // 半截推理不显示（与上下文同构）。
+      if (attempt.status === "cancelled" && (persisted || !attempt.text)) continue;
       attempts.push({
         id: `attempt-${runId}-${attempt.turn}-${attempt.attempt}`,
         runId,
         turn: attempt.turn,
         role: "attempt",
         text: attempt.text,
-        thinking: attempt.thinking,
+        thinking: attempt.status === "cancelled" ? "" : attempt.thinking,
         failed:
           attempt.status === "failed" ||
           (idle && outcome !== "completed" && outcome !== "cancelled" && attempt.status !== "cancelled"),

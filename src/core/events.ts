@@ -58,6 +58,8 @@ export interface CompactionFinishedEvent {
   status: "completed" | "cancelled" | "noop" | "failed";
   path?: "primary" | "fallback";
   coveredUpTo?: number;
+  // 压后上下文纯估算 token 数（仅 completed 且重建成功时携带）：供状态栏在实测过期时立即更新。
+  contextTokens?: number;
   error?: string;
 }
 

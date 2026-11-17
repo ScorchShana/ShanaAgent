@@ -1180,6 +1180,67 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
     ).toBe(true);
   });
 
+  it("旧记录的 aborted thinking 构建上下文时剥离，History 原文不变", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const record = records[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "LEGACY_DRAFT" });
+    const snapshot = JSON.stringify(records);
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(built.context.messages)).not.toContain("LEGACY_DRAFT");
+    expect(JSON.stringify(records)).toBe(snapshot);
+    expect(() => prepareReplay(built.context)).not.toThrow();
+  });
+
+  it("完成 Turn 的 thinking 保留进上下文（对照）", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "done" }),
+      makeRunFinishedRecord(3, "run-1", "completed"),
+    ];
+    const record = records[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "KEEP_DRAFT" });
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(JSON.stringify(built.context.messages)).toContain("KEEP_DRAFT");
+  });
+
+  it("aborted thinking 不计入上下文估算", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const withDraft = structuredClone(records);
+    const record = withDraft[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "x".repeat(10_000) });
+    const base = await buildContext({ records, workspacePath: makeWorkspace() });
+    const inflated = await buildContext({ records: withDraft, workspacePath: makeWorkspace() });
+    expect(estimateContextTokens(inflated.context, ESTIMATE)).toBe(
+      estimateContextTokens(base.context, ESTIMATE),
+    );
+  });
+
+  it("压缩摘要输入不含 aborted thinking（与正式请求同构）", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const record = records[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "SUMMARY_DRAFT" });
+    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    expect(selection.messages.some((m) => m.role === "assistant")).toBe(true);
+    expect(JSON.stringify(selection.messages)).not.toContain("SUMMARY_DRAFT");
+  });
+
   it("零 Turn 的取消 Run：Prompt 恒进上下文并附取消标注", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),

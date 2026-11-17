@@ -134,3 +134,114 @@ test('append partitions and sanitized-prefix changes match cold previews', () =>
   }
  }
 });
+
+test('streaming keeps parsed markdown in the stable prefix', () => {
+  const m = new Markdown('', 0, 0, theme);
+  m.setStreaming(true);
+  let src = '**bold**\n\n# Head\n\n';
+  m.setText(src);
+  const exactHead = new Markdown(src, 0, 0, theme).render(60);
+  assert.deepEqual(m.render(60).slice(0, exactHead.length), exactHead);
+  for (const chunk of ['tail ', 'grows ', 'here']) {
+    src += chunk;
+    m.setText(src);
+    const lines = m.render(60);
+    assert.deepEqual(lines.slice(0, exactHead.length), exactHead);
+    assert.ok(lines[0].includes('\x1b[1m'));
+  }
+  m.setStreaming(false);
+  assert.deepEqual(m.render(60), new Markdown(src, 0, 0, theme).render(60));
+});
+
+test('an open code fence keeps code styling and never splits the prefix', () => {
+  const m = new Markdown('', 0, 0, theme);
+  m.setStreaming(true);
+  let src = 'intro **bold**\n\n```ts\n';
+  m.setText(src);
+  m.render(60);
+  for (const line of ['const a = 1;\n', 'const b = 2;\n']) {
+    src += line;
+    m.setText(src);
+    const lines = m.render(60);
+    assert.ok(lines[0].includes('\x1b[1m'));
+    assert.ok(lines.some(l => l.includes('```ts')));
+    assert.ok(lines.some(l => l.includes(line.trim())));
+  }
+  src += '```\n\nafter\n';
+  m.setText(src);
+  assert.ok(m.render(60).some(l => l.includes('after')));
+  m.setStreaming(false);
+  assert.deepEqual(m.render(60), new Markdown(src, 0, 0, theme).render(60));
+});
+
+test('stable prefix is lexed incrementally, not per delta', () => {
+  const original = Marked.prototype.lexer;
+  const inputs: string[] = [];
+  Marked.prototype.lexer = function(source, options) { inputs.push(source); return original.call(this, source, options); };
+  try {
+    let src = '';
+    const m = new Markdown('', 0, 0, theme);
+    m.setStreaming(true);
+    for (let i = 0; i < 60; i++) {
+      const block = `paragraph ${i} with some text\n\n`;
+      for (let k = 1; k <= block.length; k++) { m.setText(src + block.slice(0, k)); m.render(60); }
+      src += block;
+    }
+    assert.ok(inputs.every(s => s.length <= 16384));
+    inputs.length = 0;
+    m.setText(src + 'tail');
+    m.render(60);
+    assert.ok(inputs.length > 0);
+    assert.ok(inputs.every(s => s.length < 200));
+    inputs.length = 0;
+    m.render(60);
+    assert.equal(inputs.length, 0);
+    m.setStreaming(false);
+    assert.deepEqual(m.render(60), new Markdown(src + 'tail', 0, 0, theme).render(60));
+  } finally { Marked.prototype.lexer = original; }
+});
+
+test('non-append edits during streaming reset the prefix safely', () => {
+  const m = new Markdown('', 0, 0, theme);
+  m.setStreaming(true);
+  m.setText('first **version**\n\nlong text');
+  m.render(60);
+  m.setText('totally different\n\ncontent');
+  m.render(60);
+  m.setText('totally different\n\ncontent grows');
+  m.render(60);
+  m.setStreaming(false);
+  assert.deepEqual(m.render(60), new Markdown('totally different\n\ncontent grows', 0, 0, theme).render(60));
+});
+
+test('a comment opened before the tail stays hidden while streaming', () => {
+  const m = new Markdown('', 0, 0, theme);
+  m.setStreaming(true);
+  let src = 'visible\n\n<!-- secret\n';
+  m.setText(src);
+  assert.ok(!m.render(60).join('\n').includes('secret'));
+  src += 'still secret\n-->\n\nafter\n';
+  m.setText(src);
+  const lines = m.render(60).join('\n');
+  assert.ok(!lines.includes('secret'));
+  assert.ok(lines.includes('visible'));
+  assert.ok(lines.includes('after'));
+  m.setStreaming(false);
+  assert.deepEqual(m.render(60), new Markdown(src, 0, 0, theme).render(60));
+});
+
+test('a display latex block is never split while open', () => {
+  const m = new Markdown('', 0, 0, theme);
+  m.setStreaming(true);
+  let src = 'text\n\n$$\n';
+  m.setText(src);
+  m.render(60);
+  for (const chunk of ['x^2\n', '$$\n\nafter\n']) {
+    src += chunk;
+    m.setText(src);
+    m.render(60);
+  }
+  assert.ok(m.render(60).join('\n').includes('after'));
+  m.setStreaming(false);
+  assert.deepEqual(m.render(60), new Markdown(src, 0, 0, theme).render(60));
+});

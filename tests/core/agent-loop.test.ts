@@ -277,6 +277,73 @@ describe("取消后的上下文落盘（A/B）", () => {
     expect(records.some((r) => r.type === "assistant_message")).toBe(true);
     expect(records.some((r) => r.type === "tool_result")).toBe(false);
   });
+
+  it("B：thinking-only partial 剥离后不落盘（零 Turn 取消）", async () => {
+    const partial = makeAssistantMessage([], "", { stopReason: "aborted" });
+    partial.content.push({ type: "thinking", thinking: "draft" });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.map((r) => r.type)).toEqual(["user_prompt", "run_started", "run_finished"]);
+    expect(JSON.stringify(records)).not.toContain("draft");
+  });
+
+  it("B：含正文的 partial 落盘时剥离 thinking、正文保留", async () => {
+    const partial = makeAssistantMessage([], "half", { stopReason: "aborted" });
+    partial.content.unshift({ type: "thinking", thinking: "draft" });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    const assistant = records.find((r) => r.type === "assistant_message");
+    expect(assistant?.type === "assistant_message" && assistant.message.content).toEqual([
+      { type: "text", text: "half" },
+    ]);
+  });
+
+  it("B：thinking + 合法 call：call 保留、not_executed 照旧、thinking 剥离", async () => {
+    const partial = makeAssistantMessage([{ id: "a", name: "read" }], "", {
+      stopReason: "aborted",
+    });
+    partial.content.unshift({ type: "thinking", thinking: "draft" });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.map((r) => r.type)).toEqual([
+      "user_prompt",
+      "run_started",
+      "assistant_message",
+      "tool_result",
+      "run_finished",
+    ]);
+    expect(records.find((r) => r.type === "tool_result")).toMatchObject({
+      toolCallId: "a",
+      status: "not_executed",
+    });
+    expect(JSON.stringify(records)).not.toContain("draft");
+  });
+
+  it("B：thinking + 半截非法 call：剥离后无实质内容不落盘", async () => {
+    const partial = makeAssistantMessage([{ id: "", name: "read" }], "", {
+      stopReason: "aborted",
+    });
+    partial.content.unshift({ type: "thinking", thinking: "draft" });
+    const f = await cancelFixture(async (cancel) => {
+      cancel();
+      throw new TurnError("cancelled", 1, "Turn aborted", partial);
+    });
+    await expect(f.controller.submitPrompt("q")).resolves.toBe("cancelled");
+    const records = (await f.store.loadSession(f.ref)).records;
+    expect(records.map((r) => r.type)).toEqual(["user_prompt", "run_started", "run_finished"]);
+  });
 });
 
 it("creates no Session until the first accepted prompt and resets to blank without creating another", async () => {

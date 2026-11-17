@@ -78,7 +78,8 @@ export interface SessionListEntry extends SessionMeta {
 
 export interface ControllerSnapshot {
   runTiming: RunTiming | null;
-  session: SessionView;
+  // contextEstimateTokens 由 Controller 在压缩完成时写入，不属于 Hook 提供的 SessionView。
+  session: SessionView & { contextEstimateTokens: number | null };
   sessionOperation: boolean;
   streamingAttempts: StreamingAttempt[];
   status: ControllerStatus;

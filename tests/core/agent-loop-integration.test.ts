@@ -1195,7 +1195,9 @@ it("manual compact without an open Session fails without creating one", async ()
 it("manual compact covers all eligible turns without retaining a tail", async () => {
   const f = await compactionFixture();
   const outcome = await f.controller.compact();
-  expect(outcome).toEqual({ status: "completed", coveredUpTo: f.lastSeq, path: "primary" });
+  expect(outcome).toMatchObject({ status: "completed", coveredUpTo: f.lastSeq, path: "primary" });
+  // 压后估算写入快照，供状态栏在实测过期时立即更新。
+  expect(f.controller.getSnapshot().session.contextEstimateTokens).toBeGreaterThan(0);
   expect(f.requests).toHaveLength(1);
   expect(f.requests[0]!.maxTokens).toBeUndefined();
   expect(f.requests[0]!.maxRetries).toBe(2);
@@ -1463,6 +1465,9 @@ it("auto compacts at Run start (A) keeping the primary request prefix byte-ident
     coveredUpTo: lastSeq,
     runId: started[0]!.runId,
   });
+  const finished = finishedCompactions(f.events)[0]!;
+  expect(finished.contextTokens).toBeGreaterThan(0);
+  expect(f.controller.getSnapshot().session.contextEstimateTokens).toBe(finished.contextTokens);
   const records = (await f.store.loadSession(f.ref)).records;
   expect(records.filter((r) => r.type === "checkpoint")).toHaveLength(1);
 });

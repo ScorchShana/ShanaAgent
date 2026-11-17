@@ -974,6 +974,89 @@ it("keeps cancelled partial as a persisted aborted Turn with retry failures and 
   }
 });
 
+it("hides thinking of a persisted aborted Turn but keeps completed Turn thinking", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  const aborted = makeAssistantMessage([], "partial answer", { stopReason: "aborted" });
+  aborted.content.unshift({ type: "thinking", thinking: "legacy draft" });
+  const completed = makeAssistantMessage([], "final answer");
+  completed.content.unshift({ type: "thinking", thinking: "kept draft" });
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 2, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
+      { type: "assistant_message", recordSeq: 2, ts: "now", runId: "r1", message: aborted },
+      { type: "run_finished", recordSeq: 3, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
+      { type: "user_prompt", recordSeq: 4, ts: "now", runId: "r2", text: "again" },
+      { type: "assistant_message", recordSeq: 5, ts: "now", runId: "r2", message: completed },
+      { type: "run_finished", recordSeq: 6, ts: "now", runId: "r2", outcome: "completed", persisted: true },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    const partial = items.find((i) => i.text === "partial answer");
+    expect(partial).toMatchObject({ role: "assistant", cancelled: true });
+    expect(partial?.thinking ?? "").toBe("");
+    expect(JSON.stringify(items)).not.toContain("legacy draft");
+    expect(items.find((i) => i.text === "final answer")?.thinking).toBe("kept draft");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("drops a thinking-only cancelled attempt instead of showing it", async () => {
+  const core = controller(async (handle, signal) => {
+    handle.beginAttempt(1, 1);
+    handle.streamThinking("half thought");
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    handle.finishAttempt("cancelled");
+    return { outcome: "completed" };
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  store.setDraft("task");
+  const run = store.submit();
+  try {
+    // 流式进行中实时 Thinking 照常展示。
+    await vi.waitFor(() => expect(store.items().some((i) => i.thinking === "half thought")).toBe(true));
+    store.cancel();
+    await run;
+    await vi.waitFor(() => expect(store.getSnapshot().core.status.kind).toBe("idle"));
+    expect(store.items().some((i) => i.thinking === "half thought")).toBe(false);
+    expect(store.items().some((i) => i.role === "attempt")).toBe(false);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("shows text but hides thinking for a cancelled attempt in the settlement window", async () => {
+  const core = controller(async (handle, signal) => {
+    handle.beginAttempt(1, 1);
+    handle.streamThinking("half thought");
+    handle.streamText("partial answer");
+    await new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+    handle.finishAttempt("cancelled");
+    return { outcome: "completed" };
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  store.setDraft("task");
+  const run = store.submit();
+  try {
+    await vi.waitFor(() => expect(store.items().some((i) => i.text === "partial answer")).toBe(true));
+    store.cancel();
+    await run;
+    await vi.waitFor(() => expect(store.getSnapshot().core.status.kind).toBe("idle"));
+    const item = store.items().find((i) => i.text === "partial answer");
+    expect(item).toMatchObject({ role: "attempt", cancelled: true });
+    expect(item?.thinking ?? "").toBe("");
+    expect(JSON.stringify(store.items())).not.toContain("half thought");
+  } finally {
+    await store.dispose();
+  }
+});
+
 it("shows the cancelled-request annotation for a zero-turn cancelled Run", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
