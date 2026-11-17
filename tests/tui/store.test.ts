@@ -2132,3 +2132,65 @@ describe("bash 实时输出展示态", () => {
     } finally { await store.dispose(); }
   });
 });
+
+function idleStore(): TuiStore {
+  return new TuiStore(
+    new SessionController({ driver: { execute: async () => ({ outcome: "completed" }) } }),
+    parseSettings({}),
+  );
+}
+
+it("collapses only auto-expanded cards and leaves pre-expanded ones alone", async () => {
+  const store = idleStore();
+  try {
+    store.toggle("manual");
+    store.autoExpand("auto");
+    store.autoExpand("manual");
+    expect(store.getSnapshot().expanded.has("auto")).toBe(true);
+    expect(store.getSnapshot().expanded.has("manual")).toBe(true);
+    store.releaseAutoExpanded();
+    expect(store.getSnapshot().expanded.has("auto")).toBe(false);
+    expect(store.getSnapshot().expanded.has("manual")).toBe(true);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("treats a manual toggle as ownership so release never collapses it again", async () => {
+  const store = idleStore();
+  try {
+    store.autoExpand("tool");
+    store.toggle("tool");
+    expect(store.getSnapshot().expanded.has("tool")).toBe(false);
+    store.toggle("tool");
+    store.releaseAutoExpanded();
+    expect(store.getSnapshot().expanded.has("tool")).toBe(true);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("records the latest approval decision for post-approval tracking", async () => {
+  const core = new SessionController({
+    driver: {
+      execute: async (handle) => {
+        await handle.requestApproval({ toolCallId: "c", toolName: "bash" });
+        return { outcome: "completed" };
+      },
+    },
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  const run = core.submitPrompt("run");
+  try {
+    expect(store.getSnapshot().lastResolvedApproval).toBeNull();
+    await vi.waitFor(() => expect(store.getSnapshot().core.pendingApproval).not.toBeNull());
+    const id = store.getSnapshot().core.pendingApproval!.id;
+    core.resolveApproval(id, "deny");
+    await run;
+    await vi.waitFor(() =>
+      expect(store.getSnapshot().lastResolvedApproval).toEqual({ id, decision: "deny" }),
+    );
+  } finally {
+    await store.dispose();
+  }
+});

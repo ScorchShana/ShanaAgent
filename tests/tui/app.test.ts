@@ -1,10 +1,11 @@
-import { expect, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
+import { stripVTControlCharacters } from "node:util";
 import { TuiApp } from "../../src/tui/app.js";
 import { SessionController } from "../../src/core/session-controller.js";
 import { TuiStore } from "../../src/tui/store.js";
 import { parseSettings } from "../../src/llm/settings-store.js";
-import { TuiAltScreen, Text, getKeybindings } from "../../src/tui/framework/index.js";
+import { TuiAltScreen, Text, getKeybindings, type Component } from "../../src/tui/framework/index.js";
 import { makeModelSnapshot } from "../sessions/helpers.js";
 import { VirtualTerminal } from "./framework/virtual-terminal.js";
 
@@ -603,4 +604,136 @@ it("does not reserve an empty notice row when a model is configured", async () =
     expect(test.app.header.render(200).join(" ")).not.toContain("Auto Decision:");
     expect(test.app.status.render(80)).toHaveLength(2);
   } finally { await test.close(); }
+});
+
+// describe 回调作用域内的 setup 遮蔽外层同名助手：本组固定两工具夹具，与外层审批夹具签名不同。
+describe("审批 UX：到达自动展开，结束自动折叠，按决议追踪下一个工具或追底", () => {
+  function setup(secondTool: boolean) {
+    const core = new SessionController({
+      driver: {
+        execute: async (handle) => {
+          await handle.requestApproval({
+            toolCallId: "call-1",
+            toolName: "bash",
+            summary: { paths: [], command: "echo first" },
+          });
+          return { outcome: "completed" };
+        },
+      },
+    });
+    const store = new TuiStore(core, parseSettings({}));
+    vi.spyOn(store, "items").mockImplementation(() => {
+      const pending = core.getSnapshot().pendingApproval;
+      const items = [
+        {
+          id: "fixture-tool-1",
+          role: "tool",
+          text: "bash",
+          runId: "run-fixture",
+          call: { id: "call-1", name: "bash", parse: { status: "parsed", arguments: { command: "echo first" } } },
+          ...(pending ? { pendingApprovalId: pending.id } : {}),
+        },
+        ...(secondTool
+          ? [
+              {
+                id: "fixture-tool-2",
+                role: "tool",
+                text: "bash",
+                runId: "run-fixture",
+                call: {
+                  id: "call-2",
+                  name: "bash",
+                  parse: { status: "parsed", arguments: { command: "echo second" } },
+                },
+              },
+            ]
+          : []),
+      ];
+      return items as ReturnType<TuiStore["items"]>;
+    });
+    const terminal = new VirtualTerminal();
+    const tui = new TuiAltScreen(terminal);
+    const app = new TuiApp(store, tui);
+    tui.start();
+    return {
+      core,
+      store,
+      terminal,
+      tui,
+      app,
+      async close() {
+        app.dispose();
+        await store.dispose();
+        tui.stop({ preserveScreen: true });
+      },
+    };
+  }
+
+  async function awaitApproval(test: ReturnType<typeof setup>) {
+    await vi.waitFor(() => expect(test.store.getSnapshot().core.pendingApproval).not.toBeNull());
+    await vi.waitFor(() => expect(test.store.getSnapshot().expanded.has("fixture-tool-1")).toBe(true));
+    return test.store.getSnapshot().core.pendingApproval!.id;
+  }
+
+  it("collapses the approved card and reveals the next tool", async () => {
+    const test = setup(true);
+    const run = test.core.submitPrompt("approve");
+    try {
+      const id = await awaitApproval(test);
+      const reveal = vi.spyOn(test.app.scroll, "reveal");
+      test.core.resolveApproval(id, "once");
+      await vi.waitFor(() => expect(reveal).toHaveBeenCalled());
+      const target = reveal.mock.calls.at(-1)![0] as Component;
+      expect(stripVTControlCharacters(target.render(80).join("\n"))).toContain("echo second");
+      expect(test.store.getSnapshot().expanded.has("fixture-tool-1")).toBe(false);
+    } finally {
+      await test.close();
+      await run;
+    }
+  });
+
+  it("collapses a denied card and follows the end instead of tracking not-executed tools", async () => {
+    const test = setup(true);
+    const run = test.core.submitPrompt("approve");
+    try {
+      const id = await awaitApproval(test);
+      test.core.resolveApproval(id, "deny");
+      await vi.waitFor(() => expect(test.app.scroll.isFollowingEnd).toBe(true));
+      expect(test.store.getSnapshot().expanded.has("fixture-tool-1")).toBe(false);
+    } finally {
+      await test.close();
+      await run;
+    }
+  });
+
+  it("follows the end when the approved tool was the last one", async () => {
+    const test = setup(false);
+    const run = test.core.submitPrompt("approve");
+    try {
+      const id = await awaitApproval(test);
+      test.core.resolveApproval(id, "session");
+      await vi.waitFor(() => expect(test.app.scroll.isFollowingEnd).toBe(true));
+      expect(test.store.getSnapshot().expanded.has("fixture-tool-1")).toBe(false);
+    } finally {
+      await test.close();
+      await run;
+    }
+  });
+
+  it("keeps a card the user expanded before the approval arrived", async () => {
+    const test = setup(true);
+    test.store.toggle("fixture-tool-1");
+    const run = test.core.submitPrompt("approve");
+    try {
+      const id = await awaitApproval(test);
+      test.core.resolveApproval(id, "once");
+      await vi.waitFor(() => expect(test.store.getSnapshot().core.pendingApproval).toBeNull());
+      await vi.waitFor(() => expect(test.store.getSnapshot().lastResolvedApproval?.id).toBe(id));
+      test.app.update();
+      expect(test.store.getSnapshot().expanded.has("fixture-tool-1")).toBe(true);
+    } finally {
+      await test.close();
+      await run;
+    }
+  });
 });
