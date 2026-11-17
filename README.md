@@ -19,7 +19,7 @@
 ## 安装
 
 ```bash
-git clone <仓库地址>
+git clone https://github.com/ScorchShana/ShanaAgent.git
 cd ShanaAgent
 npm install
 npm run build
