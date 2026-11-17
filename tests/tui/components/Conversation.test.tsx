@@ -265,6 +265,37 @@ it("reconstructs historical write Diff from priorContent without raw arguments",
     "Diff unavailable",
   );
 });
+it("renders a new-file write Diff from the empty priorContent snapshot", () => {
+  const item: ConversationItem = {
+    id: "d",
+    role: "diff",
+    text: "",
+    call: {
+      type: "toolCall",
+      id: "call",
+      name: "write",
+      rawArguments: '{"content":"new\\nline"}',
+      parse: { status: "parsed", arguments: { content: "new\nline" } },
+    },
+    result: {
+      type: "tool_result",
+      recordSeq: 2,
+      ts: "now",
+      runId: "r",
+      assistantRecordSeq: 1,
+      toolCallId: "call",
+      toolName: "write",
+      status: "success",
+      content: "written",
+      priorContent: "",
+    },
+  };
+  const frame = message(item).frame();
+  expect(frame).toContain("1 + new");
+  expect(frame).toContain("2 + line");
+  expect(frame).not.toContain("- ");
+  expect(frame).not.toContain("Diff unavailable");
+});
 it("shows read content without the repeated path or wrapper tags", () => {
   const lines = readResultDisplayLines(readOutput(["1: first", "2:", "3: third"]), 60);
   expect(lines.map((line) => line.text)).toEqual([

@@ -676,12 +676,13 @@ export function shellResultToOutcome(result: ShellRunResult, timeoutMs: number):
       content: `Error: Command timed out after ${timeoutMs / 1000}s; process termination confirmed.\n${output}`,
       termination,
     };
+  // 确认终止仅说明进程已死，死前可能已产生部分副作用；指引模型先核实再继续（status 仍为确定态，不触发门控）。
+  const message =
+    result.status === "internal_error"
+      ? "Internal error. Stop and ask user."
+      : "Cancelled by user; process termination confirmed. The command may have partially executed before it was killed. Verify its effects (re-read files, check state) before relying on them.";
   return {
-    ...failure(
-      result.status === "internal_error"
-        ? "Internal error. Stop and ask user."
-        : "Cancelled by user; process termination confirmed.",
-    ),
+    ...failure(message),
     category,
     termination,
   };

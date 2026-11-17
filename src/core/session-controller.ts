@@ -52,7 +52,8 @@ export interface AgentLoopDriver {
 }
 
 export interface CompactionDriver {
-  execute(signal: AbortSignal): Promise<CompactionOutcome>;
+  // estimatedContextTokens：压后上下文纯估算，仅供状态栏即时显示，可选。
+  execute(signal: AbortSignal): Promise<CompactionOutcome & { estimatedContextTokens?: number }>;
 }
 
 export interface ControllerCommands {
@@ -133,6 +134,8 @@ export class SessionController {
   private activeRunPromise: Promise<RunOutcome> | null = null;
   private activeCompactionPromise: Promise<CompactionOutcome> | null = null;
   private compaction: CompactionContext | null = null;
+  // 最近一次成功压缩的压后估算；状态栏在实测被 checkpoint 覆盖时改用此值，/new、/resume 清空。
+  private contextEstimateTokens: number | null = null;
 
   constructor(options: SessionControllerOptions) {
     this.now = options.now ?? (() => performance.now());
@@ -208,12 +211,17 @@ export class SessionController {
     const operation = (async (): Promise<CompactionOutcome> => {
       try {
         const outcome = await compactor.execute(context.abortController.signal);
+        const estimate = outcome.estimatedContextTokens;
+        const validEstimate =
+          typeof estimate === "number" && Number.isFinite(estimate) && estimate >= 0 ? estimate : null;
+        if (validEstimate !== null) this.contextEstimateTokens = validEstimate;
         this.bus.publish({
           type: "compaction.finished",
           status: outcome.status,
           ...(outcome.status === "completed" && outcome.coveredUpTo !== null
             ? { path: outcome.path, coveredUpTo: outcome.coveredUpTo }
             : {}),
+          ...(validEstimate !== null ? { contextTokens: validEstimate } : {}),
         } satisfies FormalEvent);
         return outcome;
       } catch (error) {
@@ -363,7 +371,11 @@ export class SessionController {
     return structuredClone({
       runTiming: this.getRunTiming(),
       sessionOperation: this.commandPending,
-      session: { ...session, runModel: this.status.kind === "running" ? session.runModel : null },
+      session: {
+        ...session,
+        contextEstimateTokens: this.contextEstimateTokens,
+        runModel: this.status.kind === "running" ? session.runModel : null,
+      },
       status: this.status,
       pendingApproval: this.pendingApproval,
       streamingAttempts: this.streamingAttempts,
@@ -384,6 +396,7 @@ export class SessionController {
     this.accumulatedText = "";
     this.accumulatedThinking = "";
     this.lastRun = null;
+    this.contextEstimateTokens = null;
   }
 
   private beginRun(command: string): RunContext {
@@ -592,6 +605,9 @@ export class SessionController {
       },
       notifyCompactionFinished: (result) => {
         if (run.finished) return;
+        const estimate = result.contextTokens;
+        if (typeof estimate === "number" && Number.isFinite(estimate) && estimate >= 0)
+          this.contextEstimateTokens = estimate;
         this.bus.publish({
           type: "compaction.finished",
           runId: run.id,

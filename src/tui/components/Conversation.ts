@@ -29,7 +29,7 @@ export class MessageView implements Component {
           ? new AssistantMessage(item, store, theme)
           : item.role === "tool" || item.role === "diff"
             ? new ToolExecution(item, store, theme)
-            : new SystemMessage(item);
+            : new SystemMessage(item, store);
   }
   setApproval(approval?: PendingApproval, preview?: ApprovalPreview) {
     if (this.component instanceof ToolExecution) this.component.setApproval(approval, preview);
@@ -54,7 +54,14 @@ export class MessageView implements Component {
         .render(inner)
         .map((row) => " ".repeat(this.padding) + row + " ".repeat(this.padding));
     if (this.item.role === "assistant" || this.item.role === "attempt") return rows;
-    const bg = toolBackground(this.item.result?.status ?? this.item.activity ?? "queued");
+    // 被排除/被摘要替代的卡片用中性背景；合成 unknown 占位与真实 unknown 结果同色。
+    const status =
+      this.item.compacted || this.item.failed
+        ? "queued"
+        : this.item.syntheticUnknown
+          ? "unknown"
+          : (this.item.result?.status ?? this.item.activity ?? "queued");
+    const bg = toolBackground(status);
     return [
       ...Array<string>(MESSAGE_PADDING_Y).fill(" ".repeat(width)),
       ...rows,

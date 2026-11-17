@@ -458,29 +458,49 @@ export function toolCallsOfMessage(message: StoredAssistantMessage): StoredToolC
   return message.content.filter((block): block is StoredToolCall => block.type === "toolCall");
 }
 
-export function isTurnComplete(
+// 用户中断的响应可能含半截 toolCall（id/name 缺失或 id 重复），它们从未执行、无法配对结果。
+// History 保留原文供审计；构建上下文时剥离这些块，避免 prepareReplay 因非法 tool 身份抛错。
+export function normalizeAbortedMessage(message: StoredAssistantMessage): StoredAssistantMessage {
+  if (message.stopReason !== "aborted") return message;
+  const seen = new Set<string>();
+  const content = message.content.filter((block) => {
+    if (block.type !== "toolCall") return true;
+    if (!block.id || !block.name || seen.has(block.id)) return false;
+    seen.add(block.id);
+    return true;
+  });
+  return { ...message, content };
+}
+
+// 上下文完整性（区别于审计事实）：每个合法 call 有唯一配对结果（任意 status，含 unknown），
+// 或无结果——缺结果只可能来自崩溃窗口（正常/取消路径每个 call 必落盘结果），
+// 构建上下文时合成显式 unknown 占位，不落盘、不写成确定态。门控仍按记录判定，不受此函数影响。
+export function isTurnContextComplete(
   assistant: AssistantMessageRecord,
   results: readonly ToolResultRecord[],
 ): boolean {
-  const calls = toolCallsOfMessage(assistant.message);
   const stop = assistant.message.stopReason;
-  if (stop !== "stop" && stop !== "toolUse" && stop !== "length") return false;
-  if (calls.length === 0 && stop !== "stop") return false;
+  if (stop !== "stop" && stop !== "toolUse" && stop !== "length" && stop !== "aborted") return false;
+  const message = stop === "aborted" ? normalizeAbortedMessage(assistant.message) : assistant.message;
+  const calls = toolCallsOfMessage(message);
+  if (calls.length === 0 && stop !== "stop" && stop !== "aborted") return false;
   if (
     calls.some((call) => !call.id || !call.name) ||
     new Set(calls.map((call) => call.id)).size !== calls.length
   )
     return false;
   const owned = results.filter((result) => result.assistantRecordSeq === assistant.recordSeq);
-  if (owned.length !== calls.length) return false;
+  const callIds = new Set(calls.map((call) => call.id));
+  // 多余结果（引用不存在的 call）属协议损坏，不因其存在而放行。
+  if (owned.some((result) => !callIds.has(result.toolCallId))) return false;
   return calls.every((call) => {
     const matching = owned.filter((result) => result.toolCallId === call.id);
+    if (matching.length === 0) return true;
     return (
       matching.length === 1 &&
       matching[0]!.runId === assistant.runId &&
       matching[0]!.toolName === call.name &&
-      matching[0]!.recordSeq > assistant.recordSeq &&
-      isDefiniteToolResultStatus(matching[0]!.status)
+      matching[0]!.recordSeq > assistant.recordSeq
     );
   });
 }

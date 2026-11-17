@@ -3,19 +3,26 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  CANCELLED_REQUEST_ANNOTATION,
   CONTEXT_SAFETY_MARGIN_TOKENS,
+  FAILED_REQUEST_ANNOTATION,
+  INTERRUPTED_RESPONSE_ANNOTATION,
+  MISSING_TOOL_RESULT_TEXT,
+  UNKNOWN_RESULT_ANNOTATION,
   assertCandidateCheckpointValid,
   buildContext,
   estimateContextTokens,
   estimateTokens,
   isRequestFeasible,
   loadRootAgentsMd,
+  measuredPromptTokens,
   planCompaction,
   planEffectiveContext,
   reachesCompactionThreshold,
   toAgentsMdReference,
   trimCompactionMessages,
 } from "../../src/core/context-builder.js";
+import type { Usage } from "@earendil-works/pi-ai";
 import type { StoredContext } from "../../src/llm/history-replay.js";
 import { prepareReplay } from "../../src/llm/history-replay.js";
 import { CheckpointInvalidError } from "../../src/sessions/recovery.js";
@@ -55,7 +62,7 @@ function interruption(recordSeq: number, runId: string, toolCallId?: string): Se
 }
 
 describe("V4 Turn 级过滤", () => {
-  it("失败 Run 保留原 Prompt 与前序完整 Turn，排除不完整尾部；首 Turn 前失败则整 Run 排除", () => {
+  it("失败 Run 保留原 Prompt；缺结果 Turn 受控进入（合成 unknown 占位），Prompt 恒进", () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "first"),
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
@@ -74,20 +81,19 @@ describe("V4 Turn 级过滤", () => {
     expect(plan.checkpoint).toBeNull();
     expect(plan.runs).toHaveLength(2);
     expect(plan.runs[0]?.promptIncluded).toBe(true);
-    expect(plan.runs[0]?.turns.map((turn) => turn.assistant.recordSeq)).toEqual([2, 4]);
-    expect(
-      plan.runs[0]?.excludedTurns.map((turn) => ({
-        seq: turn.assistant.recordSeq,
-        reason: turn.reason,
-      })),
-    ).toEqual([{ seq: 6, reason: "incomplete_results" }]);
+    expect(plan.runs[0]?.turns.map((turn) => turn.assistant.recordSeq)).toEqual([2, 4, 6]);
+    expect(plan.runs[0]?.turns[2]?.missingCalls).toEqual([{ toolCallId: "c3", toolName: "read" }]);
+    expect(plan.runs[0]?.turns[2]?.hasUnknown).toBe(true);
+    expect(plan.runs[0]?.excludedTurns).toEqual([]);
 
-    expect(plan.runs[1]?.promptIncluded).toBe(false);
-    expect(plan.runs[1]?.turns).toEqual([]);
-    expect(plan.runs[1]?.excludedTurns.map((turn) => turn.reason)).toEqual(["incomplete_results"]);
+    expect(plan.runs[1]?.promptIncluded).toBe(true);
+    expect(plan.runs[1]?.failed).toBe(true);
+    expect(plan.runs[1]?.turns.map((turn) => turn.assistant.recordSeq)).toEqual([9]);
+    expect(plan.runs[1]?.turns[0]?.hasUnknown).toBe(true);
+    expect(plan.runs[1]?.excludedTurns).toEqual([]);
   });
 
-  it("构建的消息只含原 Prompt 与连续完整 Turn，再拼当前 Prompt", async () => {
+  it("构建的消息含原 Prompt、完整 Turn 与缺结果占位/未知标注，再拼当前 Prompt", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "first"),
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
@@ -111,21 +117,38 @@ describe("V4 Turn 级过滤", () => {
       "toolResult",
       "assistant",
       "toolResult",
+      "assistant",
+      "toolResult",
+      "user",
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
       "user",
     ]);
     expect(built.context.messages[0]).toMatchObject({ role: "user", content: "first" });
     expect(built.context.messages[1]).toBe(records[1]?.message);
     expect(built.context.messages[3]).toBe(records[3]?.message);
-    expect(built.context.messages[5]).toMatchObject({ role: "user", content: "now" });
+    expect(built.context.messages[5]).toBe(records[5]?.message);
+    expect(built.context.messages[6]).toMatchObject({
+      role: "toolResult",
+      toolCallId: "c3",
+      isError: true,
+      content: [{ type: "text", text: MISSING_TOOL_RESULT_TEXT }],
+    });
+    expect(built.context.messages[7]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+    expect(built.context.messages[8]).toMatchObject({ role: "user", content: "second" });
+    expect(built.context.messages[12]).toMatchObject({ role: "user", content: "now" });
+    expect(() => prepareReplay(built.context)).not.toThrow();
   });
 });
 
-describe("V5 unknown 拦截", () => {
-  it("含 unknown 的 Turn 不进上下文，interruption 不改变判定", async () => {
+describe("V5 unknown 受控进入", () => {
+  it("含 unknown 结果的 Turn 进上下文并附询问标注；缺结果 Turn 合成占位", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "do it"),
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "write" }]),
-      makeToolResultRecord(3, "run-1", "c1", "unknown"),
+      makeToolResultRecord(3, "run-1", "c1", "unknown", { toolName: "write" }),
       interruption(4, "run-1", "c1"),
       makeUserPromptRecord(5, "run-2", "retry"),
       makeAssistantRecord(6, "run-2", [{ id: "c2", name: "write" }]),
@@ -133,26 +156,49 @@ describe("V5 unknown 拦截", () => {
     ];
 
     const plan = planEffectiveContext(records);
-    expect(plan.runs[0]?.turns).toEqual([]);
-    expect(plan.runs[0]?.promptIncluded).toBe(false);
-    expect(plan.runs[0]?.excludedTurns).toEqual([
-      { assistant: records[1], reason: "unknown_side_effect", toolCallIds: ["c1"] },
-    ]);
-    expect(plan.runs[1]?.turns).toEqual([]);
-    expect(plan.runs[1]?.excludedTurns[0]?.reason).toBe("incomplete_results");
+    expect(plan.runs[0]?.promptIncluded).toBe(true);
+    expect(plan.runs[0]?.turns).toHaveLength(1);
+    expect(plan.runs[0]?.turns[0]?.hasUnknown).toBe(true);
+    expect(plan.runs[0]?.turns[0]?.missingCalls).toEqual([]);
+    expect(plan.runs[0]?.excludedTurns).toEqual([]);
+    expect(plan.runs[1]?.turns[0]?.missingCalls).toEqual([{ toolCallId: "c2", toolName: "write" }]);
+    expect(plan.runs[1]?.turns[0]?.hasUnknown).toBe(true);
 
     const built = await buildContext({
       records,
       currentPrompt: "now",
       workspacePath: makeWorkspace(),
     });
-    expect(built.context.messages).toHaveLength(1);
-    expect(built.context.messages[0]).toMatchObject({ role: "user", content: "now" });
+    expect(built.context.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
+      "user",
+    ]);
+    expect(built.context.messages[0]).toMatchObject({ content: "do it" });
+    // 真实 unknown 结果原文进上下文（isError），不被占位替换。
+    expect(built.context.messages[2]).toMatchObject({ toolCallId: "c1", isError: true });
+    expect(built.context.messages[3]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+    expect(built.context.messages[4]).toMatchObject({ content: "retry" });
+    expect(built.context.messages[6]).toMatchObject({
+      toolCallId: "c2",
+      toolName: "write",
+      isError: true,
+      content: [{ type: "text", text: MISSING_TOOL_RESULT_TEXT }],
+    });
+    expect(built.context.messages[7]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+    expect(built.context.messages[8]).toMatchObject({ content: "now" });
+    expect(() => prepareReplay(built.context)).not.toThrow();
   });
 });
 
 describe("V7 检查点使用", () => {
-  it.each(["length", "error", "aborted", "pending", "deferred"] as const)(
+  it.each(["length", "error", "pending", "deferred"] as const)(
     "检查点不得覆盖被上下文排除的 %s 响应",
     async (stopReason) => {
       const records: SessionRecord[] = [
@@ -176,7 +222,7 @@ describe("V7 检查点使用", () => {
   it("检查点覆盖审计区间时可以跳过前一失败 Run，只总结有效上下文", () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "failed request"),
-      makeAssistantRecord(2, "run-1", [], { stopReason: "aborted" }),
+      makeAssistantRecord(2, "run-1", [], { stopReason: "error" }),
       makeUserPromptRecord(3, "run-2", "next request"),
       makeAssistantRecord(4, "run-2", [], { stopReason: "stop" }),
       makeCheckpointRecord(5, "invalid coverage", 4),
@@ -202,8 +248,9 @@ describe("V7 检查点使用", () => {
     expect(plan.coveredUpTo).toBe(3);
     expect(plan.runs).toHaveLength(1);
     expect(plan.runs[0]?.prompt).toBeNull();
-    expect(plan.runs[0]?.turns.map((turn) => turn.assistant.recordSeq)).toEqual([5]);
-    expect(plan.runs[0]?.excludedTurns.map((turn) => turn.assistant.recordSeq)).toEqual([7]);
+    expect(plan.runs[0]?.turns.map((turn) => turn.assistant.recordSeq)).toEqual([5, 7]);
+    expect(plan.runs[0]?.turns[1]?.hasUnknown).toBe(true);
+    expect(plan.runs[0]?.excludedTurns).toEqual([]);
 
     const built = await buildContext({
       records,
@@ -220,9 +267,14 @@ describe("V7 检查点使用", () => {
       "user",
       "assistant",
       "toolResult",
+      "assistant",
+      "toolResult",
+      "user",
       "user",
     ]);
     expect(built.context.messages[1]).toBe(records[4]?.message);
+    expect(built.context.messages[4]).toMatchObject({ toolCallId: "c3", isError: true });
+    expect(built.context.messages[5]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
     expect(built.context.messages.some((message) => message === records[0]?.message)).toBe(false);
     expect(built.context.messages.some((message) => message === records[2]?.message)).toBe(false);
   });
@@ -723,7 +775,7 @@ describe("V10 压缩范围选择", () => {
     ]);
   });
 
-  it("被排除的 Turn 不进入压缩输入，失败 Run 的 Prompt 也不会单独出现", () => {
+  it("被排除的 Turn 不进入压缩输入；零 Turn Run 的 Prompt 与 unknown Turn 照常进入", () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "first"),
       makeAssistantRecord(2, "run-1", [], { stopReason: "length" }),
@@ -736,16 +788,25 @@ describe("V10 压缩范围选择", () => {
     ];
     const plan = planEffectiveContext(records);
     expect(plan.runs[0]?.excludedTurns[0]?.reason).toBe("truncated");
-    expect(plan.runs[1]?.excludedTurns[0]?.reason).toBe("unknown_side_effect");
+    expect(plan.runs[1]?.turns[0]?.hasUnknown).toBe(true);
 
     const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
     expect(selection.coveredUpTo).toBe(8);
+    // run-1 零 Turn 但 Prompt 恒进上下文，落在覆盖范围内时同样进摘要输入，不被静默丢掉。
     expect(selection.messages.map((message) => message.role)).toEqual([
+      "user",
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
       "user",
       "assistant",
       "toolResult",
     ]);
-    expect(selection.messages[0]).toMatchObject({ content: "third" });
+    expect(selection.messages[0]).toMatchObject({ content: "first" });
+    expect(selection.messages[1]).toMatchObject({ content: "second" });
+    expect(selection.messages[4]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+    expect(selection.messages[5]).toMatchObject({ content: "third" });
   });
 
   it("stopReason=length 但工具结果齐全的 Turn 仍可压缩，调用与结果不被拆开", () => {
@@ -859,7 +920,7 @@ describe("V10 候选 Checkpoint 预校验", () => {
     ).toHaveLength(1);
   });
 
-  it("触发点 (A) 提供 currentPrompt 时只追加一次，不重复持久化的 Prompt", async () => {
+  it("触发点 (A) 压缩后从含 Prompt 的记录重建，Prompt 只出现一次", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "first"),
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
@@ -870,19 +931,14 @@ describe("V10 候选 Checkpoint 预校验", () => {
     expect(selection.coveredUpTo).toBe(3);
     records.push(makeCheckpointRecord(5, "S", 3));
 
-    const built = await buildContext({
-      records,
-      currentPrompt: "now",
-      workspacePath: makeWorkspace(),
-    });
+    // Prompt 恒进上下文：重建不传 currentPrompt（传入会重复，调用方契约见 BuildContextInput）。
+    const rebuilt = await buildContext({ records, workspacePath: makeWorkspace() });
     expect(
-      built.context.messages.filter(
+      rebuilt.context.messages.filter(
         (message) => message.role === "user" && message.content === "now",
       ),
     ).toHaveLength(1);
-
-    const rebuilt = await buildContext({ records, workspacePath: makeWorkspace() });
-    expect(rebuilt.context.messages).toHaveLength(1);
+    expect(rebuilt.context.messages.map((message) => message.role)).toEqual(["user", "user"]);
     expect(rebuilt.context.messages[0]).toMatchObject({
       role: "user",
       content: "<conversation_summary>\nS\n</conversation_summary>",
@@ -1060,5 +1116,283 @@ describe("V15 回退消息裁剪与阶梯裁剪", () => {
         maxTokens: 1,
       }),
     ).toEqual({ status: "too_large" });
+  });
+});
+
+describe("取消/中断 Turn 的上下文资格与标注", () => {
+  it("仅文本的 aborted Turn 进入上下文并附中断标注", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const plan = planEffectiveContext(records);
+    expect(plan.runs[0]?.turns).toHaveLength(1);
+    expect(plan.runs[0]?.promptIncluded).toBe(true);
+
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(built.context.messages[2]).toMatchObject({
+      role: "user",
+      content: INTERRUPTED_RESPONSE_ANNOTATION,
+    });
+    expect(() => prepareReplay(built.context)).not.toThrow();
+  });
+
+  it("aborted Turn 的可配对 call 带 not_executed 结果进入上下文", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], { stopReason: "aborted" }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
+    ]);
+    expect(built.context.messages[2]).toMatchObject({ toolCallId: "c1", isError: true });
+    expect(() => prepareReplay(built.context)).not.toThrow();
+  });
+
+  it("aborted Turn 的半截 call 在上下文被剥离，History 原文不变", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [{ id: "", name: "read" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    const assistant = built.context.messages[1];
+    expect(assistant?.role === "assistant" && assistant.content.some((b) => b.type === "toolCall")).toBe(
+      false,
+    );
+    expect(() => prepareReplay(built.context)).not.toThrow();
+    // History 原文保留半截 call。
+    const original = records[1];
+    expect(
+      original?.type === "assistant_message" &&
+        original.message.content.some((b) => b.type === "toolCall"),
+    ).toBe(true);
+  });
+
+  it("旧记录的 aborted thinking 构建上下文时剥离，History 原文不变", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const record = records[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "LEGACY_DRAFT" });
+    const snapshot = JSON.stringify(records);
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(JSON.stringify(built.context.messages)).not.toContain("LEGACY_DRAFT");
+    expect(JSON.stringify(records)).toBe(snapshot);
+    expect(() => prepareReplay(built.context)).not.toThrow();
+  });
+
+  it("完成 Turn 的 thinking 保留进上下文（对照）", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "done" }),
+      makeRunFinishedRecord(3, "run-1", "completed"),
+    ];
+    const record = records[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "KEEP_DRAFT" });
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(JSON.stringify(built.context.messages)).toContain("KEEP_DRAFT");
+  });
+
+  it("aborted thinking 不计入上下文估算", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const withDraft = structuredClone(records);
+    const record = withDraft[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "x".repeat(10_000) });
+    const base = await buildContext({ records, workspacePath: makeWorkspace() });
+    const inflated = await buildContext({ records: withDraft, workspacePath: makeWorkspace() });
+    expect(estimateContextTokens(inflated.context, ESTIMATE)).toBe(
+      estimateContextTokens(base.context, ESTIMATE),
+    );
+  });
+
+  it("压缩摘要输入不含 aborted thinking（与正式请求同构）", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const record = records[1]!;
+    if (record.type === "assistant_message")
+      record.message.content.unshift({ type: "thinking", thinking: "SUMMARY_DRAFT" });
+    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    expect(selection.messages.some((m) => m.role === "assistant")).toBe(true);
+    expect(JSON.stringify(selection.messages)).not.toContain("SUMMARY_DRAFT");
+  });
+
+  it("零 Turn 的取消 Run：Prompt 恒进上下文并附取消标注", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeRunFinishedRecord(2, "run-1", "cancelled"),
+    ];
+    const plan = planEffectiveContext(records);
+    expect(plan.runs[0]?.turns).toEqual([]);
+    expect(plan.runs[0]?.cancelled).toBe(true);
+    expect(plan.runs[0]?.promptIncluded).toBe(true);
+
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(built.context.messages[0]).toMatchObject({ content: "q" });
+    expect(built.context.messages[1]).toMatchObject({ content: CANCELLED_REQUEST_ANNOTATION });
+  });
+
+  it("零 Turn 的失败 Run：Prompt 恒进上下文并附失败标注", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { stopReason: "error" }),
+      makeRunFinishedRecord(3, "run-1", "failed"),
+    ];
+    const plan = planEffectiveContext(records);
+    expect(plan.runs[0]?.promptIncluded).toBe(true);
+    expect(plan.runs[0]?.failed).toBe(true);
+    expect(plan.runs[0]?.excludedTurns.map((turn) => turn.reason)).toEqual(["incomplete_response"]);
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(built.context.messages[0]).toMatchObject({ content: "q" });
+    expect(built.context.messages[1]).toMatchObject({ content: FAILED_REQUEST_ANNOTATION });
+  });
+
+  it("零 Turn 的失败 Run（无任何响应记录）：Prompt 恒进并附失败标注", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeRunFinishedRecord(2, "run-1", "failed"),
+    ];
+    const plan = planEffectiveContext(records);
+    expect(plan.runs[0]?.promptIncluded).toBe(true);
+    expect(plan.runs[0]?.failed).toBe(true);
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(built.context.messages[1]).toMatchObject({ content: FAILED_REQUEST_ANNOTATION });
+  });
+
+  it("aborted Turn 缺结果：中断标注与未知标注同时注入，占位不替换真实结果", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "bash" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
+      "user",
+    ]);
+    expect(built.context.messages[2]).toMatchObject({
+      toolCallId: "c1",
+      toolName: "bash",
+      isError: true,
+      content: [{ type: "text", text: MISSING_TOOL_RESULT_TEXT }],
+    });
+    expect(built.context.messages[3]).toMatchObject({ content: INTERRUPTED_RESPONSE_ANNOTATION });
+    expect(built.context.messages[4]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+    expect(() => prepareReplay(built.context)).not.toThrow();
+  });
+
+  it("纯缺结果 Turn 可作压缩边界，占位与询问标注进入压缩输入", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "first"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "bash" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success", { toolName: "bash" }),
+      makeUserPromptRecord(4, "run-2", "second"),
+      makeAssistantRecord(5, "run-2", [{ id: "c2", name: "bash" }]),
+      // 崩溃窗口：c2 无结果记录。
+    ];
+    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    expect(selection.coveredUpTo).toBe(5);
+    expect(() => assertCandidateCheckpointValid(records, 5)).not.toThrow();
+    expect(() => planEffectiveContext([...records, makeCheckpointRecord(6, "S", 5)])).not.toThrow();
+    expect(selection.messages.map((m) => m.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
+      "assistant",
+      "toolResult",
+      "user",
+    ]);
+    expect(selection.messages[5]).toMatchObject({
+      toolCallId: "c2",
+      isError: true,
+      content: [{ type: "text", text: MISSING_TOOL_RESULT_TEXT }],
+    });
+    expect(selection.messages[6]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+  });
+
+  it("planCompaction 覆盖 aborted Turn 时携带中断标注", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success"),
+      makeAssistantRecord(4, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(5, "run-1", "cancelled"),
+    ];
+    const selection = planCompaction(records, {
+      keepLatestTurn: false,
+      retainedContextBudget: 0,
+      tokenEstimate: { asciiCharsPerToken: 4, nonAsciiCharsPerToken: 1 },
+    });
+    expect("messages" in selection).toBe(true);
+    if (!("messages" in selection)) return;
+    expect(
+      selection.messages.some(
+        (m) => m.role === "user" && m.content === INTERRUPTED_RESPONSE_ANNOTATION,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("measuredPromptTokens", () => {
+  const usage = (overrides: Partial<Usage> = {}): Usage => ({
+    input: 100,
+    output: 20,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 120,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    ...overrides,
+  });
+  it("sums input + cacheRead + cacheWrite (input excludes cache hits)", () => {
+    expect(measuredPromptTokens(usage({ input: 500, cacheRead: 12000, cacheWrite: 300 }))).toBe(12800);
+  });
+  it("rejects undefined and the all-zero uncounted placeholder", () => {
+    expect(measuredPromptTokens(undefined)).toBeNull();
+    expect(
+      measuredPromptTokens(usage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 })),
+    ).toBeNull();
+  });
+  it("accepts cache-only measurements", () => {
+    expect(measuredPromptTokens(usage({ input: 0, cacheRead: 9000 }))).toBe(9000);
+  });
+  it("rejects negative or non-finite fields", () => {
+    expect(measuredPromptTokens(usage({ input: -1 }))).toBeNull();
+    expect(measuredPromptTokens(usage({ cacheRead: Number.NaN }))).toBeNull();
+    expect(measuredPromptTokens(usage({ cacheWrite: Number.POSITIVE_INFINITY }))).toBeNull();
+    expect(measuredPromptTokens({ ...usage(), input: undefined as unknown as number })).toBeNull();
   });
 });

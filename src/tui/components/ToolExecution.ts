@@ -13,6 +13,7 @@ import {
   type TuiMouseEvent,
 } from "../framework/index.js";
 import { sanitizeDisplayText, type ConversationItem, type TuiStore } from "../store.js";
+import { MISSING_TOOL_RESULT_TEXT } from "../../core/context-builder.js";
 import { wrapDisplay, HistoricalDiff } from "./DiffView.js";
 import { toolSummary, resultRenderer, highlightedReadContent } from "./ToolRenderers.js";
 import { theme } from "../theme.js";
@@ -132,7 +133,8 @@ export class ToolExecution implements Component {
     this.expanded = state.expanded.has(item.id);
     this.resultsExpanded = state.expandedResults?.has(item.id) ?? false;
     const args = item.call?.parse.status === "parsed" ? item.call.parse.arguments : undefined;
-    const status = item.result?.status ?? item.activity ?? "queued";
+    // 缺结果 call 与模型所见同构：按 unknown 展示（合成占位，非真实记录）。
+    const status = item.syntheticUnknown ? "unknown" : (item.result?.status ?? item.activity ?? "queued");
     const labels: Record<string, string> = {
       success: "Success",
       error: "Failed",
@@ -161,7 +163,11 @@ export class ToolExecution implements Component {
     else if (this.diffItem) this.diff.update(this.diffItem);
   }
   render(width: number) {
-    return this.tree.render(width);
+    const rows = this.tree.render(width);
+    // 被排除/被摘要替代的卡片整体淡化：保留审计可见性，明示不再是上下文原文。
+    if (this.item.failed || this.item.compacted)
+      return rows.map((row) => theme.muted(stripVTControlCharacters(row)));
+    return rows;
   }
   handleMouse(event: TuiMouseEvent) {
     return this.tree.handleMouse(event);
@@ -249,6 +255,17 @@ export class ToolExecution implements Component {
     const title: string[] = [];
     if (this.item.call && this.item.call.parse.status !== "parsed")
       return wrapDisplay("参数解析失败", this.bodyWidth(width)).map((row) => this.rail(row, width));
+    if (this.item.syntheticUnknown) {
+      if (!this.expanded) return title;
+      return [
+        ...title,
+        "",
+        ...wrapDisplay(MISSING_TOOL_RESULT_TEXT, this.bodyWidth(width)).map((row) =>
+          this.rail(theme.warning(row), width),
+        ),
+        this.rail(theme.muted("结果缺失（进程中断），上下文按未知处理"), width),
+      ];
+    }
     if (!this.expanded || !this.item.result) return title;
     if (["write", "edit"].includes(this.item.call?.name ?? "") && this.item.result.status === "success")
       return title;

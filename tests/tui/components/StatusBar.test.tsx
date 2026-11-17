@@ -10,7 +10,7 @@ import type {
   SessionRunOutcome,
   StoredAssistantMessage,
 } from "../../../src/sessions/records.js";
-import { StatusBar, sessionContextMetrics, formatWorkspacePath } from "../../../src/tui/components/StatusBar.js";
+import { StatusBar, sessionContextMetrics, contextSegment, formatWorkspacePath } from "../../../src/tui/components/StatusBar.js";
 import { TuiStore, type TuiState } from "../../../src/tui/store.js";
 import { makeAssistantMessage, makeModelSnapshot } from "../../sessions/helpers.js";
 const stores: TuiStore[] = [];
@@ -65,6 +65,16 @@ function timedAssistant(seq: number, runId: string, output: unknown, durationMs:
 }
 function finished(seq: number, runId: string, outcome: SessionRunOutcome = "completed"): SessionRecord {
   return { recordSeq: seq, ts: "now", type: "run_finished", runId, outcome, persisted: true };
+}
+function checkpoint(seq: number, coveredUpTo: number): SessionRecord {
+  return {
+    type: "checkpoint",
+    recordSeq: seq,
+    ts: "now",
+    summary: "summary",
+    coveredUpTo,
+    model: { providerId: "p", modelId: "m" },
+  };
 }
 function running(runId: string, phase: RunPhase = "streaming"): ControllerStatus {
   return { kind: "running", runId, phase };
@@ -130,12 +140,14 @@ it("returns no metrics for an empty history or for runs that have not finished",
     contextWindow: null,
     cacheHitRate: null,
     speedTokPerSec: null,
+    contextEstimated: false,
   });
   expect(sessionContextMetrics([started(1, "r1"), assistant(2, "r1", 100, 50)])).toEqual({
     contextTokens: null,
     contextWindow: null,
     cacheHitRate: null,
     speedTokPerSec: null,
+    contextEstimated: false,
   });
   const view = render(wideStatus(stateWith([], { model: null })));
   expect(view.lastFrame()).toContain("Context: 0 / 0 · Speed: — · Cache: 0.0%");
@@ -414,6 +426,79 @@ it("ignores compaction checkpoints while the active run is measured", () => {
   expect(sessionContextMetrics([...active, checkpoint], undefined, "r1")).toEqual(
     sessionContextMetrics(active, undefined, "r1"),
   );
+});
+it("shows the post-compaction estimate when the checkpoint covers the measured assistant", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 230000),
+    finished(3, "r1"),
+    checkpoint(4, 2),
+  ];
+  const metrics = sessionContextMetrics(records, undefined, null, 52000);
+  expect(metrics.contextTokens).toBe(52000);
+  expect(metrics.contextEstimated).toBe(true);
+  expect(contextSegment(metrics)).toBe("Context: ~52.0k / 128k");
+  // 无估算值时保持实测（旧行为不回退）。
+  const withoutEstimate = sessionContextMetrics(records);
+  expect(withoutEstimate.contextTokens).toBe(230000);
+  expect(withoutEstimate.contextEstimated).toBe(false);
+});
+it("switches back to real usage once a post-compaction assistant is committed", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 230000),
+    finished(3, "r1"),
+    checkpoint(4, 2),
+    started(5, "r2", 128000),
+    assistant(6, "r2", 40000, 10000, 55000),
+    finished(7, "r2"),
+  ];
+  const metrics = sessionContextMetrics(records, undefined, null, 52000);
+  expect(metrics.contextTokens).toBe(55000);
+  expect(metrics.contextEstimated).toBe(false);
+});
+it("shows the estimate during the first post-compaction request of an active run", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 230000),
+    finished(3, "r1"),
+    checkpoint(4, 2),
+    started(5, "r2", 128000),
+  ];
+  const metrics = sessionContextMetrics(records, undefined, "r2", 52000);
+  expect(metrics.contextTokens).toBe(52000);
+  expect(metrics.contextEstimated).toBe(true);
+});
+it("renders the estimate from the controller snapshot with a ~ prefix", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 230000),
+    finished(3, "r1"),
+    checkpoint(4, 2),
+  ];
+  const base = stateWith(records);
+  const view = render(
+    wideStatus({
+      ...base,
+      core: {
+        ...base.core,
+        session: { ...base.core.session, contextEstimateTokens: 52000 },
+      },
+    }),
+  );
+  expect(view.lastFrame()).toContain("Context: ~52.0k / 128k");
+  view.unmount();
+});
+it("keeps real usage without crashing when the checkpoint is invalid", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 230000),
+    finished(3, "r1"),
+    checkpoint(4, 3),
+  ];
+  const metrics = sessionContextMetrics(records, undefined, null, 52000);
+  expect(metrics.contextTokens).toBe(230000);
+  expect(metrics.contextEstimated).toBe(false);
 });
 it("uses real usage and cache for an active run without any finished run", () => {
   const metrics = sessionContextMetrics(

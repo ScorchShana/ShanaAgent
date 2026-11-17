@@ -504,6 +504,174 @@ describe("V4 退避与取消", () => {
   });
 });
 
+describe("取消携带部分响应（partial）", () => {
+  function abortingStream(
+    controller: AbortController,
+    events: AssistantMessageEvent[],
+    final: AssistantMessage,
+  ): TurnStream {
+    return {
+      async *[Symbol.asyncIterator]() {
+        for (const event of events) yield event;
+        controller.abort();
+        yield { type: "error", reason: "aborted", error: final } as AssistantMessageEvent;
+      },
+      result: () => Promise.resolve(final),
+    };
+  }
+
+  it("文本部分响应转为 aborted 存储形态", async () => {
+    const controller = new AbortController();
+    const final = makeMessage({ stopReason: "aborted", content: [{ type: "text", text: "partial" }] });
+    const requester = new FakeRequester();
+    requester.queue(() =>
+      abortingStream(
+        controller,
+        [
+          {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "partial",
+            partial: makeMessage(),
+          } as AssistantMessageEvent,
+        ],
+        final,
+      ),
+    );
+    const error = (await makeService(requester)
+      .streamTurn({ model: makeResolved(), context: CONTEXT, signal: controller.signal })
+      .catch((e: unknown) => e)) as TurnError;
+    expect(error.kind).toBe("cancelled");
+    expect(error.partial?.stopReason).toBe("aborted");
+    expect(error.partial?.content).toEqual([{ type: "text", text: "partial" }]);
+  });
+
+  it("半截 toolCall 参数记为 incomplete，不抛错", async () => {
+    const controller = new AbortController();
+    const call = { type: "toolCall" as const, id: "a", name: "read", arguments: {} };
+    const final = makeMessage({ stopReason: "aborted", content: [call] });
+    const requester = new FakeRequester();
+    requester.queue(() =>
+      abortingStream(
+        controller,
+        [
+          { type: "toolcall_start", contentIndex: 0, partial: final } as AssistantMessageEvent,
+          {
+            type: "toolcall_delta",
+            contentIndex: 0,
+            delta: '{"path":',
+            partial: final,
+          } as AssistantMessageEvent,
+        ],
+        final,
+      ),
+    );
+    const error = (await makeService(requester)
+      .streamTurn({ model: makeResolved(), context: CONTEXT, signal: controller.signal })
+      .catch((e: unknown) => e)) as TurnError;
+    expect(error.kind).toBe("cancelled");
+    const block = error.partial?.content.find((b) => b.type === "toolCall");
+    expect(block).toMatchObject({ id: "a", name: "read", rawArguments: '{"path":' });
+    expect(block?.type === "toolCall" && block.parse).toMatchObject({
+      status: "invalid",
+      error: "incomplete",
+    });
+  });
+
+  it("迭代中途抛错（result 未解析）从累积片段诚实合成 partial", async () => {
+    const controller = new AbortController();
+    const requester: TurnRequester = {
+      stream: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "x",
+            partial: makeMessage(),
+          } as AssistantMessageEvent;
+          controller.abort();
+          throw new Error("Turn aborted");
+        },
+        result: () => new Promise<AssistantMessage>(() => {}),
+      }),
+    };
+    const error = (await makeService(requester)
+      .streamTurn({ model: makeResolved(), context: CONTEXT, signal: controller.signal })
+      .catch((e: unknown) => e)) as TurnError;
+    expect(error.kind).toBe("cancelled");
+    expect(error.partial?.stopReason).toBe("aborted");
+    expect(error.partial?.content).toEqual([{ type: "text", text: "x" }]);
+    // 元数据来自真实请求配置；usage 无数据来源，零值占位表示"未计数"。
+    expect(error.partial).toMatchObject({ api: "openai-completions", provider: "p1", model: "m1" });
+    expect(error.partial?.usage.input).toBe(0);
+    expect(error.partial?.usage.totalTokens).toBe(0);
+  });
+
+  it("迭代中途抛错且无累积内容时不合成 partial（不捏造空消息）", async () => {
+    const controller = new AbortController();
+    const requester: TurnRequester = {
+      stream: () => ({
+        async *[Symbol.asyncIterator]() {
+          // start 事件不累积任何内容，buffer 保持为空。
+          yield { type: "start", partial: makeMessage() } as AssistantMessageEvent;
+          controller.abort();
+          throw new Error("Turn aborted");
+        },
+        result: () => new Promise<AssistantMessage>(() => {}),
+      }),
+    };
+    const error = (await makeService(requester)
+      .streamTurn({ model: makeResolved(), context: CONTEXT, signal: controller.signal })
+      .catch((e: unknown) => e)) as TurnError;
+    expect(error.kind).toBe("cancelled");
+    expect(error.partial).toBeUndefined();
+  });
+
+  it("迭代中途抛错时已完成 toolCall 按 contentIndex 映射 raw 原文", async () => {
+    const controller = new AbortController();
+    const call = { type: "toolCall" as const, id: "a", name: "read", arguments: { path: "x" } };
+    const requester: TurnRequester = {
+      stream: () => ({
+        async *[Symbol.asyncIterator]() {
+          yield {
+            type: "text_delta",
+            contentIndex: 0,
+            delta: "t",
+            partial: makeMessage(),
+          } as AssistantMessageEvent;
+          yield {
+            type: "toolcall_start",
+            contentIndex: 1,
+            partial: makeMessage(),
+          } as AssistantMessageEvent;
+          yield {
+            type: "toolcall_delta",
+            contentIndex: 1,
+            delta: '{"path":"x"}',
+            partial: makeMessage(),
+          } as AssistantMessageEvent;
+          yield {
+            type: "toolcall_end",
+            contentIndex: 1,
+            toolCall: call,
+            partial: makeMessage(),
+          } as AssistantMessageEvent;
+          controller.abort();
+          throw new Error("Turn aborted");
+        },
+        result: () => new Promise<AssistantMessage>(() => {}),
+      }),
+    };
+    const error = (await makeService(requester)
+      .streamTurn({ model: makeResolved(), context: CONTEXT, signal: controller.signal })
+      .catch((e: unknown) => e)) as TurnError;
+    expect(error.kind).toBe("cancelled");
+    const block = error.partial?.content.find((b) => b.type === "toolCall");
+    expect(block).toMatchObject({ id: "a", name: "read", rawArguments: '{"path":"x"}' });
+    expect(block?.type === "toolCall" && block.parse).toMatchObject({ status: "parsed" });
+  });
+});
+
 describe("V5 失败尝试隔离", () => {
   it("重试前后文本不拼接，失败尝试不进正式消息", async () => {
     const requester = new FakeRequester();

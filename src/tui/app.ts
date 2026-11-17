@@ -68,6 +68,9 @@ export class TuiApp {
   private approvalPreview?: ApprovalPreview;
   private revealedId?: string;
   private pendingView?: MessageView;
+  private pendingItemId?: string;
+  private autoExpandApprovalId?: string;
+  private postApproval?: { approvalId: string; itemId?: string };
   private runId: string | undefined;
   constructor(
     readonly store: TuiStore,
@@ -173,6 +176,13 @@ export class TuiApp {
     this.notice.setText(notice ? (state.notice?.error ? theme.error : theme.warning)(notice) : "");
     const pending = state.core.pendingApproval;
     if (this.previewId !== pending?.id) {
+      if (this.previewId !== undefined) {
+        // 审批结束：折叠自动展开的卡片，随后按决议追踪下一个工具或追底。
+        this.postApproval = { approvalId: this.previewId, itemId: this.pendingItemId };
+        this.store.releaseAutoExpanded();
+      }
+      this.autoExpandApprovalId = undefined;
+      this.pendingItemId = undefined;
       this.scroll.cancelReveal();
       this.revealedId = undefined;
       this.approvalPreview = undefined;
@@ -234,7 +244,36 @@ export class TuiApp {
       const view = this.messages.get(item.id);
       const approval = pending && item.pendingApprovalId === pending.id ? pending : undefined;
       view?.setApproval(approval, approval ? this.approvalPreview : undefined);
-      if (approval && view) this.pendingView = view;
+      if (approval && view) {
+        this.pendingView = view;
+        this.pendingItemId = item.id;
+        // 每个审批只自动展开一次；用户手动折叠后不在后续 update 里强行再展开。
+        if (this.autoExpandApprovalId !== approval.id) {
+          this.autoExpandApprovalId = approval.id;
+          this.store.autoExpand(item.id);
+        }
+      }
+    }
+    if (this.postApproval) {
+      const { approvalId, itemId } = this.postApproval;
+      this.postApproval = undefined;
+      const resolved = state.lastResolvedApproval;
+      const index = itemId === undefined ? -1 : items.findIndex((item) => item.id === itemId);
+      // deny/cancel 后剩余工具是 not_executed，追踪无意义；只有放行才定位下一个工具。
+      const next =
+        resolved?.id === approvalId &&
+        (resolved.decision === "once" || resolved.decision === "session") &&
+        index >= 0
+          ? items
+              .slice(index + 1)
+              .find((item) => item.role === "tool" && item.runId === items[index]!.runId)
+          : undefined;
+      const view = next ? this.messages.get(next.id) : undefined;
+      if (view) this.scroll.reveal(view);
+      else {
+        this.scroll.cancelReveal();
+        this.scroll.scrollToEnd();
+      }
     }
     if (pending && this.pendingView && this.revealedId !== pending.id) {
       this.scroll.reveal(this.pendingView);

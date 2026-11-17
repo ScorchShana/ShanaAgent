@@ -9,12 +9,15 @@ import type {
   RunStartedRecord,
   SessionRecord,
 } from "../../sessions/records.js";
+import { findLatestCheckpoint } from "../../sessions/recovery.js";
 
 export interface SessionContextMetrics {
   contextTokens: number | null;
   contextWindow: number | null;
   cacheHitRate: number | null;
   speedTokPerSec: number | null;
+  /** contextTokens 为压后估算而非 Provider 实测（显示加 ~ 前缀）。 */
+  contextEstimated: boolean;
 }
 
 function finiteToken(value: unknown): number | null {
@@ -37,6 +40,7 @@ export function sessionContextMetrics(
   records: readonly SessionRecord[],
   fallback?: ContextMetricsFallback,
   activeRunId: string | null = null,
+  contextEstimate: number | null = null,
 ): SessionContextMetrics {
   const finished = records.filter((record): record is RunFinishedRecord => record.type === "run_finished");
   const assistants = records.filter(
@@ -52,15 +56,21 @@ export function sessionContextMetrics(
 
   let contextTokens: number | null;
   let contextWindow: number | null;
+  let latestSeq = -1;
   let outputSum = 0;
   let durationMsSum = 0;
   if (measuredRunId === null) {
     contextWindow = finiteToken(fallback?.contextWindow);
     if (contextWindow === null)
-      return { contextTokens: null, contextWindow: null, cacheHitRate: null, speedTokPerSec: null };
+      return {
+        contextTokens: null,
+        contextWindow: null,
+        cacheHitRate: null,
+        speedTokPerSec: null,
+        contextEstimated: false,
+      };
     contextTokens = finiteToken(fallback?.contextTokens);
   } else {
-    let latestSeq = -1;
     contextTokens = null;
     for (const record of assistants) {
       if (record.runId !== measuredRunId) continue;
@@ -84,6 +94,23 @@ export function sessionContextMetrics(
       (record): record is RunStartedRecord => record.type === "run_started" && record.runId === measuredRunId,
     );
     contextWindow = finiteToken(started?.model?.contextWindow);
+  }
+
+  // 最新 checkpoint 覆盖了被测量的 assistant（或该 Run 尚无 assistant）：实测是压缩前旧值，
+  // 改用压后估算，与模型实际所见同构；新实测落盘后 recordSeq 超出覆盖范围，自动切回。
+  // checkpoint 损坏时无法判定实测是否过期，保持实测显示，状态栏不因此崩溃。
+  let contextEstimated = false;
+  if (contextEstimate !== null && measuredRunId !== null) {
+    let coveredUpTo: number | null = null;
+    try {
+      coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
+    } catch {
+      coveredUpTo = null;
+    }
+    if (coveredUpTo !== null && (latestSeq < 0 || coveredUpTo >= latestSeq)) {
+      contextTokens = contextEstimate;
+      contextEstimated = true;
+    }
   }
 
   const countedRunIds = new Set(finished.map((record) => record.runId));
@@ -111,6 +138,7 @@ export function sessionContextMetrics(
     contextWindow,
     cacheHitRate: cacheComplete && denominator > 0 ? cacheReadSum / denominator : null,
     speedTokPerSec: durationMsSum > 0 ? outputSum / (durationMsSum / 1000) : null,
+    contextEstimated,
   };
 }
 
@@ -123,7 +151,7 @@ function formatTokens(value: number | null, forceDecimal: boolean): string {
 }
 
 export function contextSegment(metrics: SessionContextMetrics): string {
-  const current = formatTokens(metrics.contextTokens, true);
+  const current = `${metrics.contextEstimated ? "~" : ""}${formatTokens(metrics.contextTokens, true)}`;
   const window = formatTokens(metrics.contextWindow, false);
   return `Context: ${current} / ${window}`;
 }
@@ -162,6 +190,7 @@ export class StatusBar implements Component {
     contextWindow: null,
     cacheHitRate: null,
     speedTokPerSec: null,
+    contextEstimated: false,
   };
   constructor(state: TuiState, private readonly display: { workspacePath: string; homeDirectory: string; redact?: (text: string) => string } = { workspacePath: "", homeDirectory: "" }) {
     this.state = state;
@@ -187,13 +216,15 @@ export class StatusBar implements Component {
     }
     const contextWindow = (state.core.session.runModel ?? state.core.session.model)?.contextWindow ?? null;
     const contextTokens = state.core.session.contextBaselineTokens;
-    const key = JSON.stringify([this.refreshKey, contextWindow, contextTokens]);
+    const contextEstimate = state.core.session.contextEstimateTokens;
+    const key = JSON.stringify([this.refreshKey, contextWindow, contextTokens, contextEstimate]);
     if (key !== this.metricsKey) {
       this.metricsKey = key;
       this.metrics = sessionContextMetrics(
         state.history?.records ?? [],
         contextWindow === null ? undefined : { contextWindow, contextTokens },
         activeRunId,
+        contextEstimate,
       );
     }
   }

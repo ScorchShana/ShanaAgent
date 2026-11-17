@@ -425,7 +425,10 @@ it("restored missing-result acknowledgement survives an unrelated later failure"
     modelService: {
       streamTurn: async (options) => {
         requests++;
-        expect(JSON.stringify(options.context.messages)).not.toContain("old-call");
+        // 缺结果 Turn 受控进入：合成 unknown 占位 + 询问标注（门控仍先拦截新 Run）。
+        const context = JSON.stringify(options.context.messages);
+        expect(context).toContain("old-call");
+        expect(context).toContain("Ask the user to verify");
         if (requests === 1) throw new TurnError("stream_error", 1, "temporary failure");
         return turn(makeAssistantMessage([], "done"));
       },
@@ -691,7 +694,10 @@ it("a result persistence failure leaves effects intact and requires confirmation
     modelService: {
       streamTurn: async (options) => {
         calls++;
-        expect(JSON.stringify(options.context.messages)).not.toContain("effect");
+        // 结果落盘失败（效果已发生）：Turn 受控进入，占位明说"是否执行过未知"。
+        const context = JSON.stringify(options.context.messages);
+        expect(context).toContain("effect");
+        expect(context).toContain("was not recorded");
         return turn(makeAssistantMessage([], "done"));
       },
     },
@@ -704,7 +710,7 @@ it("a result persistence failure leaves effects intact and requires confirmation
   expect(fs.readFileSync(path.join(f.workspaceRoot, "once.txt"), "utf8")).toBe("written");
 });
 
-it("restores explicit unknown history, asks again for new missing results, and excludes both Turns", async () => {
+it("restores explicit unknown history, asks again for new missing results, and includes both Turns", async () => {
   const f = await fixture([]);
   await f.store.appendRecord(f.ref, { type: "user_prompt", runId: "old", text: "old task" });
   const owner = await f.store.appendRecord(f.ref, {
@@ -734,8 +740,12 @@ it("restores explicit unknown history, asks again for new missing results, and e
     modelService: {
       streamTurn: async (options) => {
         requests++;
-        expect(JSON.stringify(options.context.messages)).not.toContain("old-unknown");
-        expect(JSON.stringify(options.context.messages)).not.toContain("new-missing");
+        const context = JSON.stringify(options.context.messages);
+        // 显式 unknown 与缺结果 Turn 均受控进入，附询问标注；新缺结果仍触发门控。
+        expect(context).toContain("old-unknown");
+        expect(context).toContain("Ask the user to verify");
+        if (requests === 1) expect(context).not.toContain("new-missing");
+        else expect(context).toContain("new-missing");
         return requests === 1
           ? turn(makeAssistantMessage([{ id: "new-missing", name: "read", arguments: { path: "missing" } }]))
           : turn(makeAssistantMessage([], "done"));
@@ -831,8 +841,8 @@ it("routes tool diagnostics to the configured logger without copying private err
   expect(history).not.toContain("PRIVATE_ARGUMENT_TEXT");
 });
 
-it("does not commit a response when a completed-attempt notification cancels before submission", async () => {
-  const f = await fixture([makeAssistantMessage([], "uncommitted")]);
+it("commits a completed response even when cancellation arrives at the completed-attempt notification", async () => {
+  const f = await fixture([makeAssistantMessage([], "committed despite cancel")]);
   f.controller.eventBus.subscribe((event) => {
     if (
       event.type === "run.state_changed" &&
@@ -841,7 +851,8 @@ it("does not commit a response when a completed-attempt notification cancels bef
       f.controller.cancel();
   });
   expect(await f.controller.submitPrompt("test")).toBe("cancelled");
-  expect((await f.store.loadSession(f.ref)).records.some((r) => r.type === "assistant_message")).toBe(false);
+  // A：完整生成的响应不因取消竞态丢弃，照常落盘。
+  expect((await f.store.loadSession(f.ref)).records.some((r) => r.type === "assistant_message")).toBe(true);
 });
 
 it("rejects an empty tool name without fabricating results", async () => {
@@ -850,7 +861,7 @@ it("rejects an empty tool name without fabricating results", async () => {
   expect((await f.store.loadSession(f.ref)).records.some((r) => r.type === "tool_result")).toBe(false);
 });
 
-it("cancels an active unconfirmed Shell, records interruption, and excludes the entire Turn", async () => {
+it("cancels an active unconfirmed Shell, records interruption, and includes the Turn with unknown annotation", async () => {
   const fake = fakeShellRun({ kill: "unconfirmed" });
   Object.assign(fake.child, { unref: vi.fn() });
   const f = await fixture(
@@ -884,7 +895,9 @@ it("cancels an active unconfirmed Shell, records interruption, and excludes the 
   expect(records).toContainEqual(
     expect.objectContaining({ type: "interruption", toolCallId: "s", reason: "unknown_side_effect" }),
   );
-  expect(planEffectiveContext(records).runs.flatMap((r) => r.turns)).toHaveLength(0);
+  const turns = planEffectiveContext(records).runs.flatMap((r) => r.turns);
+  expect(turns).toHaveLength(1);
+  expect(turns[0]?.hasUnknown).toBe(true);
   expect(fs.existsSync(path.join(f.workspaceRoot, "never.txt"))).toBe(false);
   f.acknowledgeUnknownSideEffects();
   expect(() => f.controller.submitPrompt("again")).toThrow(/Shell termination/);
@@ -1182,7 +1195,9 @@ it("manual compact without an open Session fails without creating one", async ()
 it("manual compact covers all eligible turns without retaining a tail", async () => {
   const f = await compactionFixture();
   const outcome = await f.controller.compact();
-  expect(outcome).toEqual({ status: "completed", coveredUpTo: f.lastSeq, path: "primary" });
+  expect(outcome).toMatchObject({ status: "completed", coveredUpTo: f.lastSeq, path: "primary" });
+  // 压后估算写入快照，供状态栏在实测过期时立即更新。
+  expect(f.controller.getSnapshot().session.contextEstimateTokens).toBeGreaterThan(0);
   expect(f.requests).toHaveLength(1);
   expect(f.requests[0]!.maxTokens).toBeUndefined();
   expect(f.requests[0]!.maxRetries).toBe(2);
@@ -1450,6 +1465,9 @@ it("auto compacts at Run start (A) keeping the primary request prefix byte-ident
     coveredUpTo: lastSeq,
     runId: started[0]!.runId,
   });
+  const finished = finishedCompactions(f.events)[0]!;
+  expect(finished.contextTokens).toBeGreaterThan(0);
+  expect(f.controller.getSnapshot().session.contextEstimateTokens).toBe(finished.contextTokens);
   const records = (await f.store.loadSession(f.ref)).records;
   expect(records.filter((r) => r.type === "checkpoint")).toHaveLength(1);
 });

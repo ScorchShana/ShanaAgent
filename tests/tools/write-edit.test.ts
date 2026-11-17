@@ -172,7 +172,7 @@ describe("V3 write — 新建、覆盖与审批", () => {
 });
 
 describe("V10 写入前快照捕获与 UTF-8 ground rule", () => {
-  it("write 覆盖成功时携带写入前全量快照，新建文件无快照", async () => {
+  it("write 覆盖成功时携带写入前全量快照，新建文件快照为空串", async () => {
     const root = makeWorkspace();
     writeFileAt(root, "file.ts", "old line 1\nold line 2\n");
     const { gate } = recordingGate("allow");
@@ -184,7 +184,7 @@ describe("V10 写入前快照捕获与 UTF-8 ground rule", () => {
     expect(readFileAt(root, "file.ts")).toBe("new");
 
     const created = await executor.execute(call("c2", "write", { path: "created.txt", content: "x" }));
-    expect(created.priorContent).toBeUndefined();
+    expect(created.priorContent).toBe("");
     expect(readFileAt(root, "created.txt")).toBe("x");
   });
 
@@ -473,10 +473,31 @@ describe("edit commit boundaries and file faults", () => {
       return handle;
     });
     const result = await editFileContent(args, target, { signal: controller.signal });
-    expect(result).toMatchObject({ category: "cancelled", content: "Error: Cancelled by user." });
+    expect(result).toMatchObject({
+      status: "not_executed",
+      category: "cancelled",
+      content: "Error: Cancelled by user.",
+    });
     expect(rename).not.toHaveBeenCalled();
     expect(readFileAt(root, "a.txt")).toBe("old");
     expect(fs.readdirSync(root)).toEqual(["a.txt"]);
+  });
+
+  it("write cancelled before opening the file reports not_executed and leaves it untouched", async () => {
+    const root = makeWorkspace();
+    writeFileAt(root, "a.txt", "old");
+    const target = createPathPolicy(root).resolve("a.txt");
+    const controller = new AbortController();
+    controller.abort();
+    const result = await writeFileContent({ path: "a.txt", content: "new" }, target, {
+      signal: controller.signal,
+    });
+    expect(result).toMatchObject({
+      status: "not_executed",
+      category: "cancelled",
+      content: "Error: Cancelled by user.",
+    });
+    expect(readFileAt(root, "a.txt")).toBe("old");
   });
 
   it("keeps success after rename has started even when cancellation arrives", async () => {

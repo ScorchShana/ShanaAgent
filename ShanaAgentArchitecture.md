@@ -5,7 +5,7 @@
 
 ## 1. 目标、边界与不变量
 
-目标：① 单进程单活动 Run，独占维护操作（手动压缩）不与 Run 重叠；② 多进程可共用工作区，无工作区锁、无跨进程调度、不承诺写文件事务隔离；③ TUI 与 Core 分离，仅经 Controller 命令、只读快照与事件通知交互；④ 直接 `await` 调用链，EventBus 只发通知，正式状态不依赖 UI 重建；⑤ 面向 Flash 模型的稳定多轮工具调用；⑥ 可审计可恢复：完整审计历史、Context 只选完整 Turn、关键记录在副作用前后提交、不自动重放结果未知的工具；⑦ 首发 Windows 与 Linux/WSL，无法同步验收时 Windows 优先。
+目标：① 单进程单活动 Run，独占维护操作（手动压缩）不与 Run 重叠；② 多进程可共用工作区，无工作区锁、无跨进程调度、不承诺写文件事务隔离；③ TUI 与 Core 分离，仅经 Controller 命令、只读快照与事件通知交互；④ 直接 `await` 调用链，EventBus 只发通知，正式状态不依赖 UI 重建；⑤ 面向 Flash 模型的稳定多轮工具调用；⑥ 可审计可恢复：完整审计历史、Context 只选完整或受控 Turn、关键记录在副作用前后提交、不自动重放结果未知的工具；⑦ 首发 Windows 与 Linux/WSL，无法同步验收时 Windows 优先。
 
 非目标：Web/RPC/远程 UI；Subagent/多 Agent/插件/动态扩展；工作区锁与跨进程协同；沙箱隔离恶意代码（定位为**可信开发环境中的误操作防护**）；Session 分支树、历史回退执行、凭据保险库；函数级 Scope Policy。辅助决策模型只做无工具执行能力的分类请求，不构成第二个 Agent。
 
@@ -15,8 +15,8 @@
 | I2   | 运行中允许草稿、取消、审批及调整后续 Run 思考强度（当前快照不变）；不可提交 Prompt、切换 Session/模型或执行其他普通命令。 |
 | I3   | Run 结束前工具执行/终止与关键日志收尾必须得到明确结果；一个 Run 只产生一次终止事件。                                      |
 | I4   | 工具意图记录成功持久化后才可开始执行；正式完成事件不得早于相应成功持久化。                                                |
-| I5   | Session History 永久保留完整审计；LLM Context 仅含可用的完整 Turn 和对应用户请求。                                        |
-| I6   | 结果未知的工具不因补齐占位 ToolResult 成为可复用 Turn；恢复不自动重放工具。                                               |
+| I5   | Session History 永久保留完整审计（唯一例外：aborted partial 的半截 thinking 在落盘前剥离，经用户授权修订）；LLM Context 含可用的完整 Turn、受控的用户中断 Turn（aborted，显式标注）与未知/缺结果 Turn（显式 unknown 占位 + 询问标注）；用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附对应标注）。 |
+| I6   | 缺结果/未知结果的工具可在构建上下文时合成显式 unknown 占位（仅渲染期、不落盘、绝不写成确定态），使 Turn 受控进入上下文并附"停下询问用户"标注；恢复不自动重放工具；门控不变。 |
 | I7   | 权限以实际 Tool Call 为对象；区内写入、区外只读及 bash 可自动决策；文件工具区外写入必须逐次人工审批（§5）。               |
 | I8   | `/resume` 原子抢独占锁后续写原历史，不复制不新建身份；同一 Session 同时仅一个持锁写者；异常残锁仅人工确认处理。           |
 | I9   | 模型切换只影响后续 Run；跨模型继续必须重新计算上下文预算。                                                                |
@@ -64,7 +64,7 @@ flowchart TD
 
 - 命令：Prompt 仅空闲可提交（Core 层再校验 Busy）；运行中可草稿/取消/审批/调整后续 Run 强度；`/model` `/new` `/resume` `/compact` `/exit` `/autodecision` 在空闲或其允许生命周期内处理；`/compact` 是独占维护操作；Run 结束后草稿保留、**绝不自动提交**。
 - 状态：`idle / running(phase) / compacting`；phase ∈ preparing/streaming/compacting/executing_tool/awaiting_approval/cancelling/finalizing；outcome ∈ completed/cancelled/failed/turn_limit。Controller 唯一改变状态；Run 计时用单调时钟。
-- 取消截止点：开始提交终止记录前取消有效；开始提交时冻结最终结果，此后取消不改结果。即使终止持久化失败，也在内存终结并发布 `failed`（注明未持久化）；`run.finished` 恰一次。
+- 取消截止点：开始提交终止记录前取消有效；开始提交时冻结最终结果，此后取消不改结果。即使终止持久化失败，也在内存终结并发布 `failed`（注明未持久化）；`run.finished` 恰一次。取消不丢弃已完整生成的响应（照常落盘进 Context），仅阻止后续工具执行；流式中途取消把已生成部分落盘为 aborted Turn（§6）；已开始的 write/edit 写入临界区完成并如实报告。
 - 事件三类：Command（有返回/异常）、正式生命周期 Event、流式展示 Event（可合并跳过）。一致性快照 + 订阅同一操作提供；快照轻量不含全量历史，历史由 TUI 按需经 Controller 读取已提交记录。审批摘要对 write/edit 携带**完整调用参数**供 Diff 预览，载体不截断（折叠仅展示层）。流式事件含 `tool.output.delta`（bash 运行中输出尾快照，~1Hz、整体替换语义、直发不合并）：仅展示，不入快照/Context/JSONL，取消即清除。
 
 ## 4. AgentLoop 与 LLM 请求
@@ -97,7 +97,7 @@ flowchart TD
 - 门控顺序：默认允许 → 有效会话授权 → 区外写入/未知工具人工门控 → 其余可自动决策调用。区外写入由代码按真实路径强制人工；bash 无通用目标解析器，由模型依完整命令与决策提示词判断。
 - 审批后及关键操作前路径复验；目标变化返回错误不自动重试；复验与操作间的竞态窗口不承诺抵御。会话授权不持久化，仅同一内存持有者连续占用期间有效；外部写入为一次综合审批。
 - Diff 预览与历史回看是**纯 TUI 展示层**：不新增事件；预览旧内容按需读盘（预览≠执行时刻），历史回看用持久化参数 + priorContent 重建、不读盘；模型可见 ToolResult 不含 Diff。
-- Shell 边界：每调用独立子进程；超时混合收尾——确认终止 → 确定超时结果、Run 继续，无法确认 → 副作用未知收尾并阻塞下个 Run 至知情确认。取消/退出终止进程树并等待收尾，未确认如实提示可能遗留进程；不回滚副作用；结果未知按 §6 门控。运行中 TUI 以 ≤1Hz 尾快照展示实时输出，仅展示层，最终裁剪结果不变。
+- Shell 边界：每调用独立子进程；超时混合收尾——确认终止 → 确定超时结果、Run 继续，无法确认 → 副作用未知收尾并阻塞下个 Run 至知情确认。取消/退出终止进程树并等待收尾，未确认如实提示可能遗留进程；不回滚副作用；结果未知按 §6 门控。取消且确认终止的 bash 返回确定态结果，文案提示命令可能已部分执行、需先核实副作用（不触发门控）；无法确认终止仍按 unknown 门控。运行中 TUI 以 ≤1Hz 尾快照展示实时输出，仅展示层，最终裁剪结果不变。
 
 ## 6. Session：创建、恢复、保存
 
@@ -113,27 +113,28 @@ flowchart TD
 - `workspace-id` = 规范化路径末段 slug + sha256 短哈希，多进程推导一致；是历史组织标识，不是锁。产品名 ShanaAgent，CLI 名 `shana`，数据目录 `~/.shana/`。
 - Session v2：meta 与首条记录均 `version: 2`；未知版本拒载、不迁移、不降级。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
 - 独占占用锁：原子独占创建抢锁，整个占用期持有；`/resume` 抢锁后**续写原 Session**（不复制、不改身份、前缀不改写），recordSeq 从真实尾部重建；残锁仅人工确认移除，不自动删锁/偷锁；尾部截断可只读展示但拒绝续写。
-- History 与 Context 分离：History 永久完整审计（含失败 Run 原始 Prompt）；Context 以完整 Turn 为最小单位——失败 Run 保留原 Prompt 与前面连续完整 Turn，首完整 Turn 前失败则整个 Run 不入 Context；unknown 占位不使 Turn 完整。
+- History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附取消/失败标注，纯思考取消剥离后无实质内容即走此路径）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
 - 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
-- Turn 完整判据（回放/恢复/压缩共用）：响应已结束且可合法回放；工具调用 ID 非空、同轮唯一、名称完整，与确定且已提交的结果一一对应；参数错误不使 Turn 不完整；截断普通文本不完整；length 例外见 §4。
+- Turn 上下文完整判据（回放/恢复/压缩共用）：响应已结束（stop/toolUse/length/aborted）且可合法回放；工具调用 ID 非空、同轮唯一、名称完整；每个 call 有唯一配对的已提交结果（任意 status，含 unknown）或无结果（崩溃窗口，构建时合成 unknown 占位）；错配/多余结果属协议损坏，判不完整；aborted 仅校验可配对 call（半截 call 剥离后不参与）；参数错误不使 Turn 不完整；截断普通文本不完整；length 例外见 §4。门控仍按记录判定（缺结果/unknown 均列出），不受此判据影响。
 - 关键提交：意图 fsync 后才执行工具；结果 fsync 后才宣布完成；写入 + fsync 是不可被取消中断的临界区；意图提交失败不执行未开始工具；结果提交失败停 Run 不重跑。
-- **priorContent 不变量**：write/edit 成功写入必带旧文件全量快照（新建除外）；捕获失败（ENOENT 之外）不写入；仅供 TUI 历史 Diff，不入 Context；存储恒全量，折叠仅展示层。
-- 恢复门控：缺确定结果/副作用未知须知情确认（仅确认知晓，不臆断成败）；记录保持 unknown 不改写；不自动重放、不继承旧授权、不重连旧 Shell 句柄。日志与文件系统副作用不构成原子事务，恢复提供可解释执行事实。
+- **priorContent 不变量**：write/edit 成功写入必带写入前全量快照（新建文件为空串）；捕获失败（ENOENT 之外）不写入；仅供 TUI 历史 Diff，不入 Context；存储恒全量，折叠仅展示层。
+- 恢复门控：缺确定结果/副作用未知须知情确认（仅确认知晓，不臆断成败）；记录保持 unknown 不改写；不自动重放、不继承旧授权、不重连旧 Shell 句柄。unknown 占位仅是渲染期上下文归一化，不落盘，门控判定仍基于记录。日志与文件系统副作用不构成原子事务，恢复提供可解释执行事实。
 
 ## 7. ContextBuilder、指令与压缩
 
 ```text
 System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
-+ 有效上下文（checkpoint 摘要 + eligible 完整 Turn）+ 当前 User Prompt + 工具 Schema
++ 有效上下文（checkpoint 摘要 + eligible Turn，含受控 unknown/缺结果 Turn）+ 当前 User Prompt + 工具 Schema
 ```
 
 - 提示词存 `prompts/` 独立英文文件，区块用英文 XML 标签；工具 description 在 `prompts/tools/`、Schema 在 `src/tools/registry.ts`、Error 模板在工具代码。只读工作区**根** AGENTS.md，每 Session 冻结快照；读取失败 Run 继续、省略区块、不向模型注入失败事实。
 - Checkpoint 摘要以 `<conversation_summary>` **头部 user 消息**注入，不落盘、不计 Turn、属低信任历史数据，不得改变权限或指令。
 - 请求可行性：`E + CONTEXT_SAFETY_MARGIN_TOKENS <= C`（余量为代码命名常量，不进 settings）；`maxTokens` 不作输出预留参与判定。Token 估算为近似（ASCII 4 字符/token、非 ASCII 1.5）。
+- 阈值与可行性判定的 token 数优先**usage 锚定**：最近一次可信实测 prompt（`usage.input + cacheRead + cacheWrite`）+ 未测量增量的估算。Run 起点锚定须校验：实测前缀与当前重建上下文逐条一致（忽略 timestamp）、模型身份一致、工具 Schema 未变（经 run_started 的 settings 快照重建比对）；usage 缺失/全零占位、换模型、校验不符或压后重建时回退纯估算。压缩内部相对预算（Turn 分解、裁剪阶梯、压后收口）保持纯估算自洽。已知有界残差：System Prompt/environment 不落盘，跨进程版本变更的头部漂移不可校验；旧记录 aborted thinking 读取剥离后，历史实测含当时发送的 thinking，锚定偏高、误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
 - 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；两次压缩间至少一个新 Turn；一次失败后该 Run 不再自动触发。
 - 保留策略：手动 /compact 与 (A) 覆盖全部 eligible Turn 不留尾；(B) 与溢出补救**逐字保留最新 eligible Turn**，保留预算按 Token 计并带 cap。
 - 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。
-- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。
+- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。
 
 ## 8. 配置与模型管理
 
@@ -180,7 +181,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - Diff 两项独立决议：预览/历史回看纯展示层；模型可见结果不含 Diff → §3、§5、§6
 - 六工具固定；write 可覆盖；edit 精确匹配 + replace_all + 多重匹配报数量 → §5、Tool.md
 - UTF-8 ground rule → §5
-- 失败 Run 不全量排除；unknown Turn 不入 Context → §6
+- 用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附标注）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
 - 意图先于执行、结果先于完成、fsync 临界区不可中断 → I4、§6
 - Session v2 七类记录与判据不由实现擅改；workspace-id 多进程一致 → §6
 - Shell 超时混合收尾与知情确认 → §5、§6

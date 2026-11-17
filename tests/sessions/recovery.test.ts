@@ -137,7 +137,7 @@ describe("resume original Session", () => {
 });
 
 describe("V6 知情确认门控", () => {
-  it.each(["length", "aborted"] as const)(
+  it.each(["length"] as const)(
     "未具备执行条件的 %s 响应不因缺少工具结果而要求确认",
     (stopReason) => {
       const records: SessionRecord[] = [
@@ -149,6 +149,34 @@ describe("V6 知情确认门控", () => {
       expect(() => createRunStartGate(records).assertCanStartRun()).not.toThrow();
     },
   );
+
+  it("aborted 响应的可配对 call 缺合成结果时要求知情确认", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "write file"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "write" }], { stopReason: "aborted" }),
+    ];
+    expect(findUnknownSideEffects(records).map((item) => item.toolCallId)).toEqual(["c1"]);
+    expect(() => createRunStartGate(records).assertCanStartRun()).toThrow();
+  });
+
+  it("aborted 响应已合成 not_executed 结果时不要求确认", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "write file"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "write" }], { stopReason: "aborted" }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed", { toolName: "write" }),
+    ];
+    expect(findUnknownSideEffects(records)).toEqual([]);
+    expect(() => createRunStartGate(records).assertCanStartRun()).not.toThrow();
+  });
+
+  it("aborted 响应的半截 call（空 id）缺结果不要求确认", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "write file"),
+      makeAssistantRecord(2, "run-1", [{ id: "", name: "write" }], { stopReason: "aborted" }),
+    ];
+    expect(findUnknownSideEffects(records)).toEqual([]);
+    expect(() => createRunStartGate(records).assertCanStartRun()).not.toThrow();
+  });
 
   it("混合批次只对有效且缺结果的调用报告副作用未知", () => {
     const assistant = makeAssistantRecord(2, "run-1", [

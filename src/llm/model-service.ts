@@ -49,6 +49,71 @@ function abortError(): Error {
   return new Error("Turn aborted");
 }
 
+// 取消时把 SDK 已累积的部分响应转为存储形态：toolCall 参数允许不完整（allowRepair=false），
+// 缺失的 raw 片段记为空串。半截/无 id 的 toolCall 由 normalizeAbortedMessage 在构建上下文时剥离。
+function buildAbortedPartial(
+  message: AssistantMessage,
+  raw: Map<number, string>,
+): StoredAssistantMessage {
+  return {
+    ...message,
+    stopReason: "aborted",
+    content: message.content.map((block, index) => {
+      if (block.type !== "toolCall") return block;
+      const rawArguments = raw.get(index) ?? "";
+      return {
+        type: "toolCall" as const,
+        id: block.id,
+        name: block.name,
+        rawArguments,
+        parse: parseArguments(rawArguments, false),
+      };
+    }),
+  };
+}
+
+// 时机 B（迭代中途抛错、stream.result() 未解析）：用已累积的流式片段诚实合成 partial。
+// api/provider/model 取自真实请求配置；usage 无数据来源，零值占位表示"未计数"而非测量值；
+// 块顺序按 thinking/text/toolCalls 重建（真实交错顺序不可知）；未完成的 call 从未执行，不重建。
+// 无任何内容时返回 undefined，不捏造空消息。
+function synthesizeAbortedPartial(
+  buffer: AttemptBuffer,
+  raw: Map<number, string>,
+  model: ResolvedModel,
+): StoredAssistantMessage | undefined {
+  if (!buffer.text && !buffer.thinking && buffer.toolCalls.length === 0) return undefined;
+  const content: StoredAssistantMessage["content"] = [];
+  if (buffer.thinking) content.push({ type: "thinking", thinking: buffer.thinking });
+  if (buffer.text) content.push({ type: "text", text: buffer.text });
+  for (const { contentIndex, toolCall } of buffer.toolCalls) {
+    const rawArguments = raw.get(contentIndex) ?? "";
+    content.push({
+      type: "toolCall",
+      id: toolCall.id,
+      name: toolCall.name,
+      rawArguments,
+      parse: parseArguments(rawArguments, false),
+    });
+  }
+  return {
+    role: "assistant",
+    content,
+    api: model.api,
+    provider: model.providerId,
+    model: model.id,
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: "aborted",
+    timestamp: Date.now(),
+  };
+}
+
 export interface ModelSnapshot {
   providerId: string;
   providerName: string;
@@ -105,12 +170,15 @@ export type TurnErrorKind =
 export class TurnError extends Error {
   readonly kind: TurnErrorKind;
   readonly attempts: number;
+  // 用户取消时尽力携带已流式生成的部分响应，供上层落盘为受控中断 Turn；可能为空。
+  readonly partial?: StoredAssistantMessage;
 
-  constructor(kind: TurnErrorKind, attempts: number, message: string) {
+  constructor(kind: TurnErrorKind, attempts: number, message: string, partial?: StoredAssistantMessage) {
     super(message);
     this.name = "TurnError";
     this.kind = kind;
     this.attempts = attempts;
+    this.partial = partial;
   }
 }
 
@@ -154,7 +222,8 @@ export interface StreamTurnOptions {
 interface AttemptBuffer {
   text: string;
   thinking: string;
-  toolCalls: ToolCall[];
+  // contentIndex 用于把 raw 参数原文映射回已完成的 call（raw map 按流式块索引键控）。
+  toolCalls: { contentIndex: number; toolCall: ToolCall }[];
 }
 
 export class ModelService {
@@ -193,8 +262,11 @@ export class ModelService {
         throw new TurnError("cancelled", attempts, "Turn aborted");
       }
       attempts += 1;
-      let buffer: AttemptBuffer;
+      // 声明处初始化：catch 路径（stream() 本身抛错）也要能安全读取 buffer。
+      let buffer: AttemptBuffer = { text: "", thinking: "", toolCalls: [] };
       let message: AssistantMessage;
+      // stream.result() 已解析时用其消息；迭代中途抛错（result 未解析）时从累积片段诚实合成。
+      let partialSource: AssistantMessage | undefined;
       const raw = new Map<number, string>();
       try {
         const stream = this.requester.stream(
@@ -241,7 +313,7 @@ export class ModelService {
               });
               break;
             case "toolcall_end":
-              buffer.toolCalls.push(event.toolCall);
+              buffer.toolCalls.push({ contentIndex: event.contentIndex, toolCall: event.toolCall });
               onEvent?.({ type: "tool_call_end", attempt: attempts, toolCall: event.toolCall });
               break;
             default:
@@ -249,13 +321,22 @@ export class ModelService {
           }
         }
         message = await stream.result();
-        if (signal?.aborted) throw new TurnError("cancelled", attempts, "Turn aborted");
+        partialSource = message;
+        if (signal?.aborted)
+          throw new TurnError("cancelled", attempts, "Turn aborted", buildAbortedPartial(message, raw));
       } catch (error) {
         if (error instanceof TurnError) {
           throw error;
         }
         if (signal?.aborted || isAbortError(error)) {
-          throw new TurnError("cancelled", attempts, "Turn aborted");
+          throw new TurnError(
+            "cancelled",
+            attempts,
+            "Turn aborted",
+            partialSource
+              ? buildAbortedPartial(partialSource, raw)
+              : synthesizeAbortedPartial(buffer, raw, options.model),
+          );
         }
         throw new TurnError(
           "stream_error",
@@ -305,7 +386,7 @@ export class ModelService {
       }
 
       if (signal?.aborted || message.stopReason === "aborted") {
-        throw new TurnError("cancelled", attempts, "Turn aborted");
+        throw new TurnError("cancelled", attempts, "Turn aborted", buildAbortedPartial(message, raw));
       }
       const errorMessage = this.redact(message.errorMessage ?? "unknown provider error");
       // 分类依赖 pi-ai 字符串启发式，Provider 文案变化会导致误判

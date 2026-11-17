@@ -24,10 +24,16 @@ function makeController(
   extras: {
     hooks?: ConstructorParameters<typeof SessionController>[0]["hooks"];
     compactor?: ConstructorParameters<typeof SessionController>[0]["compactor"];
+    commands?: ConstructorParameters<typeof SessionController>[0]["commands"];
   } = {},
 ) {
   const events: BusEvent[] = [];
-  const controller = new SessionController({ driver, hooks: extras.hooks, compactor: extras.compactor });
+  const controller = new SessionController({
+    driver,
+    hooks: extras.hooks,
+    compactor: extras.compactor,
+    commands: extras.commands,
+  });
   controller.eventBus.subscribe((event) => events.push(event));
   const snapshots = controller.getSnapshot.bind(controller);
   return { controller, events, snapshots };
@@ -1049,5 +1055,84 @@ describe("bash 实时输出流", () => {
     expect(events.filter((e) => e.type === "tool.output.delta")).toEqual([
       { type: "tool.output.delta", runId: "run-1", toolCallId: "t1", delta: "before" },
     ]);
+  });
+});
+
+describe("压后估算 contextEstimateTokens", () => {
+  it("Run 内压缩：finished 事件携带估算并写入快照", async () => {
+    const driver: AgentLoopDriver = {
+      execute: async (handle) => {
+        handle.notifyCompactionStarted();
+        handle.notifyCompactionFinished({
+          status: "completed",
+          path: "primary",
+          coveredUpTo: 3,
+          contextTokens: 52000,
+        });
+        return { outcome: "completed" };
+      },
+    };
+    const { controller, events, snapshots } = makeController(driver);
+    await controller.submitPrompt("task");
+    expect(snapshots().session.contextEstimateTokens).toBe(52000);
+    expect(events.find((e) => e.type === "compaction.finished")).toMatchObject({
+      status: "completed",
+      contextTokens: 52000,
+    });
+  });
+
+  it("手动压缩：compactor 的估算写入快照并随 finished 事件发布", async () => {
+    const { controller, events, snapshots } = makeController(idleDriver, {
+      compactor: {
+        execute: () => Promise.resolve({ ...completedCompaction, estimatedContextTokens: 52000 }),
+      },
+    });
+    await controller.compact();
+    expect(snapshots().session.contextEstimateTokens).toBe(52000);
+    expect(events).toEqual([
+      { type: "compaction.started" },
+      {
+        type: "compaction.finished",
+        status: "completed",
+        path: "primary",
+        coveredUpTo: 3,
+        contextTokens: 52000,
+      },
+    ]);
+  });
+
+  it("非法估算（NaN/负数）不写入快照、不随事件发布", async () => {
+    const driver: AgentLoopDriver = {
+      execute: async (handle) => {
+        handle.notifyCompactionFinished({ status: "completed", coveredUpTo: 3, contextTokens: Number.NaN });
+        handle.notifyCompactionFinished({ status: "completed", coveredUpTo: 3, contextTokens: -1 });
+        return { outcome: "completed" };
+      },
+    };
+    const { controller, snapshots } = makeController(driver, {
+      compactor: {
+        execute: () => Promise.resolve({ ...completedCompaction, estimatedContextTokens: -5 }),
+      },
+    });
+    await controller.submitPrompt("task");
+    expect(snapshots().session.contextEstimateTokens).toBeNull();
+    await controller.compact();
+    expect(snapshots().session.contextEstimateTokens).toBeNull();
+  });
+
+  it("/new 与 /resume 清空估算", async () => {
+    const { controller, snapshots } = makeController(idleDriver, {
+      compactor: {
+        execute: () => Promise.resolve({ ...completedCompaction, estimatedContextTokens: 52000 }),
+      },
+      commands: { newSession: async () => {}, resumeSession: async () => {} },
+    });
+    await controller.compact();
+    expect(snapshots().session.contextEstimateTokens).toBe(52000);
+    await controller.newSession();
+    expect(snapshots().session.contextEstimateTokens).toBeNull();
+    await controller.compact();
+    await controller.resumeSession({ workspaceId: "ws", sessionId: "other" });
+    expect(snapshots().session.contextEstimateTokens).toBeNull();
   });
 });
