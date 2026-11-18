@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## 未发布
+## 0.2.5 — 2026-11-19
 
 - **变更**：压缩覆盖的历史记录不再整段淡化——压前的 Prompt/回复/工具卡/提示保留原配色，工具卡背景按真实结果状态着色，压前 view_image 卡展开正常显示真图（失败卡片仍淡化且不渲染图像）。压缩分隔线文案改为 `compacted`，摘要展开/折叠提示改为英文（`Click to expand/collapse the chat summary`）。
 - **变更**：删除零 Turn 取消 Run 的独立取消标注（经用户裁决）。取消 Run 的 Prompt 裸进上下文，其下一条 Prompt 渲染期前置 `[The previous request was interrupted before completion.]`：仅渲染期注入、从不落盘，`user_prompt` 记录恒存用户原文，正式请求/压缩摘要输入/锚定重建同源一致；TUI 在对应 Prompt 前显示同构 notice，用户气泡仍为原文。半截文本取消（aborted Turn）的中断标注与失败/未知标注不变；Session v4 Schema 零变更，旧 Session 重建自动获得新行为。
