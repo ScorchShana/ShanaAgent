@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import type { StopReason } from "@earendil-works/pi-ai";
+import type { StopReason, Usage } from "@earendil-works/pi-ai";
 import {
   CONTEXT_SAFETY_MARGIN_TOKENS,
   IMAGE_COMPACTION_OMITTED_TEXT,
@@ -110,9 +110,16 @@ function makeContext(records: readonly SessionRecord[]): StoredContext {
 
 function summaryTurn(
   text: string,
-  options: { stopReason?: StopReason; toolCalls?: Array<{ id: string; name: string }> } = {},
+  options: {
+    stopReason?: StopReason;
+    toolCalls?: Array<{ id: string; name: string }>;
+    durationMs?: number;
+    usage?: Partial<Usage>;
+  } = {},
 ): TurnResult {
   const message = makeAssistantMessage(options.toolCalls ?? [], text, { stopReason: options.stopReason });
+  if (options.durationMs !== undefined) message.durationMs = options.durationMs;
+  if (options.usage !== undefined) message.usage = { ...message.usage, ...options.usage };
   return {
     attempts: 1,
     message,
@@ -183,6 +190,24 @@ describe("主路径请求形态", () => {
       coveredUpTo: 5,
       model: { providerId: "p", modelId: "m" },
       promptVersion: createHash("sha256").update(PROMPT).digest("hex").slice(0, 16),
+      // 摘要请求的实测用量；Provider 未报告耗时则不写 durationMs。
+      usage: { input: 1, cacheRead: 0, output: 1 },
+    });
+  });
+
+  it("摘要请求的实测用量（含耗时）随 checkpoint 落盘", async () => {
+    const h = harness(
+      {},
+      async () =>
+        summaryTurn("summary text", {
+          durationMs: 1500.5,
+          usage: { input: 1200, cacheRead: 800, output: 300 },
+        }),
+    );
+    await compactHistory(h.options);
+    expect(h.appended[0]).toMatchObject({
+      type: "checkpoint",
+      usage: { input: 1200, cacheRead: 800, output: 300, durationMs: 1500.5 },
     });
   });
 
@@ -198,6 +223,8 @@ describe("主路径请求形态", () => {
       coveredUpTo: 5,
       model: { providerId: "p", modelId: "m" },
       promptVersion: createHash("sha256").update(PROMPT).digest("hex").slice(0, 16),
+      // 摘要请求的实测用量；Provider 未报告耗时则不写 durationMs。
+      usage: { input: 1, cacheRead: 0, output: 1 },
     });
   });
 

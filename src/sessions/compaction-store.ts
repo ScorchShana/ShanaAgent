@@ -203,6 +203,13 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
     coveredUpTo: selection.coveredUpTo,
     model: { providerId: model.providerId, modelId: model.id },
     promptVersion,
+    // 摘要请求是真实请求，用量必须随 checkpoint 落盘，否则重启/多进程后 Cache/Speed 会漏计。
+    usage: {
+      input: result.usage.input,
+      cacheRead: result.usage.cacheRead,
+      output: result.usage.output,
+      ...(typeof result.message.durationMs === "number" ? { durationMs: result.message.durationMs } : {}),
+    },
   });
   return { status: "completed", coveredUpTo: selection.coveredUpTo, path };
 }
