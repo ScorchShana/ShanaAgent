@@ -2303,12 +2303,17 @@ describe("TuiAltScreen", () => {
 
 		terminal.sendInput("\r");
 		await terminal.waitForRender();
-		assert.strictEqual(submitted, "/command-5");
+		// 菜单 Enter 只接受补全，不提交。
+		assert.strictEqual(submitted, "");
+		assert.strictEqual(editor.getText(), "/command-5");
 		assert.strictEqual(editor.isShowingAutocomplete(), false);
 		const topWithoutMenu = tui.viewportTop;
 		terminal.sendInput("\x1b[5~"); // PageUp scrolls the transcript again
 		await terminal.waitForRender();
 		assert.ok(tui.viewportTop < topWithoutMenu);
+		terminal.sendInput("\r");
+		await terminal.waitForRender();
+		assert.strictEqual(submitted, "/command-5");
 		tui.stop();
 	});
 });

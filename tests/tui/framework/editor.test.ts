@@ -2159,6 +2159,14 @@ describe("Editor component", () => {
 			editor.handleInput("\x1b[5~");
 			editor.handleInput("\r");
 
+			// 菜单里的 Enter 只接受补全，与 Tab/鼠标点击一致，不提交。
+			assert.strictEqual(submitted, "");
+			assert.strictEqual(editor.getText(), "/command-5");
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+			assert.strictEqual(editor.capturesViewportInput, false);
+
+			// 菜单关闭后再次 Enter 才执行。
+			editor.handleInput("\r");
 			assert.strictEqual(submitted, "/command-5");
 		});
 

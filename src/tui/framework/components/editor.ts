@@ -844,16 +844,12 @@ export class Editor implements Component, Focusable {
           this.state.lines = result.lines;
           this.state.cursorLine = result.cursorLine;
           this.setCursorCol(result.cursorCol);
-
-          if (this.autocompletePrefix.startsWith("/")) {
-            this.cancelAutocomplete();
-            // Fall through to submit
-          } else {
-            this.cancelAutocomplete();
-            if (this.onChange) this.onChange(this.getText());
-            return;
-          }
+          // 与 Tab/鼠标点击一致：只接受补全，不提交。斜杠命令需用户再次 Enter 执行，
+          // 避免选中菜单项即触发命令（可能带有不可撤销的副作用）。
+          this.cancelAutocomplete();
+          if (this.onChange) this.onChange(this.getText());
         }
+        return;
       }
     }
 
