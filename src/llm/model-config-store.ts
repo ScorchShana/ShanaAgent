@@ -483,6 +483,11 @@ export function toPiAiModel(resolved: ResolvedModel): Model<typeof SUPPORTED_API
     model.samplingParams = resolved.samplingParams as Model<typeof SUPPORTED_API>["samplingParams"];
   }
   // pi-ai 对未识别端点默认 true 会以 developer 角色发 system，兼容端点普遍拒绝；默认 false，显式配置优先。
-  model.compat = { supportsDeveloperRole: false, ...resolved.compat } as OpenAICompletionsCompat;
+  // pi-ai 1.5.1 起无工具请求会省略 tools 字段；压缩摘要依赖 tools:[] 维持请求前缀，默认恢复旧行为。
+  model.compat = {
+    supportsDeveloperRole: false,
+    requiresToolsWithToolHistory: true,
+    ...resolved.compat,
+  } as OpenAICompletionsCompat;
   return model;
 }

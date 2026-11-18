@@ -32,7 +32,7 @@ describe("settings-store", () => {
       maxRetries: 10,
       ctrlCExitWindowMs: 3000,
       decisionTimeoutMs: 30000,
-      maxTurns: 40,
+      maxTurns: 200,
       diffFoldLines: 200,
       diffFoldChars: 10000,
       thinkingPreviewLines: 5,
@@ -70,7 +70,7 @@ describe("settings-store", () => {
     expect(loadSettings(filePath)).toEqual({
       ctrlCExitWindowMs: 3000,
       decisionTimeoutMs: 30000,
-      maxTurns: 40,
+      maxTurns: 200,
       diffFoldLines: 200,
       diffFoldChars: 10000,
       thinkingPreviewLines: 5,

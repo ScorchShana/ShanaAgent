@@ -195,7 +195,7 @@ describe("model-config-store 默认值与解析", () => {
   });
 });
 
-describe("toPiAiModel supportsDeveloperRole 默认值", () => {
+describe("toPiAiModel compat 默认值", () => {
   function loadWithCompat(compat: unknown, reasoning = true) {
     const raw = structuredClone(VALID_CONFIG) as Record<string, unknown>;
     const providers = raw.providers as Record<string, Record<string, unknown>>;
@@ -225,7 +225,20 @@ describe("toPiAiModel supportsDeveloperRole 默认值", () => {
   it("非 reasoning 模型无 compat 也补默认", () => {
     const piModel = toPiAiModel(loadWithCompat(undefined, false));
     expect(piModel.reasoning).toBe(false);
-    expect(piModel.compat).toEqual({ supportsDeveloperRole: false });
+    expect(piModel.compat).toEqual({ supportsDeveloperRole: false, requiresToolsWithToolHistory: true });
+  });
+
+  it("requiresToolsWithToolHistory 缺省补默认 true，不影响其他字段", () => {
+    const piModel = toPiAiModel(loadWithCompat({ thinkingFormat: "qwen" }));
+    expect(piModel.compat?.requiresToolsWithToolHistory).toBe(true);
+    expect(piModel.compat?.thinkingFormat).toBe("qwen");
+  });
+
+  it("requiresToolsWithToolHistory 显式 false 优先于默认", () => {
+    const piModel = toPiAiModel(
+      loadWithCompat({ thinkingFormat: "openai", requiresToolsWithToolHistory: false }),
+    );
+    expect(piModel.compat?.requiresToolsWithToolHistory).toBe(false);
   });
 });
 

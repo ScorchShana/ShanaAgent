@@ -1,7 +1,6 @@
 import type { StoredAssistantMessage } from "../../src/sessions/records.js";
 import type { StoredContext } from "../../src/llm/history-replay.js";
 import { describe, expect, it } from "vitest";
-import { Type } from "@earendil-works/pi-ai";
 import type { Tool } from "@earendil-works/pi-ai";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import { redactSecrets } from "../../src/llm/model-config-store.js";
@@ -32,7 +31,12 @@ function withTestOverrides(model: ResolvedModel, role: ProviderRole, thinking: b
 const getWeather: Tool = {
   name: "get_weather",
   description: "Get the current weather for a city",
-  parameters: Type.Object({ city: Type.String() }),
+  parameters: {
+    type: "object",
+    properties: { city: { type: "string" } },
+    required: ["city"],
+    additionalProperties: false,
+  },
 };
 
 const SYSTEM_PROMPT = "You are a concise assistant. Use the get_weather tool when asked about weather.";

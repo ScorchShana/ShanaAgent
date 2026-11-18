@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import { Type, type StopReason } from "@earendil-works/pi-ai";
+import type { StopReason } from "@earendil-works/pi-ai";
 import {
   CONTEXT_SAFETY_MARGIN_TOKENS,
   buildContext,
@@ -100,9 +100,7 @@ function makeContext(records: readonly SessionRecord[]): StoredContext {
   return {
     systemPrompt: "system prompt",
     messages,
-    tools: [
-      { name: "read", description: "Read a file", parameters: Type.Unsafe({ type: "object", properties: {} }) },
-    ],
+    tools: [{ name: "read", description: "Read a file", parameters: { type: "object", properties: {} } }],
   };
 }
 

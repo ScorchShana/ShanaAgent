@@ -1,7 +1,7 @@
 # ShanaAgent — 架构设计
 
 > 整体架构基线：系统约束、模块责任、控制流程与已确认设计决策。**行为细节（Schema、数值默认、文案、展示交互）以代码实现为唯一依据**；工具边界摘要见 Tool.md。
-> 技术栈：TypeScript · Node.js >=22.19.0 · 内置 shana-tui · `@earendil-works/pi-ai`（固定 1.4.0）；主要面向 DeepSeek Flash / Qwen Flash，单 Agent、仅 TUI。
+> 技术栈：TypeScript · Node.js >=22.19.0 · 内置 shana-tui · `@earendil-works/pi-ai`（固定 1.5.2）；主要面向 DeepSeek Flash / Qwen Flash，单 Agent、仅 TUI。
 
 ## 1. 目标、边界与不变量
 
@@ -138,7 +138,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 
 ## 8. 配置与模型管理
 
-- `model.json`：自有格式，解析映射为 pi-ai Model；`api` 固定 openai-completions；`/model` 只列用户配置模型。凭据**仅明文 apiKey**，不支持 `$VAR`、不用 pi-ai 凭据链；TUI 掩码、日志与错误脱敏（Provider 回显可能含 Key 片段，须二次脱敏）；工具调用参数例外保留原文。`contextWindow`/`maxTokens` 必填，前者可有意低于官方上限、按配置生效。`compat` 不依赖 pi-ai 自动探测，`supportsDeveloperRole` 默认 false、显式配置优先。第一版不做费用记账。无有效模型可启动但禁提交；`/model` 与强度调整原子写回、只影响后续 Run；每 Run 固定模型快照。
+- `model.json`：自有格式，解析映射为 pi-ai Model；`api` 固定 openai-completions；`/model` 只列用户配置模型。凭据**仅明文 apiKey**，不支持 `$VAR`、不用 pi-ai 凭据链；TUI 掩码、日志与错误脱敏（Provider 回显可能含 Key 片段，须二次脱敏）；工具调用参数例外保留原文。`contextWindow`/`maxTokens` 必填，前者可有意低于官方上限、按配置生效。`compat` 不依赖 pi-ai 自动探测，`supportsDeveloperRole` 默认 false、`requiresToolsWithToolHistory` 默认 true（pi-ai 1.5.1 起无工具请求默认省略 tools 字段，此默认值维持压缩摘要请求发送 `tools: []` 的原有前缀）、显式配置优先。第一版不做费用记账。无有效模型可启动但禁提交；`/model` 与强度调整原子写回、只影响后续 Run；每 Run 固定模型快照。
 - `settings.json`：无 version，严格 Schema 拒损坏、不静默修复；数值参数 = 可配置项 + 代码命名常量，默认值与范围以代码（`src/llm/settings-store.ts`）为准；启动加载、重启生效；写入临时文件 + 原子替换，多进程不加锁。
 - `decision-model.json`：`base_url` 必填服务根地址（追加 `/v1/systemone`），`model`/`apiKey` 可选；严格校验，不自动创建/修复/写回；缺失=未配置、无效=配置错误，均不阻断主模型；仅支持单模型服务（llama.cpp）。探测与可用状态见 §4。
 
