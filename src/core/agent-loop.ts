@@ -401,7 +401,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   // 用户取消时把已流式生成的部分响应落盘为受控中断 Turn：History 存原文（含半截 call）供审计，
   // 仅对可配对 call 合成 not_executed 结果（它们从未进入 executor）。无实质内容则不落盘。
   // 半截 thinking 在落盘前剥离（经授权修订 I5 审计范围）：推理草稿无续写价值，回传可能误导
-  // 模型与压缩摘要。纯思考取消剥离后无实质内容 → 不落盘，Run 走零 Turn 取消标注。
+  // 模型与压缩摘要。纯思考取消剥离后无实质内容 → 不落盘，Run 以零 Turn 取消收尾，
+  // 下一条 Prompt 渲染期前置中断前缀。
   const persistAbortedTurn = async (
     handle: RunHandle,
     partial: StoredAssistantMessage | undefined,

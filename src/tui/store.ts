@@ -2,9 +2,9 @@ import { visibleWidth } from "./framework/index.js";
 import { SessionController } from "../core/session-controller.js";
 import type { ApprovalDecision, ControllerSnapshot, SessionListEntry } from "../core/state.js";
 import {
-  CANCELLED_REQUEST_ANNOTATION,
   FAILED_REQUEST_ANNOTATION,
   INTERRUPTED_RESPONSE_ANNOTATION,
+  PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
   UNKNOWN_RESULT_ANNOTATION,
   planEffectiveContext,
   type EligibleTurn,
@@ -779,10 +779,11 @@ export class TuiStore {
     // 在途 Turn（执行中/等待审批）尚无结果，与崩溃窗口在记录层同形；planEffectiveContext
     // 会把它判为缺结果 unknown，展示层按 pendingSeq 豁免合成标记，Run 收尾后自动恢复崩溃窗口语义。
     if (pendingSeq !== undefined) failed.delete(pendingSeq);
-    // 零 Turn 的取消/失败 Run：Prompt 恒进上下文，展示同构地附对应标注。
-    const cancelledPrompts = new Set(
+    // 零 Turn 失败 Run：Prompt 恒进上下文，展示同构地附失败标注；零 Turn 取消 Run 的中断
+    // 信息由下一条 Prompt 前置的 notice 承载（与模型所见的渲染期前缀同构）。
+    const interruptedPrompts = new Set(
       plan.runs
-        .filter((r) => r.cancelled && r.turns.length === 0 && r.prompt !== null)
+        .filter((r) => r.followsCancelledZeroTurn && r.prompt !== null)
         .map((r) => r.prompt!.recordSeq),
     );
     const failedPrompts = new Set(
@@ -830,17 +831,18 @@ export class TuiStore {
       // Run 收尾行（取消/失败标记、耗时）属于前面的展示块，分隔线不越过它们。
       if (record.type !== "run_finished") flushSeparators(record.recordSeq);
       if (record.type === "user_prompt") {
+        // 前缀 notice 在 Prompt 之前：模型所见前缀搭乘本条 Prompt，气泡仍显示记录原文。
+        if (interruptedPrompts.has(record.recordSeq))
+          items.push({
+            id: `interrupted-prompt-${record.recordSeq}`,
+            role: "notice",
+            text: PREVIOUS_REQUEST_INTERRUPTED_PREFIX.trimEnd(),
+          });
         items.push({
           id: `prompt-${record.recordSeq}`,
           role: "user",
           text: record.text,
         });
-        if (cancelledPrompts.has(record.recordSeq))
-          items.push({
-            id: `cancelled-prompt-${record.recordSeq}`,
-            role: "notice",
-            text: CANCELLED_REQUEST_ANNOTATION,
-          });
         if (failedPrompts.has(record.recordSeq))
           items.push({
             id: `failed-prompt-${record.recordSeq}`,

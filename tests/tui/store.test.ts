@@ -5,8 +5,8 @@ import { parseSettings } from "../../src/llm/settings-store.js";
 import { TuiStore } from "../../src/tui/store.js";
 import {
   INTERRUPTED_RESPONSE_ANNOTATION,
-  CANCELLED_REQUEST_ANNOTATION,
   FAILED_REQUEST_ANNOTATION,
+  PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
   UNKNOWN_RESULT_ANNOTATION,
 } from "../../src/core/context-builder.js";
 import { UnknownSideEffectsError } from "../../src/sessions/recovery.js";
@@ -1057,7 +1057,7 @@ it("shows text but hides thinking for a cancelled attempt in the settlement wind
   }
 });
 
-it("shows the cancelled-request annotation for a zero-turn cancelled Run", async () => {
+it("shows no annotation notice for a zero-turn cancelled Run but keeps the outcome line", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
     meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
@@ -1073,7 +1073,40 @@ it("shows the cancelled-request annotation for a zero-turn cancelled Run", async
     await store.refreshHistory();
     const items = store.items();
     expect(items.find((item) => item.text === "task")).toMatchObject({ role: "user" });
-    expect(items.some((item) => item.text === CANCELLED_REQUEST_ANNOTATION)).toBe(true);
+    expect(items.some((item) => item.id.startsWith("interrupted-prompt-"))).toBe(false);
+    expect(items.some((item) => item.id.startsWith("cancelled-prompt-"))).toBe(false);
+    expect(items.some((item) => item.text === "✗ 已取消")).toBe(true);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("prepends the interrupted notice before the prompt following a zero-turn cancelled Run", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "cancelled task" },
+      { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
+      { type: "user_prompt", recordSeq: 3, ts: "now", runId: "r2", text: "new task" },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    const notice = items.find((item) => item.id === "interrupted-prompt-3");
+    expect(notice).toMatchObject({
+      role: "notice",
+      text: PREVIOUS_REQUEST_INTERRUPTED_PREFIX.trimEnd(),
+    });
+    // notice 紧邻其 Prompt 之前；用户气泡显示记录原文；取消 Prompt 自身无 notice。
+    expect(items[items.indexOf(notice!) + 1]).toMatchObject({ id: "prompt-3", role: "user", text: "new task" });
+    expect(items.find((item) => item.id === "prompt-1")).toMatchObject({ text: "cancelled task" });
+    expect(items.some((item) => item.id === "interrupted-prompt-1")).toBe(false);
+    expect(items.some((item) => item.text === "✗ 已取消")).toBe(true);
   } finally {
     await store.dispose();
   }
