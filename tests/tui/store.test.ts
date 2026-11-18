@@ -5,8 +5,8 @@ import { parseSettings } from "../../src/llm/settings-store.js";
 import { TuiStore } from "../../src/tui/store.js";
 import {
   INTERRUPTED_RESPONSE_ANNOTATION,
-  CANCELLED_REQUEST_ANNOTATION,
   FAILED_REQUEST_ANNOTATION,
+  PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
   UNKNOWN_RESULT_ANNOTATION,
 } from "../../src/core/context-builder.js";
 import { UnknownSideEffectsError } from "../../src/sessions/recovery.js";
@@ -66,7 +66,7 @@ function controller(
     compactor,
     commands: {
       readHistory: async () => ({
-        meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         records: [],
         warnings: [],
         fromRecordSeq: 1,
@@ -299,7 +299,7 @@ it("suggests continuing after a failed Run with a complete Turn", async () => {
     return { outcome: "failed", error: new Error("later Turn failed") };
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -346,7 +346,7 @@ it("coalesces high frequency updates without awaiting a slow subscriber and can 
 it("does not restore a Session when its chooser or confirmation is dismissed", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "listSessions").mockResolvedValue([
-    { version: 3, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
+    { version: 4, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
   ]);
   const resume = vi.spyOn(core, "resumeSession").mockResolvedValue();
   const store = new TuiStore(core, parseSettings({}));
@@ -380,7 +380,7 @@ it("clears the previous retry suggestion when adopting a new Session", async () 
     sessionId = "new";
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId, createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId, createdAt: "now" },
     records: [],
     warnings: [],
     fromRecordSeq: 1,
@@ -407,7 +407,7 @@ it("loads the durable prompt while the first response is still pending", async (
     });
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -459,7 +459,7 @@ it("clears the temporary notice after /new resets the Session", async () => {
 it("clears the temporary notice after /resume restores another Session", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "listSessions").mockResolvedValue([
-    { version: 3, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
+    { version: 4, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
   ]);
   vi.spyOn(core, "resumeSession").mockResolvedValue();
   const store = new TuiStore(core, parseSettings({}));
@@ -498,7 +498,7 @@ it("permits /effort during a Run without submitting another Prompt", async () =>
 it("does not revive a dismissed history warning on subsequent refreshes", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [],
     warnings: [{ kind: "tail_truncated", line: 1, byteOffset: 1, message: "old warning" }],
     fromRecordSeq: 1,
@@ -527,7 +527,7 @@ it("retains failure audit records while omitting their detailed system error fro
     },
   ];
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records,
     warnings: [],
     fromRecordSeq: 1,
@@ -636,7 +636,7 @@ it("hands completed thinking state to history and places one duration after fail
   });
   let release!: () => void;
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -694,7 +694,7 @@ it("does not clear live expansion when initial history arrives late", async () =
   vi.spyOn(core, "readHistory").mockImplementation(async () => {
     await first;
     return {
-      meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [],
       warnings: [],
       fromRecordSeq: 1,
@@ -744,7 +744,7 @@ it("hands off the previous Run even if the next Run starts before history arrive
   vi.spyOn(core, "readHistory").mockImplementation(async () => {
     if (records.length) await historyGate;
     return {
-      meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [...records],
       warnings: [],
       fromRecordSeq: 1,
@@ -794,7 +794,7 @@ it("clears history and expansion on reset to an unmaterialized Session", async (
         ref = null;
       },
       readHistory: async () => ({
-        meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         records: [{ type: "user_prompt", recordSeq: 1, ts: "now", runId: "r", text: "old prompt" }],
         warnings: [],
         fromRecordSeq: 1,
@@ -829,7 +829,7 @@ it("does not mark the in-flight turn as excluded while its tool awaits a result"
     const runId =
       snapshot.status.kind === "running" ? snapshot.status.runId : (snapshot.lastRun?.runId ?? "r");
     return {
-      meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [{ type: "assistant_message", recordSeq: 1, ts: "now", runId, message }],
       warnings: [],
       fromRecordSeq: 1,
@@ -894,7 +894,7 @@ it("places a failed retry before its own Turn rather than after later Turn tools
     return { outcome: "completed" };
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records,
     warnings: [],
     fromRecordSeq: 1,
@@ -928,7 +928,7 @@ it("keeps cancelled partial as a persisted aborted Turn with retry failures and 
     return { outcome: "completed" };
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -981,7 +981,7 @@ it("hides thinking of a persisted aborted Turn but keeps completed Turn thinking
   const completed = makeAssistantMessage([], "final answer");
   completed.content.unshift({ type: "thinking", thinking: "kept draft" });
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       { type: "assistant_message", recordSeq: 2, ts: "now", runId: "r1", message: aborted },
@@ -1057,10 +1057,10 @@ it("shows text but hides thinking for a cancelled attempt in the settlement wind
   }
 });
 
-it("shows the cancelled-request annotation for a zero-turn cancelled Run", async () => {
+it("shows no annotation notice for a zero-turn cancelled Run but keeps the outcome line", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
@@ -1073,7 +1073,40 @@ it("shows the cancelled-request annotation for a zero-turn cancelled Run", async
     await store.refreshHistory();
     const items = store.items();
     expect(items.find((item) => item.text === "task")).toMatchObject({ role: "user" });
-    expect(items.some((item) => item.text === CANCELLED_REQUEST_ANNOTATION)).toBe(true);
+    expect(items.some((item) => item.id.startsWith("interrupted-prompt-"))).toBe(false);
+    expect(items.some((item) => item.id.startsWith("cancelled-prompt-"))).toBe(false);
+    expect(items.some((item) => item.text === "✗ 已取消")).toBe(true);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("prepends the interrupted notice before the prompt following a zero-turn cancelled Run", async () => {
+  const core = controller(async () => ({ outcome: "completed" }));
+  vi.spyOn(core, "readHistory").mockResolvedValue({
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "cancelled task" },
+      { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
+      { type: "user_prompt", recordSeq: 3, ts: "now", runId: "r2", text: "new task" },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    await store.refreshHistory();
+    const items = store.items();
+    const notice = items.find((item) => item.id === "interrupted-prompt-3");
+    expect(notice).toMatchObject({
+      role: "notice",
+      text: PREVIOUS_REQUEST_INTERRUPTED_PREFIX.trimEnd(),
+    });
+    // notice 紧邻其 Prompt 之前；用户气泡显示记录原文；取消 Prompt 自身无 notice。
+    expect(items[items.indexOf(notice!) + 1]).toMatchObject({ id: "prompt-3", role: "user", text: "new task" });
+    expect(items.find((item) => item.id === "prompt-1")).toMatchObject({ text: "cancelled task" });
+    expect(items.some((item) => item.id === "interrupted-prompt-1")).toBe(false);
+    expect(items.some((item) => item.text === "✗ 已取消")).toBe(true);
   } finally {
     await store.dispose();
   }
@@ -1082,7 +1115,7 @@ it("shows the cancelled-request annotation for a zero-turn cancelled Run", async
 it("shows the failed-request annotation for a zero-turn failed Run", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "failed", persisted: true },
@@ -1105,7 +1138,7 @@ it("shows the failed-request annotation for a zero-turn failed Run", async () =>
 it("shows unknown annotations and synthetic placeholders isomorphic to the model context", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       {
@@ -1174,7 +1207,7 @@ it("does not mark the in-flight turn as synthetic unknown while the Run is runni
   });
   // 在途 Turn：assistant 已落盘、bash call 等待审批/执行，盘上无 tool_result——与崩溃窗口同形。
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId, text: "task" },
       {
@@ -1217,7 +1250,7 @@ it("does not mark the in-flight turn as synthetic unknown while the Run is runni
 it("dims tool cards of excluded turns (G2)", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       {
@@ -1244,7 +1277,7 @@ it("dims tool cards of excluded turns (G2)", async () => {
   }
 });
 
-it("dims records covered by the checkpoint summary and keeps the tail verbatim (G3/G9)", async () => {
+it("keeps records covered by the checkpoint summary verbatim without dimming (G3/G9)", async () => {
   const { records, core } = compactionFixture(async () => ({
     status: "noop",
     coveredUpTo: null,
@@ -1264,12 +1297,19 @@ it("dims records covered by the checkpoint summary and keeps the tail verbatim (
   const store = await loadedStore(core);
   try {
     const items = store.items();
-    expect(items.find((item) => item.id === "prompt-1")).toMatchObject({ compacted: true });
-    expect(items.find((item) => item.id === "assistant-2")).toMatchObject({ compacted: true });
+    // 压前记录不淡化、原文保留：compacted 标记已删除，压前/尾部同构。
+    const coveredPrompt = items.find((item) => item.id === "prompt-1");
+    const coveredAssistant = items.find((item) => item.id === "assistant-2");
+    expect(coveredPrompt).toMatchObject({ text: "old task" });
+    expect(coveredAssistant).toMatchObject({ text: "covered answer" });
+    for (const item of [coveredPrompt!, coveredAssistant!]) {
+      expect("compacted" in item).toBe(false);
+      expect(item.failed).toBeFalsy();
+    }
     const separator = items.find((item) => item.role === "compaction");
-    expect(separator).toMatchObject({ id: "compaction-3", text: "以上历史已由摘要替代", summary: "SUMMARY" });
-    expect(items.find((item) => item.id === "prompt-4")?.compacted).toBeFalsy();
-    expect(items.find((item) => item.id === "assistant-5")?.compacted).toBeFalsy();
+    expect(separator).toMatchObject({ id: "compaction-3", text: "compacted", summary: "SUMMARY" });
+    expect(items.find((item) => item.id === "prompt-4")).toMatchObject({ text: "new task" });
+    expect(items.find((item) => item.id === "assistant-5")).toMatchObject({ text: "retained answer" });
     // 摘要默认折叠，点击分隔线展开/再折叠（复用 expanded 机制）。
     expect(store.getSnapshot().expanded.has("compaction-3")).toBe(false);
     store.toggle("compaction-3");
@@ -1322,7 +1362,7 @@ it("reuses history item identities when toggling a diff in a long session", asyn
   );
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -1369,7 +1409,7 @@ function compactionFixture(execute: CompactionDriver["execute"]) {
   ];
   const core = controller(async () => ({ outcome: "completed" }), { execute });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -1402,12 +1442,81 @@ it("enables /compact when idle and derives the separator after the covered block
     const items = store.items();
     const separators = items.filter((item) => item.role === "compaction");
     expect(separators).toHaveLength(1);
-    expect(separators[0]).toMatchObject({ id: "compaction-3", text: "以上历史已由摘要替代" });
+    expect(separators[0]).toMatchObject({ id: "compaction-3", text: "compacted" });
     expect(separators[0]?.summary).toBeTruthy();
     expect(items[items.indexOf(separators[0]!) - 1]).toMatchObject({ id: "assistant-2" });
     expect(items.some((item) => item.id === "prompt-1")).toBe(true);
     expect(items.some((item) => item.id === "assistant-2")).toBe(true);
     expect(items.some((item) => item.text.includes("SUMMARY"))).toBe(false);
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("passes /compact <focus> to the compactor", async () => {
+  let captured: string | undefined;
+  const { records, core } = compactionFixture(async (_signal, focus) => {
+    captured = focus;
+    records.push(checkpointRecord(3, 2));
+    return { status: "completed", coveredUpTo: 2, path: "primary" };
+  });
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact 关注认证流程");
+    await store.submit();
+    expect(captured).toBe("关注认证流程");
+    expect(store.getSnapshot().notice?.text).toBe("压缩完成");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("keeps multi-line /compact focus verbatim", async () => {
+  let captured: string | undefined;
+  const { core } = compactionFixture(async (_signal, focus) => {
+    captured = focus;
+    return { status: "noop", coveredUpTo: null, path: "primary" };
+  });
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact 第一行\n第二行");
+    await store.submit();
+    expect(captured).toBe("第一行\n第二行");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("passes no focus for bare /compact and keeps /compactfoo unknown", async () => {
+  const focuses: Array<string | undefined> = [];
+  const { core } = compactionFixture(async (_signal, focus) => {
+    focuses.push(focus);
+    return { status: "noop", coveredUpTo: null, path: "primary" };
+  });
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact");
+    await store.submit();
+    expect(focuses).toEqual([undefined]);
+    store.setDraft("/compactfoo");
+    await store.submit();
+    expect(focuses).toHaveLength(1);
+    expect(store.getSnapshot().notice?.text).toContain("未知命令");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("hides the command menu once /compact carries an argument", async () => {
+  const { core } = compactionFixture(async () => ({
+    status: "noop",
+    coveredUpTo: null,
+    path: "primary",
+  }));
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact 关注");
+    expect(store.commandOptions()).toEqual([]);
   } finally {
     await store.dispose();
   }
@@ -1588,7 +1697,7 @@ it("shows a live compacting separator and replaces it with the checkpoint-derive
     finish({ status: "completed", coveredUpTo: 2, path: "primary" });
     await pending;
     await vi.waitFor(() =>
-      expect(store.items().some((item) => item.text === "以上历史已由摘要替代")).toBe(true),
+      expect(store.items().some((item) => item.text === "compacted")).toBe(true),
     );
     expect(store.items().some((item) => item.text === "compacting")).toBe(false);
     expect(store.items().filter((item) => item.role === "compaction")).toHaveLength(1);
@@ -1701,7 +1810,7 @@ it("clears transient separators when adopting a new Session", async () => {
     sessionId = "new";
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 3, workspaceId: "ws", sessionId, createdAt: "now" },
+    meta: { version: 4, workspaceId: "ws", sessionId, createdAt: "now" },
     records: [],
     warnings: [],
     fromRecordSeq: 1,
@@ -2029,7 +2138,7 @@ it("clears interrupt state when editing and disposes its timer", async () => {
 });
 it("retains the session chooser on failure and retries directly", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
-  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 3, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
+  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 4, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
   const resume = vi.spyOn(core, "resumeSession").mockRejectedValueOnce(new Error("occupied")).mockResolvedValueOnce();
   const store = new TuiStore(core, parseSettings({}));
   try {
@@ -2045,7 +2154,7 @@ it("retains the session chooser on failure and retries directly", async () => {
 
 it("closes the originating chooser after delayed resume despite navigation", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
-  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 3, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
+  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 4, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
   let finish!: () => void;
   vi.spyOn(core, "resumeSession").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
   const store = new TuiStore(core, parseSettings({}));
@@ -2075,7 +2184,7 @@ it("associates approval with the latest execution occurrence and clears it after
  });
  vi.spyOn(core,"readHistory").mockImplementation(async()=>{
    const snapshot=core.getSnapshot(); const runId=snapshot.status.kind === "running" ? snapshot.status.runId : snapshot.lastRun!.runId;
-   return {meta:{version:3,workspaceId:"ws",sessionId:"s",createdAt:"now"},warnings:[],fromRecordSeq:1,
+   return {meta:{version:4,workspaceId:"ws",sessionId:"s",createdAt:"now"},warnings:[],fromRecordSeq:1,
     records:[1,2].slice(0,phase+1).map(recordSeq=>({type:"assistant_message" as const,recordSeq,ts:"now",runId,message:makeAssistantMessage([{id:"same",name:"bash",arguments:{command:"echo test"}}],"",{stopReason:"toolUse"})}))};
  });
  const store=new TuiStore(core,parseSettings({})); const run=core.submitPrompt("task");
@@ -2093,7 +2202,7 @@ describe("bash 实时输出展示态", () => {
       const snapshot = core.getSnapshot();
       const runId = snapshot.status.kind === "running" ? snapshot.status.runId : snapshot.lastRun!.runId;
       return {
-        meta: { version: 3, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 4, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         warnings: [],
         fromRecordSeq: 1,
         records: [

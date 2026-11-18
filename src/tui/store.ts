@@ -2,9 +2,9 @@ import { visibleWidth } from "./framework/index.js";
 import { SessionController } from "../core/session-controller.js";
 import type { ApprovalDecision, ControllerSnapshot, SessionListEntry } from "../core/state.js";
 import {
-  CANCELLED_REQUEST_ANNOTATION,
   FAILED_REQUEST_ANNOTATION,
   INTERRUPTED_RESPONSE_ANNOTATION,
+  PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
   UNKNOWN_RESULT_ANNOTATION,
   planEffectiveContext,
   type EligibleTurn,
@@ -80,8 +80,6 @@ export interface ConversationItem {
   failed?: boolean;
   cancelled?: boolean;
   dim?: boolean;
-  // 已被压缩摘要替代（recordSeq <= coveredUpTo）：整段淡化，不再是上下文原文。
-  compacted?: boolean;
   // 缺结果 call 的合成 unknown 占位（与模型所见同构）；真实记录仍缺失，审计细节见提示文案。
   syntheticUnknown?: boolean;
   // compaction 分隔线携带的摘要正文，默认折叠、点击展开。
@@ -561,6 +559,17 @@ export class TuiStore {
         );
       });
     }
+    const compact = /^\/compact(?:\s+([\s\S]*))?$/.exec(command);
+    if (compact) {
+      // 参数是本次压缩的附加重点：只透传给摘要请求，不落盘。
+      const focus = compact[1]?.trim() || undefined;
+      return this.command(async () => {
+        const outcome = await this.controller.compact(focus);
+        if (outcome.status === "completed") this.notice("压缩完成");
+        else if (outcome.status === "noop") this.notice("No context to compact");
+        else this.notice("压缩已取消");
+      });
+    }
     switch (command) {
       case "/effort":
         this.openModels(true);
@@ -577,13 +586,6 @@ export class TuiStore {
         return this.command(async () => {
           const sessions = await this.controller.listSessions();
           this.update({ modal: { kind: "sessions", selection: 0, sessions } });
-        });
-      case "/compact":
-        return this.command(async () => {
-          const outcome = await this.controller.compact();
-          if (outcome.status === "completed") this.notice("压缩完成");
-          else if (outcome.status === "noop") this.notice("No context to compact");
-          else this.notice("压缩已取消");
         });
       case "/cancel":
         this.cancel();
@@ -777,10 +779,11 @@ export class TuiStore {
     // 在途 Turn（执行中/等待审批）尚无结果，与崩溃窗口在记录层同形；planEffectiveContext
     // 会把它判为缺结果 unknown，展示层按 pendingSeq 豁免合成标记，Run 收尾后自动恢复崩溃窗口语义。
     if (pendingSeq !== undefined) failed.delete(pendingSeq);
-    // 零 Turn 的取消/失败 Run：Prompt 恒进上下文，展示同构地附对应标注。
-    const cancelledPrompts = new Set(
+    // 零 Turn 失败 Run：Prompt 恒进上下文，展示同构地附失败标注；零 Turn 取消 Run 的中断
+    // 信息由下一条 Prompt 前置的 notice 承载（与模型所见的渲染期前缀同构）。
+    const interruptedPrompts = new Set(
       plan.runs
-        .filter((r) => r.cancelled && r.turns.length === 0 && r.prompt !== null)
+        .filter((r) => r.followsCancelledZeroTurn && r.prompt !== null)
         .map((r) => r.prompt!.recordSeq),
     );
     const failedPrompts = new Set(
@@ -791,8 +794,6 @@ export class TuiStore {
     const eligibleTurns = new Map<number, EligibleTurn>(
       plan.runs.flatMap((r) => r.turns).map((turn) => [turn.assistant.recordSeq, turn]),
     );
-    // 压缩覆盖边界：其前的记录已被摘要替代，整段淡化（与上下文归属一致）。
-    const compacted = (recordSeq: number): boolean => recordSeq <= plan.coveredUpTo;
     const results = new Map(
       records
         .filter((r): r is ToolResultRecord => r.type === "tool_result")
@@ -807,7 +808,7 @@ export class TuiStore {
           item: {
             id: `compaction-${record.recordSeq}`,
             role: "compaction",
-            text: "以上历史已由摘要替代",
+            text: "compacted",
             summary: record.summary,
           },
         });
@@ -830,25 +831,23 @@ export class TuiStore {
       // Run 收尾行（取消/失败标记、耗时）属于前面的展示块，分隔线不越过它们。
       if (record.type !== "run_finished") flushSeparators(record.recordSeq);
       if (record.type === "user_prompt") {
+        // 前缀 notice 在 Prompt 之前：模型所见前缀搭乘本条 Prompt，气泡仍显示记录原文。
+        if (interruptedPrompts.has(record.recordSeq))
+          items.push({
+            id: `interrupted-prompt-${record.recordSeq}`,
+            role: "notice",
+            text: PREVIOUS_REQUEST_INTERRUPTED_PREFIX.trimEnd(),
+          });
         items.push({
           id: `prompt-${record.recordSeq}`,
           role: "user",
           text: record.text,
-          compacted: compacted(record.recordSeq),
         });
-        if (cancelledPrompts.has(record.recordSeq))
-          items.push({
-            id: `cancelled-prompt-${record.recordSeq}`,
-            role: "notice",
-            text: CANCELLED_REQUEST_ANNOTATION,
-            compacted: compacted(record.recordSeq),
-          });
         if (failedPrompts.has(record.recordSeq))
           items.push({
             id: `failed-prompt-${record.recordSeq}`,
             role: "notice",
             text: FAILED_REQUEST_ANNOTATION,
-            compacted: compacted(record.recordSeq),
           });
       }
       if (record.type === "interruption")
@@ -856,7 +855,6 @@ export class TuiStore {
           id: `interruption-${record.recordSeq}`,
           role: "notice",
           text: this.redact(`运行中断：${record.reason}`),
-          compacted: compacted(record.recordSeq),
         });
       if (record.type === "run_finished" && record.outcome !== "completed")
         items.push(
@@ -866,14 +864,12 @@ export class TuiStore {
                 role: "failure",
                 text: "✗ 已取消",
                 cancelled: true,
-                compacted: compacted(record.recordSeq),
               }
             : {
                 id: `outcome-${record.recordSeq}`,
                 role: "failure",
                 text: this.redact(`运行${{ failed: "失败", turn_limit: "达到轮数上限" }[record.outcome]}`),
                 failed: true,
-                compacted: compacted(record.recordSeq),
               },
         );
       if (record.type === "run_finished" && record.elapsedMs !== undefined)
@@ -882,7 +878,6 @@ export class TuiStore {
           role: "duration",
           text: `Worked for ${formatDuration(record.elapsedMs)}`,
           dim: true,
-          compacted: compacted(record.recordSeq),
         });
       if (record.type !== "assistant_message") continue;
       const turn = (turns.get(record.runId) ?? 0) + 1;
@@ -910,7 +905,6 @@ export class TuiStore {
           thinking,
           failed: failed.has(record.recordSeq),
           cancelled: record.message.stopReason === "aborted",
-          compacted: compacted(record.recordSeq),
         });
       if (failed.has(record.recordSeq))
         items.push({
@@ -920,7 +914,6 @@ export class TuiStore {
           role: "failure",
           text: "此轮未进入有效上下文",
           failed: true,
-          compacted: compacted(record.recordSeq),
         });
       const eligible = eligibleTurns.get(record.recordSeq);
       for (const call of record.message.content.filter((b): b is StoredToolCall => b.type === "toolCall")) {
@@ -944,7 +937,6 @@ export class TuiStore {
           syntheticUnknown:
             record.recordSeq !== pendingSeq &&
             (eligible?.missingCalls.some((missing) => missing.toolCallId === call.id) ?? false),
-          compacted: compacted(record.recordSeq),
           activity: execution && !execution.completed ? "running" : "queued",
           liveOutput: execution && !execution.completed ? execution.liveOutput : undefined,
           pendingApprovalId: !result && execution && !execution.completed && execution === this.executions.get(key)?.at(-1) && this.state.core.status.kind === "running" && record.runId === this.state.core.status.runId && this.state.core.pendingApproval?.toolCallId === call.id && this.state.core.pendingApproval.toolName === call.name ? this.state.core.pendingApproval.id : undefined,
@@ -958,7 +950,6 @@ export class TuiStore {
           turn,
           role: "notice",
           text: INTERRUPTED_RESPONSE_ANNOTATION,
-          compacted: compacted(record.recordSeq),
         });
       if (eligible?.hasUnknown && record.recordSeq !== pendingSeq)
         items.push({
@@ -967,7 +958,6 @@ export class TuiStore {
           turn,
           role: "notice",
           text: UNKNOWN_RESULT_ANNOTATION,
-          compacted: compacted(record.recordSeq),
         });
     }
     while (separatorIndex < separators.length) {
@@ -1009,7 +999,6 @@ export class TuiStore {
           call: item.call,
           result: item.result,
           failed: item.failed,
-          compacted: item.compacted,
         };
         this.diffItemCache.set(item, diff);
       }

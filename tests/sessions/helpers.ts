@@ -7,6 +7,7 @@ import type {
   AssistantMessageRecord,
   StoredAssistantMessage,
   CheckpointRecord,
+  CheckpointUsage,
   RunFinishedRecord,
   RunModelSnapshot,
   SessionRunOutcome,
@@ -171,6 +172,7 @@ export function makeCheckpointRecord(
   recordSeq: number,
   summary: string,
   coveredUpTo: number,
+  usage?: CheckpointUsage,
 ): CheckpointRecord {
   return {
     recordSeq,
@@ -179,6 +181,7 @@ export function makeCheckpointRecord(
     summary,
     coveredUpTo,
     model: { providerId: "deepseek", modelId: "deepseek-flash" },
+    ...(usage === undefined ? {} : { usage }),
   };
 }
 

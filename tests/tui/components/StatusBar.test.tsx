@@ -5,6 +5,7 @@ import type { ControllerStatus, RunPhase } from "../../../src/core/state.js";
 import { SessionController } from "../../../src/core/session-controller.js";
 import { parseSettings } from "../../../src/llm/settings-store.js";
 import type {
+  CheckpointUsage,
   RunModelSnapshot,
   SessionRecord,
   SessionRunOutcome,
@@ -66,7 +67,7 @@ function timedAssistant(seq: number, runId: string, output: unknown, durationMs:
 function finished(seq: number, runId: string, outcome: SessionRunOutcome = "completed"): SessionRecord {
   return { recordSeq: seq, ts: "now", type: "run_finished", runId, outcome, persisted: true };
 }
-function checkpoint(seq: number, coveredUpTo: number): SessionRecord {
+function checkpoint(seq: number, coveredUpTo: number, usage?: CheckpointUsage): SessionRecord {
   return {
     type: "checkpoint",
     recordSeq: seq,
@@ -74,6 +75,7 @@ function checkpoint(seq: number, coveredUpTo: number): SessionRecord {
     summary: "summary",
     coveredUpTo,
     model: { providerId: "p", modelId: "m" },
+    ...(usage === undefined ? {} : { usage }),
   };
 }
 function running(runId: string, phase: RunPhase = "streaming"): ControllerStatus {
@@ -127,7 +129,7 @@ function stateWith(
     ...snapshot,
     core: options.status === undefined ? snapshot.core : { ...snapshot.core, status: options.status },
     history: {
-      meta: { version: 3, workspaceId: "ws", sessionId, createdAt: "now" },
+      meta: { version: 4, workspaceId: "ws", sessionId, createdAt: "now" },
       records,
       warnings: [],
       fromRecordSeq: 1,
@@ -204,19 +206,17 @@ it("takes the latest request totalTokens within the most recently finished run",
   expect(metrics.contextWindow).toBe(128000);
   expect(metrics.cacheHitRate).toBeCloseTo(100 / 400);
 });
-it("ignores compaction checkpoints in Context and Cache metrics", () => {
+it("keeps Cache and Speed cumulative at a checkpoint without usage", () => {
   const records = [started(1, "r1", 128000), assistant(2, "r1", 100, 50, 1000), finished(3, "r1")];
-  const checkpoint: SessionRecord = {
-    type: "checkpoint",
-    recordSeq: 4,
-    ts: "now",
-    summary: "summary",
-    coveredUpTo: 2,
-    model: { providerId: "p", modelId: "m" },
-  };
-  expect(sessionContextMetrics([...records, checkpoint])).toEqual(sessionContextMetrics(records));
+  const metrics = sessionContextMetrics([...records, checkpoint(4, 2)]);
+  expect(metrics.contextTokens).toBe(1000);
+  expect(metrics.contextWindow).toBe(128000);
+  // 压缩不重置 Cache：checkpoint 自己没带 usage 时，累计只来自 assistant。
+  expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
+  expect(metrics.speedTokPerSec).toBeNull();
+  expect(metrics.contextEstimated).toBe(false);
 });
-it("keeps earlier runs out of the context value while the hit rate still spans all runs", () => {
+it("keeps earlier runs out of the context value while the hit rate still spans runs of the same era", () => {
   const metrics = sessionContextMetrics([
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 50, 1000),
@@ -413,19 +413,11 @@ it("keeps a committed turn of a tool-batch cancel once the run finishes", () => 
   expect(view.lastFrame()).toContain("Context: 2.0k / 128k · Speed: — · Cache: 9.1%");
   view.unmount();
 });
-it("ignores compaction checkpoints while the active run is measured", () => {
+it("keeps Cache for the active run when a checkpoint covers its measured assistant", () => {
   const active: SessionRecord[] = [started(1, "r1", 128000), assistant(2, "r1", 100, 50, 1000)];
-  const checkpoint: SessionRecord = {
-    type: "checkpoint",
-    recordSeq: 3,
-    ts: "now",
-    summary: "summary",
-    coveredUpTo: 2,
-    model: { providerId: "p", modelId: "m" },
-  };
-  expect(sessionContextMetrics([...active, checkpoint], undefined, "r1")).toEqual(
-    sessionContextMetrics(active, undefined, "r1"),
-  );
+  const metrics = sessionContextMetrics([...active, checkpoint(3, 2)], undefined, "r1");
+  expect(metrics.contextTokens).toBe(1000);
+  expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
 });
 it("shows the post-compaction estimate when the checkpoint covers the measured assistant", () => {
   const records: SessionRecord[] = [
@@ -456,6 +448,26 @@ it("switches back to real usage once a post-compaction assistant is committed", 
   const metrics = sessionContextMetrics(records, undefined, null, 52000);
   expect(metrics.contextTokens).toBe(55000);
   expect(metrics.contextEstimated).toBe(false);
+  // Cache 是整段对话累计：压缩前的 assistant(2) 与压后 assistant(6) 都计入。
+  expect(metrics.cacheHitRate).toBeCloseTo(10050 / 50150);
+});
+it("recomputes metrics when a checkpoint with usage is appended", () => {
+  const records = [
+    started(1, "r1", 128000),
+    timedAssistant(2, "r1", 80, 1275),
+    finished(3, "r1"),
+  ];
+  const view = render(wideStatus(stateWith(records)));
+  expect(view.lastFrame()).toContain("Speed: 63 tok/s");
+  // 追加 checkpoint 不改既有 assistant / run_finished 的 seq，必须靠 refreshKey 的 checkpoint 维度重算。
+  view.rerender(
+    wideStatus(
+      stateWith([...records, checkpoint(4, 2, { input: 900, cacheRead: 100, output: 40, durationMs: 1275 })]),
+    ),
+  );
+  expect(view.lastFrame()).toContain("Speed: 47 tok/s");
+  expect(view.lastFrame()).toContain("Cache: 9.1%");
+  view.unmount();
 });
 it("shows the estimate during the first post-compaction request of an active run", () => {
   const records: SessionRecord[] = [
@@ -499,6 +511,83 @@ it("keeps real usage without crashing when the checkpoint is invalid", () => {
   const metrics = sessionContextMetrics(records, undefined, null, 52000);
   expect(metrics.contextTokens).toBe(230000);
   expect(metrics.contextEstimated).toBe(false);
+  // Cache/Speed 不依赖 checkpoint 边界；坏记录只影响 Context 的实测/估算切换。
+  expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
+});
+it("counts checkpoint usage on top of every assistant in Cache and Speed", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 1000),
+    finished(3, "r1"),
+    checkpoint(4, 2, { input: 600, cacheRead: 400, output: 200, durationMs: 2000 }),
+    started(5, "r2", 128000),
+    timedAssistant(6, "r2", 80, 1275),
+    assistant(7, "r2", 300, 30, 2000),
+    finished(8, "r2"),
+  ];
+  const metrics = sessionContextMetrics(records);
+  expect(metrics.contextTokens).toBe(2000);
+  // Cache：(50 + 0 + 30 + 400) / (100 + 100 + 300 + 50 + 0 + 30 + 600 + 400)。
+  expect(metrics.cacheHitRate).toBeCloseTo(480 / 1580);
+  // Speed：(80 + 200) / (1275 + 2000)。
+  expect(metrics.speedTokPerSec).toBeCloseTo(280 / 3.275);
+});
+it("accumulates every checkpoint of the conversation", () => {
+  const metrics = sessionContextMetrics([
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 1000),
+    finished(3, "r1"),
+    checkpoint(4, 2, { input: 500, cacheRead: 500, output: 100, durationMs: 1000 }),
+    checkpoint(5, 2, { input: 300, cacheRead: 100, output: 300, durationMs: 2000 }),
+  ]);
+  // Cache：assistant(2) + checkpoint(4) + checkpoint(5)。
+  expect(metrics.cacheHitRate).toBeCloseTo((50 + 500 + 100) / (100 + 50 + 500 + 500 + 300 + 100));
+  // Speed：(100 + 300) / (1000 + 2000)。
+  expect(metrics.speedTokPerSec).toBeCloseTo(400 / 3);
+});
+it("counts a checkpoint without duration in Cache but not in Speed", () => {
+  const metrics = sessionContextMetrics([
+    started(1, "r1", 128000),
+    assistant(2, "r1", 100, 50, 1000),
+    finished(3, "r1"),
+    checkpoint(4, 2, { input: 500, cacheRead: 100, output: 900 }),
+  ]);
+  // Cache：(50 + 100) / (100 + 50 + 500 + 100)。
+  expect(metrics.cacheHitRate).toBeCloseTo(150 / 750);
+  // 缺 durationMs 的摘要请求只计 token，不补零冒充测量，因此 Speed 仍无数据。
+  expect(metrics.speedTokPerSec).toBeNull();
+});
+it("ignores malformed checkpoint usage instead of throwing", () => {
+  for (const usage of [
+    null,
+    { input: "500", cacheRead: 100, output: 10 },
+    { input: 500, cacheRead: Number.NaN, output: 10, durationMs: 1000 },
+    { input: 500, cacheRead: 100, output: 10, durationMs: -1 },
+    { input: 500, cacheRead: 100 },
+  ]) {
+    const metrics = sessionContextMetrics([
+      started(1, "r1", 128000),
+      assistant(2, "r1", 100, 50, 1000),
+      finished(3, "r1"),
+      { ...checkpoint(4, 2), usage } as unknown as SessionRecord,
+    ]);
+    expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
+    expect(metrics.speedTokPerSec).toBeNull();
+  }
+});
+it("renders non-zero Cache and Speed after a compaction", () => {
+  const records: SessionRecord[] = [
+    started(1, "r1", 128000),
+    timedAssistant(2, "r1", 80, 1275),
+    assistant(3, "r1", 100, 50, 1000),
+    finished(4, "r1"),
+    checkpoint(5, 3, { input: 800, cacheRead: 200, output: 40, durationMs: 1275 }),
+  ];
+  const view = render(wideStatus(stateWith(records)));
+  // Cache：(0 + 50 + 200) / (100 + 0 + 100 + 50 + 800 + 200) = 20.0%。
+  expect(view.lastFrame()).toContain("Cache: 20.0%");
+  expect(view.lastFrame()).toContain("Speed: 47 tok/s");
+  view.unmount();
 });
 it("uses real usage and cache for an active run without any finished run", () => {
   const metrics = sessionContextMetrics(
@@ -594,7 +683,7 @@ it("returns null when no turn of the run has a usable pair", () => {
   ]);
   expect(metrics.speedTokPerSec).toBeNull();
 });
-it("keeps earlier runs out of the weighted average", () => {
+it("weights every run of the conversation into the average", () => {
   const metrics = sessionContextMetrics(
     [
       started(1, "r1", 128000),
@@ -608,8 +697,8 @@ it("keeps earlier runs out of the weighted average", () => {
     undefined,
     "r2",
   );
-  expect(metrics.speedTokPerSec).toBeCloseTo(80 / 2);
-  expect(metrics.speedTokPerSec).not.toBeCloseTo(260 / 4.35);
+  expect(metrics.speedTokPerSec).toBeCloseTo(260 / 4.35);
+  expect(metrics.speedTokPerSec).not.toBeCloseTo(80 / 2);
 });
 it("counts committed turns of cancelled and failed runs in the average", () => {
   for (const outcome of ["cancelled", "failed"] as const) {
@@ -622,7 +711,7 @@ it("counts committed turns of cancelled and failed runs in the average", () => {
     expect(metrics.speedTokPerSec).toBeCloseTo(180 / 2.35);
   }
 });
-it("carries the previous run average until the active run commits a turn", () => {
+it("dilutes the conversation average with a new turn of the active run", () => {
   const records = [
     started(1, "r1", 128000),
     timedAssistant(2, "r1", 80, 1275),
@@ -636,7 +725,8 @@ it("carries the previous run average until the active run commits a turn", () =>
     undefined,
     "r2",
   );
-  expect(after.speedTokPerSec).toBeCloseTo(100 / 1.075);
+  expect(after.speedTokPerSec).toBeCloseTo(280 / 3.425);
+  expect(after.speedTokPerSec).not.toBeCloseTo(100 / 1.075);
 });
 it("falls back to null when output or duration is unusable", () => {
   const cases: Array<[unknown, unknown]> = [

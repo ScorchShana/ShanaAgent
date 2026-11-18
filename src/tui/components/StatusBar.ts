@@ -54,11 +54,18 @@ export function sessionContextMetrics(
     activeRunId !== null && assistants.some((record) => record.runId === activeRunId);
   const measuredRunId: string | null = activeHasAssistant ? activeRunId : (lastFinished?.runId ?? null);
 
+  // 最新 checkpoint 的 coveredUpTo 只服务于 Context：被覆盖的实测是压缩前旧值，改用压后估算。
+  // checkpoint 损坏时无法判定覆盖范围，保持实测显示，状态栏不因坏记录崩溃。
+  let coveredUpTo: number | null = null;
+  try {
+    coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
+  } catch {
+    coveredUpTo = null;
+  }
+
   let contextTokens: number | null;
   let contextWindow: number | null;
   let latestSeq = -1;
-  let outputSum = 0;
-  let durationMsSum = 0;
   if (measuredRunId === null) {
     contextWindow = finiteToken(fallback?.contextWindow);
     if (contextWindow === null)
@@ -74,18 +81,6 @@ export function sessionContextMetrics(
     contextTokens = null;
     for (const record of assistants) {
       if (record.runId !== measuredRunId) continue;
-      const output = finiteToken(usageOf(record)?.output);
-      const durationMs = record.message.durationMs;
-      // 累加必须先于 latestSeq 跳过：Context 只取最大 seq 那条，Speed 要覆盖本 Run 全部 Turn。
-      if (
-        output !== null &&
-        typeof durationMs === "number" &&
-        Number.isFinite(durationMs) &&
-        durationMs > 0
-      ) {
-        outputSum += output;
-        durationMsSum += durationMs;
-      }
       if (record.recordSeq < latestSeq) continue;
       latestSeq = record.recordSeq;
       contextTokens = finiteToken(usageOf(record)?.totalTokens);
@@ -98,15 +93,9 @@ export function sessionContextMetrics(
 
   // 最新 checkpoint 覆盖了被测量的 assistant（或该 Run 尚无 assistant）：实测是压缩前旧值，
   // 改用压后估算，与模型实际所见同构；新实测落盘后 recordSeq 超出覆盖范围，自动切回。
-  // checkpoint 损坏时无法判定实测是否过期，保持实测显示，状态栏不因此崩溃。
+  // checkpoint 损坏时 coveredUpTo 为 null，保持实测显示。
   let contextEstimated = false;
   if (contextEstimate !== null && measuredRunId !== null) {
-    let coveredUpTo: number | null = null;
-    try {
-      coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
-    } catch {
-      coveredUpTo = null;
-    }
     if (coveredUpTo !== null && (latestSeq < 0 || coveredUpTo >= latestSeq)) {
       contextTokens = contextEstimate;
       contextEstimated = true;
@@ -116,9 +105,13 @@ export function sessionContextMetrics(
   const countedRunIds = new Set(finished.map((record) => record.runId));
   if (activeRunId !== null) countedRunIds.add(activeRunId);
 
+  // Cache/Speed 是整段对话的累计口径：跨 Run、跨压缩都持续累加，压缩不重置。
+  // 摘要请求本身也是真实请求，其用量随 checkpoint 落盘并计入同一累计（重启 / /resume 后仍完整）。
   let inputSum = 0;
   let cacheReadSum = 0;
   let cacheComplete = true;
+  let outputSum = 0;
+  let durationMsSum = 0;
   for (const record of assistants) {
     if (!countedRunIds.has(record.runId)) continue;
     const usage = usageOf(record);
@@ -126,10 +119,37 @@ export function sessionContextMetrics(
     const cacheRead = finiteToken(usage?.cacheRead);
     if (input === null || cacheRead === null) {
       cacheComplete = false;
-      continue;
+    } else {
+      inputSum += input;
+      cacheReadSum += cacheRead;
     }
+    const output = finiteToken(usage?.output);
+    const durationMs = record.message.durationMs;
+    if (output !== null && typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0) {
+      outputSum += output;
+      durationMsSum += durationMs;
+    }
+  }
+  for (const record of records) {
+    if (record.type !== "checkpoint") continue;
+    // 旧 checkpoint 无 usage（记录层可选）。字段非法时整条忽略（不补零、不部分采信），状态栏不崩。
+    const usage = record.usage;
+    const input = finiteToken(usage?.input);
+    const cacheRead = finiteToken(usage?.cacheRead);
+    const output = finiteToken(usage?.output);
+    if (input === null || cacheRead === null || output === null) continue;
+    const durationMs = usage?.durationMs;
+    const durationValid =
+      durationMs === undefined ||
+      (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0);
+    if (!durationValid) continue;
     inputSum += input;
     cacheReadSum += cacheRead;
+    // 摘要请求耗时缺省（Provider 未报告）或为 0 时只计 token、不计速度。
+    if (durationMs !== undefined && durationMs > 0) {
+      outputSum += output;
+      durationMsSum += durationMs;
+    }
   }
 
   const denominator = inputSum + cacheReadSum;
@@ -212,7 +232,15 @@ export class StatusBar implements Component {
               : latest,
           -1,
         ) ?? -1;
-      this.refreshKey = `${state.history?.meta.sessionId ?? ""}:${activeRunId ?? "idle"}:${seq}`;
+      // checkpoint 追加会改变 Cache/Speed 口径，但既有 seq（assistant/run_finished）可能不变，
+      // 必须把 checkpoint 维度计入键，否则压缩后不会重算。
+      const checkpointSeq =
+        state.history?.records.reduce(
+          (latest, record) =>
+            record.type === "checkpoint" && record.recordSeq > latest ? record.recordSeq : latest,
+          -1,
+        ) ?? -1;
+      this.refreshKey = `${state.history?.meta.sessionId ?? ""}:${activeRunId ?? "idle"}:${seq}:${checkpointSeq}`;
     }
     const contextWindow = (state.core.session.runModel ?? state.core.session.model)?.contextWindow ?? null;
     const contextTokens = state.core.session.contextBaselineTokens;

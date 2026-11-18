@@ -9,12 +9,18 @@ import { TuiAltScreen, Text, getKeybindings, type Component } from "../../src/tu
 import { makeModelSnapshot } from "../sessions/helpers.js";
 import { VirtualTerminal } from "./framework/virtual-terminal.js";
 
-it.each(["\r", "\x1b[13u", "\x1b[13;1u"])("opens exit confirmation for typed /quit and Enter %j", async (enter) => {
+it.each(["\r", "\x1b[13u", "\x1b[13;1u"])("fills /quit on the first Enter and exits on the second %j", async (enter) => {
   const test = setup();
+  const requestExit = vi.spyOn(test.store, "requestExit");
   try {
     for (const key of "/quit") test.terminal.sendInput(key);
     await vi.waitFor(() => expect(test.app.editor.capturesViewportInput).toBe(true));
     test.terminal.sendInput(enter);
+    expect(test.app.editor.getText()).toBe("/quit");
+    expect(test.app.editor.capturesViewportInput).toBe(false);
+    expect(requestExit).not.toHaveBeenCalled();
+    test.terminal.sendInput(enter);
+    await vi.waitFor(() => expect(requestExit).toHaveBeenCalledTimes(1));
     await test.store.dispose();
     expect(test.store.getSnapshot().modal).toBeNull();
   } finally { await test.close(); }
@@ -32,15 +38,19 @@ it.each([15, 24, 40])("shows slash command suggestions after typing slash at hei
   } finally { await test.close(); }
 });
 
-it.each(["\r", "\x1b[13u", "\x1b[13;1u"])("submits the selected model command with Enter %j", async (enter) => {
+it.each(["\r", "\x1b[13u", "\x1b[13;1u"])("fills the selected model command and runs it on the second Enter %j", async (enter) => {
   const test = setup();
   try {
     for (const key of "/mo") test.terminal.sendInput(key);
     await vi.waitFor(() => expect(test.app.editor.capturesViewportInput).toBe(true));
     test.terminal.sendInput(enter);
+    expect(test.store.getSnapshot().draft).toBe("/model");
+    expect(test.app.editor.getText()).toBe("/model");
+    expect(test.store.getSnapshot().notice).toBeNull();
+    expect(test.app.editor.capturesViewportInput).toBe(false);
+    test.terminal.sendInput(enter);
     expect(test.store.getSnapshot().draft).toBe("");
     expect(test.store.getSnapshot().notice?.text).toContain("model.json");
-    expect(test.app.editor.capturesViewportInput).toBe(false);
   } finally { await test.close(); }
 });
 
@@ -195,15 +205,18 @@ it("does not pick a different command when there are no completions", async () =
     expect(test.core.getSnapshot().status.kind).toBe("idle");
   } finally { await test.close(); }
 });
-it("submits the selected completion on the first Enter", async () => {
+it("fills the selected completion without executing it", async () => {
   const test = setup();
   try {
     test.terminal.sendInput("/");
     await vi.waitFor(() => expect(test.app.editor.capturesViewportInput).toBe(true));
     for (let i = 0; i < 7; i++) test.terminal.sendInput("\x1b[B");
     test.terminal.sendInput("\r");
-    await test.store.dispose();
+    expect(test.app.editor.getText()).toBe("/exit");
+    expect(test.store.getSnapshot().draft).toBe("/exit");
+    expect(test.app.editor.capturesViewportInput).toBe(false);
     expect(test.store.getSnapshot().modal).toBeNull();
+    expect(test.core.getSnapshot().status.kind).toBe("idle");
   } finally {
     await test.close();
   }

@@ -82,16 +82,16 @@ describe("V1 记录枚举与 Schema 校验", () => {
   it("合法记录通过校验；首条记录必须且仅允许首条携带 version", () => {
     const prompt = { recordSeq: 1, ts: TS, type: "user_prompt", runId: "run-1", text: "hi" };
     expect(parseSessionRecord(prompt, { expectVersion: false }).type).toBe("user_prompt");
-    expect(parseSessionRecord({ ...prompt, version: 3 }, { expectVersion: true }).recordSeq).toBe(1);
+    expect(parseSessionRecord({ ...prompt, version: 4 }, { expectVersion: true }).recordSeq).toBe(1);
     expect(() => parseSessionRecord(prompt, { expectVersion: true })).toThrow(/缺少 "version"/);
     expect(() =>
-      parseSessionRecord({ ...prompt, recordSeq: 2, version: 3 }, { expectVersion: false }),
+      parseSessionRecord({ ...prompt, recordSeq: 2, version: 4 }, { expectVersion: false }),
     ).toThrow(/仅首条记录允许/);
   });
 
   it("非法 type / status / outcome / 未知字段被拒绝", () => {
     expect(() =>
-      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 3 }, { expectVersion: true }),
+      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 4 }, { expectVersion: true }),
     ).toThrow(RecordValidationError);
     expect(() =>
       parseSessionRecord(
@@ -325,7 +325,7 @@ it("accepts optional elapsedMs and rejects invalid audit durations", () => {
     type: "run_finished",
     recordSeq: 1,
     ts: TS,
-    version: 3,
+    version: 4,
     runId: "r",
     outcome: "completed",
     persisted: true,
@@ -341,8 +341,50 @@ it("accepts optional elapsedMs and rejects invalid audit durations", () => {
     );
 });
 
+describe("checkpoint usage", () => {
+  const checkpoint = {
+    type: "checkpoint",
+    recordSeq: 1,
+    ts: TS,
+    version: 4,
+    summary: "sum",
+    coveredUpTo: 3,
+    model: { providerId: "p", modelId: "m" },
+  };
+
+  it("可选：缺省通过，合法 usage 原样保留", () => {
+    expect(parseSessionRecord(checkpoint, { expectVersion: true })).not.toHaveProperty("usage");
+    const usage = { input: 100, cacheRead: 20, output: 30, durationMs: 1234.5 };
+    expect(parseSessionRecord({ ...checkpoint, usage }, { expectVersion: true })).toEqual({
+      ...checkpoint,
+      usage,
+    });
+    // durationMs 可由 Provider 缺省；token 三项必填。
+    const noDuration = { input: 0, cacheRead: 0, output: 0 };
+    expect(parseSessionRecord({ ...checkpoint, usage: noDuration }, { expectVersion: true })).toMatchObject({
+      usage: noDuration,
+    });
+  });
+
+  it.each([
+    ["非对象", 12],
+    ["缺字段", { input: 1, cacheRead: 1 }],
+    ["负数", { input: -1, cacheRead: 0, output: 0 }],
+    ["NaN", { input: NaN, cacheRead: 0, output: 0 }],
+    ["Infinity", { input: 0, cacheRead: Infinity, output: 0 }],
+    ["字符串", { input: "1", cacheRead: 0, output: 0 }],
+    ["多余键", { input: 0, cacheRead: 0, output: 0, cost: 1 }],
+    ["durationMs 非数", { input: 0, cacheRead: 0, output: 0, durationMs: "1" }],
+    ["durationMs 负数", { input: 0, cacheRead: 0, output: 0, durationMs: -5 }],
+  ])("拒绝非法 usage：%s", (_label, usage) => {
+    expect(() => parseSessionRecord({ ...checkpoint, usage }, { expectVersion: true })).toThrow(
+      RecordValidationError,
+    );
+  });
+});
+
 describe("autoDecisionEnabled metadata", () => {
-  const meta = { version: 3, sessionId: "s1", workspaceId: "ws", createdAt: TS };
+  const meta = { version: 4, sessionId: "s1", workspaceId: "ws", createdAt: TS };
   it("preserves absence and accepts both booleans", () => {
     expect(parseSessionMeta(meta)).not.toHaveProperty("autoDecisionEnabled");
     for (const enabled of [true, false]) {

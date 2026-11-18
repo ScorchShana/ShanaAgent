@@ -46,9 +46,11 @@ export interface ExcludedTurn {
 export interface RunPlan {
   prompt: UserPromptRecord | null;
   promptIncluded: boolean;
-  // Run 以用户取消/失败收尾；零 Turn 时分别附取消/失败标注，避免悬空 Prompt 误导模型。
+  // Run 以用户取消/失败收尾；零 Turn 失败 Run 附失败标注，零 Turn 取消由下一条 Prompt 的前缀承载。
   cancelled: boolean;
   failed: boolean;
+  // 紧邻其前的 Run 零 Turn 取消：本 Run 的 Prompt 渲染期前置中断前缀（不落盘）。
+  followsCancelledZeroTurn: boolean;
   turns: EligibleTurn[];
   excludedTurns: ExcludedTurn[];
 }
@@ -200,7 +202,7 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
     if (record.recordSeq <= coveredUpTo) continue;
 
     if (record.type === "user_prompt") {
-      current = { prompt: record, promptIncluded: false, cancelled: false, failed: false, turns: [], excludedTurns: [] };
+      current = { prompt: record, promptIncluded: false, cancelled: false, failed: false, followsCancelledZeroTurn: false, turns: [], excludedTurns: [] };
       runs.push(current);
       runIds.set(current, record.runId);
       blockedReason = null;
@@ -209,7 +211,7 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
     if (record.type !== "assistant_message") continue;
 
     if (current === null) {
-      current = { prompt: null, promptIncluded: false, cancelled: false, failed: false, turns: [], excludedTurns: [] };
+      current = { prompt: null, promptIncluded: false, cancelled: false, failed: false, followsCancelledZeroTurn: false, turns: [], excludedTurns: [] };
       runs.push(current);
       runIds.set(current, record.runId);
     }
@@ -235,13 +237,17 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
     }
   }
 
-  // Prompt 恒进上下文（含失败/取消的零 Turn Run）；零 Turn 时由 buildContext 附对应标注。
-  for (const run of runs) {
+  // Prompt 恒进上下文（含失败/取消的零 Turn Run）；零 Turn 失败由 buildContext 附标注，
+  // 零 Turn 取消的中断信息前置到记录序相邻的下一条 Prompt（渲染期，不落盘）。
+  for (const [index, run] of runs.entries()) {
     const runId = runIds.get(run);
     const outcome = runId === undefined ? undefined : outcomes.get(runId);
     run.cancelled = outcome === "cancelled";
     run.failed = outcome === "failed";
     run.promptIncluded = run.prompt !== null;
+    const previous = runs[index - 1];
+    run.followsCancelledZeroTurn =
+      previous !== undefined && previous.cancelled && previous.turns.length === 0;
   }
 
   return { checkpoint, coveredUpTo, runs };
@@ -318,8 +324,12 @@ export interface BuiltContext {
   warnings: ContextBuildWarning[];
 }
 
-function promptMessage(record: UserPromptRecord): UserMessage {
-  return { role: "user", content: record.text, timestamp: Date.parse(record.ts) };
+function promptMessage(record: UserPromptRecord, prefixed = false): UserMessage {
+  return {
+    role: "user",
+    content: prefixed ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + record.text : record.text,
+    timestamp: Date.parse(record.ts),
+  };
 }
 
 export function wrapConversationSummary(summary: string): string {
@@ -362,11 +372,15 @@ export function toolResultMessage(record: ToolResultRecord, imageInput = true): 
   };
 }
 
-// 取消/中断/未知标注：渲染期注入的 user 消息，不落盘。防止模型把半截响应当完整结论续写、
+// 中断/失败/未知标注：渲染期注入的 user 消息，不落盘。防止模型把半截响应当完整结论续写、
 // 把未知结果当未执行而盲目重试。
 export const INTERRUPTED_RESPONSE_ANNOTATION = "[The user interrupted this response.]";
-export const CANCELLED_REQUEST_ANNOTATION = "[The user cancelled this request before any response.]";
 export const FAILED_REQUEST_ANNOTATION = "[This request failed before any response was generated.]";
+// 零 Turn 取消 Run 的下一条 Prompt 渲染期前置此句（记录恒存原文），提示模型前一请求未完成、
+// 勿连带回答。旧 Session 历史实测含已删除的取消标注：锚定偏高以标注大小为界、方向安全，
+// 下次响应重新锚定消除（与 thinking 残差同理）。
+export const PREVIOUS_REQUEST_INTERRUPTED_PREFIX =
+  "[The previous request was interrupted before completion.]\n";
 export const UNKNOWN_RESULT_ANNOTATION =
   "[Some tool results in this turn are unknown: the tools may have partially or fully executed, or may not have run at all. Do not retry them or assume their outcomes. Ask the user to verify the actual effects before continuing.]";
 
@@ -378,10 +392,10 @@ function annotationMessage(text: string, ts: string): UserMessage {
   return { role: "user", content: text, timestamp: Date.parse(ts) };
 }
 
-// 零 Turn 的取消/失败 Run：Prompt 后附标注，避免悬空 Prompt 误导模型。
+// 零 Turn 失败 Run：Prompt 后附失败标注，避免悬空 Prompt 误导模型。取消 Run 的 Prompt
+// 裸进上下文，中断信息由其下一条 Prompt 的前缀承载（followsCancelledZeroTurn）。
 function zeroTurnAnnotations(run: RunPlan): StoredContext["messages"] {
   if (run.prompt === null || run.turns.length > 0) return [];
-  if (run.cancelled) return [annotationMessage(CANCELLED_REQUEST_ANNOTATION, run.prompt.ts)];
   if (run.failed) return [annotationMessage(FAILED_REQUEST_ANNOTATION, run.prompt.ts)];
   return [];
 }
@@ -451,7 +465,7 @@ export async function buildContext(input: BuildContextInput): Promise<BuiltConte
   }
   for (const run of plan.runs) {
     if (run.promptIncluded && run.prompt !== null) {
-      messages.push(promptMessage(run.prompt));
+      messages.push(promptMessage(run.prompt, run.followsCancelledZeroTurn));
       messages.push(...zeroTurnAnnotations(run));
     }
     for (const turn of run.turns) {
@@ -460,9 +474,15 @@ export async function buildContext(input: BuildContextInput): Promise<BuiltConte
   }
   if (input.currentPrompt !== undefined) {
     const now = input.now ?? (() => new Date());
+    // 与重建路径同一规则（新 Prompt 的 Run 尚未在记录里，取末尾 Run 判定）：
+    // 锚定 sameSentMessage 逐条比较，两条路径必须逐字一致。
+    const previous = plan.runs.at(-1);
+    const prefixed = previous !== undefined && previous.cancelled && previous.turns.length === 0;
     messages.push({
       role: "user",
-      content: input.currentPrompt,
+      content: prefixed
+        ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + input.currentPrompt
+        : input.currentPrompt,
       timestamp: now().getTime(),
     });
   }
@@ -573,7 +593,12 @@ export function planCompaction(
       if (!firstTurnOfRun.has(entry.run)) firstTurnOfRun.set(entry.run, index);
     }
     const promptTokens = (run: RunPlan) =>
-      run.prompt === null ? 0 : estimateTokens(run.prompt.text, options.tokenEstimate);
+      run.prompt === null
+        ? 0
+        : estimateTokens(run.prompt.text, options.tokenEstimate) +
+          (run.followsCancelledZeroTurn
+            ? estimateTokens(PREVIOUS_REQUEST_INTERRUPTED_PREFIX, options.tokenEstimate)
+            : 0);
 
     const latestIndex = planned.length - 1;
     const latest = planned[latestIndex]!;
@@ -602,7 +627,7 @@ export function planCompaction(
     const promptCovered = run.prompt !== null && run.prompt.recordSeq <= coveredUpTo;
     if (turns.length === 0 && !promptCovered) continue;
     if (promptCovered && run.prompt !== null) {
-      messages.push(promptMessage(run.prompt));
+      messages.push(promptMessage(run.prompt, run.followsCancelledZeroTurn));
       messages.push(...zeroTurnAnnotations(run));
     }
     for (const turn of turns) {

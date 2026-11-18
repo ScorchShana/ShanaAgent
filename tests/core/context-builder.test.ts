@@ -3,13 +3,13 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  CANCELLED_REQUEST_ANNOTATION,
   CONTEXT_SAFETY_MARGIN_TOKENS,
   FAILED_REQUEST_ANNOTATION,
   IMAGE_COMPACTION_OMITTED_TEXT,
   IMAGE_OMITTED_TEXT,
   INTERRUPTED_RESPONSE_ANNOTATION,
   MISSING_TOOL_RESULT_TEXT,
+  PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
   UNKNOWN_RESULT_ANNOTATION,
   assertCandidateCheckpointValid,
   buildContext,
@@ -1247,7 +1247,7 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
     expect(JSON.stringify(selection.messages)).not.toContain("SUMMARY_DRAFT");
   });
 
-  it("零 Turn 的取消 Run：Prompt 恒进上下文并附取消标注", async () => {
+  it("零 Turn 的取消 Run：Prompt 裸进上下文，无标注", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
       makeRunFinishedRecord(2, "run-1", "cancelled"),
@@ -1258,9 +1258,8 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
     expect(plan.runs[0]?.promptIncluded).toBe(true);
 
     const built = await buildContext({ records, workspacePath: makeWorkspace() });
-    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user"]);
     expect(built.context.messages[0]).toMatchObject({ content: "q" });
-    expect(built.context.messages[1]).toMatchObject({ content: CANCELLED_REQUEST_ANNOTATION });
   });
 
   it("零 Turn 的失败 Run：Prompt 恒进上下文并附失败标注", async () => {
@@ -1370,6 +1369,143 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
         (m) => m.role === "user" && m.content === INTERRUPTED_RESPONSE_ANNOTATION,
       ),
     ).toBe(true);
+  });
+});
+
+describe("零 Turn 取消后的渲染期中断前缀", () => {
+  it("下一条 Prompt 前置前缀，取消 Run 的 Prompt 裸进上下文（重建路径）", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "cancelled task"),
+      makeRunFinishedRecord(2, "run-1", "cancelled"),
+      makeUserPromptRecord(3, "run-2", "new task"),
+    ];
+    const plan = planEffectiveContext(records);
+    expect(plan.runs[1]?.followsCancelledZeroTurn).toBe(true);
+    expect(plan.runs[0]?.followsCancelledZeroTurn).toBe(false);
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(built.context.messages[0]).toMatchObject({ content: "cancelled task" });
+    expect(built.context.messages[1]).toMatchObject({
+      content: PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "new task",
+    });
+    // 前缀不落盘：记录恒存原文。
+    expect(records[2]).toMatchObject({ text: "new task" });
+  });
+
+  it("prior + currentPrompt 路径与记录重建路径逐字一致（锚定同一性护栏）", async () => {
+    const prior: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "cancelled task"),
+      makeRunFinishedRecord(2, "run-1", "cancelled"),
+    ];
+    const rebuilt = await buildContext({
+      records: [...prior, makeUserPromptRecord(3, "run-2", "new task")],
+      workspacePath: makeWorkspace(),
+    });
+    const sent = await buildContext({
+      records: prior,
+      currentPrompt: "new task",
+      workspacePath: makeWorkspace(),
+      now: () => new Date(RECORD_TS),
+    });
+    expect(sent.context.messages).toEqual(rebuilt.context.messages);
+    expect(sent.context.messages.at(-1)).toMatchObject({
+      content: PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "new task",
+    });
+  });
+
+  it("取消后无下一条 Prompt：正式请求与压缩输入全文无前缀", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "first"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success"),
+      makeRunFinishedRecord(4, "run-1", "completed"),
+      makeUserPromptRecord(5, "run-2", "dangling"),
+      makeRunFinishedRecord(6, "run-2", "cancelled"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(JSON.stringify(built.context.messages)).not.toContain(
+      PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
+    );
+    expect(built.context.messages.at(-1)).toMatchObject({ content: "dangling" });
+    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    expect(JSON.stringify(selection.messages)).not.toContain(PREVIOUS_REQUEST_INTERRUPTED_PREFIX);
+  });
+
+  it("半截文本取消（aborted Turn）不触发前缀，中断标注照旧（作用域 A 护栏）", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "first"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+      makeUserPromptRecord(4, "run-2", "second"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.at(-1)).toMatchObject({ content: "second" });
+    expect(
+      built.context.messages.some((m) => m.content === INTERRUPTED_RESPONSE_ANNOTATION),
+    ).toBe(true);
+    expect(JSON.stringify(built.context.messages)).not.toContain(
+      PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
+    );
+  });
+
+  it("零 Turn 失败 Run 附失败标注，下一条 Prompt 无前缀", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "first"),
+      makeRunFinishedRecord(2, "run-1", "failed"),
+      makeUserPromptRecord(3, "run-2", "second"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user", "user"]);
+    expect(built.context.messages[1]).toMatchObject({ content: FAILED_REQUEST_ANNOTATION });
+    expect(built.context.messages[2]).toMatchObject({ content: "second" });
+    expect(JSON.stringify(built.context.messages)).not.toContain(
+      PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
+    );
+  });
+
+  it("连续两次零 Turn 取消：后续 Prompt 各带一个前缀，首条裸", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "p1"),
+      makeRunFinishedRecord(2, "run-1", "cancelled"),
+      makeUserPromptRecord(3, "run-2", "p2"),
+      makeRunFinishedRecord(4, "run-2", "cancelled"),
+      makeUserPromptRecord(5, "run-3", "p3"),
+    ];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages.map((m) => m.content)).toEqual([
+      "p1",
+      PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "p2",
+      PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "p3",
+    ]);
+  });
+
+  it("planCompaction：被覆盖的带前缀 Prompt 进摘要输入且前缀计入保留预算", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "cancelled task"),
+      makeRunFinishedRecord(2, "run-1", "cancelled"),
+      makeUserPromptRecord(3, "run-2", "new task"),
+      makeAssistantRecord(4, "run-2", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(5, "run-2", "c1", "success"),
+      makeAssistantRecord(6, "run-2", [{ id: "c2", name: "read" }]),
+      makeToolResultRecord(7, "run-2", "c2", "success"),
+    ];
+    // 每 Turn 估算 3、Prompt "new task" 2：预算 8 恰好在不计前缀时能保留两个 Turn；
+    // 前缀计入后第一个 Turn 被覆盖，其 Prompt（带前缀）进摘要输入。
+    const selection = expectSelection(
+      planCompaction(records, { keepLatestTurn: true, retainedContextBudget: 8, tokenEstimate: ESTIMATE }),
+    );
+    expect(selection.coveredUpTo).toBe(5);
+    expect(selection.messages.map((m) => m.role)).toEqual([
+      "user",
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+    // 被覆盖的裸取消 Prompt 无标注进摘要输入。
+    expect(selection.messages[0]).toMatchObject({ content: "cancelled task" });
+    expect(selection.messages[1]).toMatchObject({
+      content: PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "new task",
+    });
   });
 });
 

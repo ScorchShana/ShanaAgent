@@ -14,7 +14,7 @@ export type StoredAssistantMessage = Omit<AssistantMessage, "content"> & {
   content: (Exclude<AssistantMessage["content"][number], { type: "toolCall" }> | StoredToolCall)[];
 };
 
-export const SESSION_FORMAT_VERSION = 3;
+export const SESSION_FORMAT_VERSION = 4;
 
 export const SESSION_RECORD_TYPES = [
   "user_prompt",
@@ -157,12 +157,22 @@ export interface CheckpointModelRef {
   modelId: string;
 }
 
+// 生成摘要那次请求自身的实测用量：Cache/Speed 需要跨重启与 /resume 累积，只能靠落盘。
+// durationMs 缺省表示 Provider 未报告耗时，此时只计 token、不计速度（不补零冒充测量）。
+export interface CheckpointUsage {
+  input: number;
+  cacheRead: number;
+  output: number;
+  durationMs?: number;
+}
+
 export interface CheckpointRecord extends RecordBase {
   type: "checkpoint";
   summary: string;
   coveredUpTo: number;
   model: CheckpointModelRef;
   promptVersion?: string;
+  usage?: CheckpointUsage;
 }
 
 export type SessionRecord =
@@ -392,6 +402,25 @@ function parseCheckpointModel(raw: unknown, scope: string): void {
   requireString(raw, "modelId", scope, { allowEmpty: false });
 }
 
+// 摘要请求用量：token 为非负有限数，durationMs 允许小数（实测耗时不做取整）。
+function parseCheckpointUsage(raw: unknown, scope: string): void {
+  if (!isPlainObject(raw)) fail(scope, '"usage" 必须是对象');
+  checkKeys(raw, ["input", "cacheRead", "output", "durationMs"], scope);
+  for (const key of ["input", "cacheRead", "output"] as const) {
+    const value = raw[key];
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+      fail(scope, `"usage.${key}" 必须是非负有限数`);
+    }
+  }
+  const durationMs = raw.durationMs;
+  if (
+    durationMs !== undefined &&
+    (typeof durationMs !== "number" || !Number.isFinite(durationMs) || durationMs < 0)
+  ) {
+    fail(scope, '"usage.durationMs" 必须是非负有限数');
+  }
+}
+
 const COMMON_KEYS = ["recordSeq", "ts", "type", "runId", "version"] as const;
 const TYPE_KEYS: Record<SessionRecordType, readonly string[]> = {
   user_prompt: ["text"],
@@ -400,7 +429,7 @@ const TYPE_KEYS: Record<SessionRecordType, readonly string[]> = {
   tool_result: ["assistantRecordSeq", "toolCallId", "toolName", "status", "content", "priorContent", "images"],
   interruption: ["toolCallId", "reason", "detail"],
   run_finished: ["outcome", "persisted", "error", "elapsedMs"],
-  checkpoint: ["summary", "coveredUpTo", "model", "promptVersion"],
+  checkpoint: ["summary", "coveredUpTo", "model", "promptVersion", "usage"],
 };
 
 export interface ParseRecordOptions {
@@ -488,6 +517,8 @@ export function parseSessionRecord(raw: unknown, options: ParseRecordOptions): S
       }
       parseCheckpointModel(raw.model, scope);
       optionalString(raw, "promptVersion", scope);
+      // usage 记录层可选：仅新 checkpoint 写入，旧/失败请求不补零。
+      if (raw.usage !== undefined) parseCheckpointUsage(raw.usage, scope);
       break;
   }
   return raw as unknown as SessionRecord;

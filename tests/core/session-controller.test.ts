@@ -190,6 +190,21 @@ describe("T10 手动压缩（§14.8 Controller 侧）", () => {
     ]);
   });
 
+  it("focus 透传给 CompactionDriver，未传时为 undefined", async () => {
+    const focuses: Array<string | undefined> = [];
+    const { controller } = makeController(idleDriver, {
+      compactor: {
+        execute: (_signal, focus) => {
+          focuses.push(focus);
+          return Promise.resolve(completedCompaction);
+        },
+      },
+    });
+    await controller.compact("关注认证流程");
+    await controller.compact();
+    expect(focuses).toEqual(["关注认证流程", undefined]);
+  });
+
   it.each(["noop", "cancelled"] as const)("%s：finished 不携带 path/coveredUpTo", async (status) => {
     const outcome: CompactionOutcome = { status, coveredUpTo: null, path: "fallback" };
     const { controller, events } = makeController(idleDriver, {

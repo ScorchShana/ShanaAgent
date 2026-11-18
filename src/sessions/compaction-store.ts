@@ -42,6 +42,8 @@ export interface CompactHistoryOptions {
   signal: AbortSignal;
   retainedContextBudget: number;
   keepLatestTurn: boolean;
+  // 手动 /compact 的用户附加重点：只进本次摘要请求，不落盘、不进 promptVersion。
+  focus?: string;
   modelService: Pick<ModelService, "streamTurn">;
   appendRecord: (input: NewSessionRecord) => Promise<SessionRecord>;
   loadPrompt?: () => Promise<string>;
@@ -93,7 +95,11 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
   ) {
     throw new CompactionError("压缩失败：压缩指令文件无效。");
   }
-  const instruction = promptText.replaceAll(TARGET_TOKENS_PLACEHOLDER, String(summaryTarget));
+  // 先替换占位符再拼 focus，focus 内的 {{TARGET_TOKENS}} 保持字面量；
+  // trimEnd 避免模板自身结尾换行与分隔符叠加出多余空行。
+  const focus = options.focus?.trim() ?? "";
+  const filled = promptText.replaceAll(TARGET_TOKENS_PLACEHOLDER, String(summaryTarget));
+  const instruction = focus ? `${filled.trimEnd()}\n\nAdditional focus:\n${focus}` : filled;
   const promptVersion = createHash("sha256").update(promptText).digest("hex").slice(0, 16);
 
   const contextWindow = model.contextWindow;
@@ -197,6 +203,13 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
     coveredUpTo: selection.coveredUpTo,
     model: { providerId: model.providerId, modelId: model.id },
     promptVersion,
+    // 摘要请求是真实请求，用量必须随 checkpoint 落盘，否则重启/多进程后 Cache/Speed 会漏计。
+    usage: {
+      input: result.usage.input,
+      cacheRead: result.usage.cacheRead,
+      output: result.usage.output,
+      ...(typeof result.message.durationMs === "number" ? { durationMs: result.message.durationMs } : {}),
+    },
   });
   return { status: "completed", coveredUpTo: selection.coveredUpTo, path };
 }

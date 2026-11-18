@@ -90,13 +90,22 @@ describe("ToolExecution view_image 内联图片", () => {
     expect(rows.some((row) => row.includes("[Image: a.png [image/png] 40x30]"))).toBe(true);
   });
 
-  it.each(["failed", "compacted"] as const)("%s 卡片不渲染 image 块，元信息文本照常", (flag) => {
+  it("failed 卡片不渲染 image 块，元信息文本照常", () => {
     setCapabilities({ images: "kitty", trueColor: true, hyperlinks: false });
-    const h = harness(imageItem({ [flag]: true } as Partial<ConversationItem>));
+    const h = harness(imageItem({ failed: true }));
     const rows = h.view.render(80);
     expect(rows.some(isKittyLine)).toBe(false);
     expect(rows.map((row) => stripVTControlCharacters(row)).join("\n")).toContain("(Image attached:");
     expect(privateImage(h.view)).toBeUndefined();
+  });
+
+  it("压缩覆盖的卡片（不再淡化）正常渲染 image 块", () => {
+    setCapabilities({ images: "kitty", trueColor: true, hyperlinks: false });
+    // compacted 标记已删除：压前 view_image 卡即普通成功卡，image 序列完整保留。
+    const h = harness(imageItem());
+    const rows = h.view.render(80);
+    expect(rows.some(isKittyLine)).toBe(true);
+    expect(privateImage(h.view)).toBeDefined();
   });
 
   it("非 success 状态不渲染 image 块", () => {

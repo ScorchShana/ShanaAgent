@@ -15,7 +15,7 @@
 | I2   | 运行中允许草稿、取消、审批及调整后续 Run 思考强度（当前快照不变）；不可提交 Prompt、切换 Session/模型或执行其他普通命令。 |
 | I3   | Run 结束前工具执行/终止与关键日志收尾必须得到明确结果；一个 Run 只产生一次终止事件。                                      |
 | I4   | 工具意图记录成功持久化后才可开始执行；正式完成事件不得早于相应成功持久化。                                                |
-| I5   | Session History 永久保留完整审计（唯一例外：aborted partial 的半截 thinking 在落盘前剥离，经用户授权修订）；LLM Context 含可用的完整 Turn、受控的用户中断 Turn（aborted，显式标注）与未知/缺结果 Turn（显式 unknown 占位 + 询问标注）；用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附对应标注）。 |
+| I5   | Session History 永久保留完整审计（唯一例外：aborted partial 的半截 thinking 在落盘前剥离，经用户授权修订）；LLM Context 含可用的完整 Turn、受控的用户中断 Turn（aborted，显式标注）与未知/缺结果 Turn（显式 unknown 占位 + 询问标注）；用户 Prompt 恒进 Context（零 Turn 失败 Run 附失败标注；零 Turn 取消 Run 不附标注，其下一条 Prompt 渲染期前置中断前缀，不落盘，经用户裁决修订）。 |
 | I6   | 缺结果/未知结果的工具可在构建上下文时合成显式 unknown 占位（仅渲染期、不落盘、绝不写成确定态），使 Turn 受控进入上下文并附"停下询问用户"标注；恢复不自动重放工具；门控不变。 |
 | I7   | 权限以实际 Tool Call 为对象；区内写入、区外只读及 bash 可自动决策；文件工具区外写入必须逐次人工审批（§5）。               |
 | I8   | `/resume` 原子抢独占锁后续写原历史，不复制不新建身份；同一 Session 同时仅一个持锁写者；异常残锁仅人工确认处理。           |
@@ -111,9 +111,9 @@ flowchart TD
 ```
 
 - `workspace-id` = 规范化路径末段 slug + sha256 短哈希，多进程推导一致；是历史组织标识，不是锁。产品名 ShanaAgent，CLI 名 `shana`，数据目录 `~/.shana/`。
-- Session v3：meta 与首条记录均 `version: 3`；未知版本拒载、不迁移、不降级（v2 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
+- Session v4：meta 与首条记录均 `version: 4`；未知版本拒载、不迁移、不降级（v2/v3 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
 - 独占占用锁：原子独占创建抢锁，整个占用期持有；`/resume` 抢锁后**续写原 Session**（不复制、不改身份、前缀不改写），recordSeq 从真实尾部重建；残锁仅人工确认移除，不自动删锁/偷锁；尾部截断可只读展示但拒绝续写。
-- History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附取消/失败标注，纯思考取消剥离后无实质内容即走此路径）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
+- History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 失败 Run 附失败标注；零 Turn 取消 Run 不附标注，纯思考取消剥离后无实质内容即走此路径，其下一条 Prompt 渲染期前置 `[The previous request was interrupted before completion.]` + 换行——前缀是记录的确定性函数、仅渲染期注入不落盘，`user_prompt` 记录恒存用户原文，正式请求/压缩摘要输入/锚定重建同源，经用户裁决修订）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
 - 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。tool_result 可选 `images` 块（仅 view_image 成功携带：恰 1 项，base64 数据 + mimeType + 宽高，记录级严格校验）。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
 - Turn 上下文完整判据（回放/恢复/压缩共用）：响应已结束（stop/toolUse/length/aborted）且可合法回放；工具调用 ID 非空、同轮唯一、名称完整；每个 call 有唯一配对的已提交结果（任意 status，含 unknown）或无结果（崩溃窗口，构建时合成 unknown 占位）；错配/多余结果属协议损坏，判不完整；aborted 仅校验可配对 call（半截 call 剥离后不参与）；参数错误不使 Turn 不完整；截断普通文本不完整；length 例外见 §4。门控仍按记录判定（缺结果/unknown 均列出），不受此判据影响。
 - 关键提交：意图 fsync 后才执行工具；结果 fsync 后才宣布完成；写入 + fsync 是不可被取消中断的临界区；意图提交失败不执行未开始工具；结果提交失败停 Run 不重跑。
@@ -133,8 +133,8 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - 阈值与可行性判定的 token 数优先**usage 锚定**：最近一次可信实测 prompt（`usage.input + cacheRead + cacheWrite`）+ 未测量增量的估算。Run 起点锚定须校验：实测前缀与当前重建上下文逐条一致（忽略 timestamp）、模型身份一致、工具 Schema 未变（经 run_started 的 settings 快照与 `input` 能力快照重建比对，视觉↔文本切换致工具集变化时回退）；usage 缺失/全零占位、换模型、校验不符或压后重建时回退纯估算。压缩内部相对预算（Turn 分解、裁剪阶梯、压后收口）保持纯估算自洽。已知有界残差：System Prompt/environment 不落盘，跨进程版本变更的头部漂移不可校验；旧记录 aborted thinking 读取剥离后，历史实测含当时发送的 thinking，锚定偏高、误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
 - 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；两次压缩间至少一个新 Turn；一次失败后该 Run 不再自动触发。
 - 保留策略：手动 /compact 与 (A) 覆盖全部 eligible Turn 不留尾；(B) 与溢出补救**逐字保留最新 eligible Turn**，保留预算按 Token 计并带 cap。
-- 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。
-- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。
+- 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。手动 `/compact` 可携带用户附加重点（`/compact <重点>`），追加在指令模板末尾的 `Additional focus` 段；focus 只进本次摘要请求，不入库、不写 checkpoint、不参与 `promptVersion`（与压缩指令不落盘同一口径），其 token 计入指令预算。
+- 检查点 = 摘要 + `coveredUpTo(recordSeq)` + 摘要请求自身的实测 `usage`（`input/cacheRead/output/durationMs`，durationMs 缺省表示 Provider 未报告耗时）；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。状态栏的 Cache/Speed 是整段对话的累计口径（全部已计入 Run 的 assistant + 所有 checkpoint 的摘要请求，跨 Run、跨压缩持续累加，**压缩不重置**）：Cache = `ΣcacheRead / (Σinput + ΣcacheRead)`，Speed = `Σoutput / ΣdurationMs`；摘要请求是真实请求，其用量随 checkpoint 落盘，重启 / `/resume` 后累计完整；摘要请求耗时缺省时只计 token、不计速度。Context 不同：以最新 checkpoint 的 `coveredUpTo` 为界切换实测/压后估算（`~` 前缀），checkpoint 损坏时保持实测。
 
 ## 8. 配置与模型管理
 
@@ -182,9 +182,9 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - Diff 两项独立决议：预览/历史回看纯展示层；模型可见结果不含 Diff → §3、§5、§6
 - 六工具固定 + `view_image` 条件启用（model.json `input` 含 `image` 时注册，否则不存在）；write 可覆盖；edit 精确匹配 + replace_all + 多重匹配报数量 → §5、Tool.md
 - UTF-8 ground rule（view_image 为显式二进制只读 carve-out）→ §5
-- 用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附标注）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
+- 用户 Prompt 恒进 Context（零 Turn 失败 Run 附标注；零 Turn 取消 Run 的下一条 Prompt 渲染期前置中断前缀，不落盘，经用户裁决修订）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
 - 意图先于执行、结果先于完成、fsync 临界区不可中断 → I4、§6
-- Session v3 七类记录与判据不由实现擅改（tool_result 可选 images 块，仅成功单图；v2 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
+- Session v4 七类记录与判据不由实现擅改（tool_result 可选 images 块，仅成功单图；checkpoint 可选 usage = 摘要请求实测用量；v2/v3 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
 - Shell 超时混合收尾与知情确认 → §5、§6
 - 溢出不可重试 + 每 Run 一次压缩补救 → §4
 - 压缩 A/B 触发、最新 Turn 保留、主路径/回退裁剪、摘要头部 user 消息 → §7

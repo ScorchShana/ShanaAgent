@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
-import type { StopReason } from "@earendil-works/pi-ai";
+import type { StopReason, Usage } from "@earendil-works/pi-ai";
 import {
   CONTEXT_SAFETY_MARGIN_TOKENS,
   IMAGE_COMPACTION_OMITTED_TEXT,
@@ -110,9 +110,16 @@ function makeContext(records: readonly SessionRecord[]): StoredContext {
 
 function summaryTurn(
   text: string,
-  options: { stopReason?: StopReason; toolCalls?: Array<{ id: string; name: string }> } = {},
+  options: {
+    stopReason?: StopReason;
+    toolCalls?: Array<{ id: string; name: string }>;
+    durationMs?: number;
+    usage?: Partial<Usage>;
+  } = {},
 ): TurnResult {
   const message = makeAssistantMessage(options.toolCalls ?? [], text, { stopReason: options.stopReason });
+  if (options.durationMs !== undefined) message.durationMs = options.durationMs;
+  if (options.usage !== undefined) message.usage = { ...message.usage, ...options.usage };
   return {
     attempts: 1,
     message,
@@ -183,7 +190,50 @@ describe("主路径请求形态", () => {
       coveredUpTo: 5,
       model: { providerId: "p", modelId: "m" },
       promptVersion: createHash("sha256").update(PROMPT).digest("hex").slice(0, 16),
+      // 摘要请求的实测用量；Provider 未报告耗时则不写 durationMs。
+      usage: { input: 1, cacheRead: 0, output: 1 },
     });
+  });
+
+  it("摘要请求的实测用量（含耗时）随 checkpoint 落盘", async () => {
+    const h = harness(
+      {},
+      async () =>
+        summaryTurn("summary text", {
+          durationMs: 1500.5,
+          usage: { input: 1200, cacheRead: 800, output: 300 },
+        }),
+    );
+    await compactHistory(h.options);
+    expect(h.appended[0]).toMatchObject({
+      type: "checkpoint",
+      usage: { input: 1200, cacheRead: 800, output: 300, durationMs: 1500.5 },
+    });
+  });
+
+  it("focus 追加在指令末尾，promptVersion 仍只对应模板且不入库", async () => {
+    const h = harness({ focus: "关注认证流程" });
+    await compactHistory(h.options);
+    const last = h.requests[0]!.context.messages.at(-1)!;
+    expect(last.role).toBe("user");
+    expect(last.content).toBe("Summarize the conversation in 4096 tokens.\n\nAdditional focus:\n关注认证流程");
+    expect(h.appended[0]).toEqual({
+      type: "checkpoint",
+      summary: "summary text",
+      coveredUpTo: 5,
+      model: { providerId: "p", modelId: "m" },
+      promptVersion: createHash("sha256").update(PROMPT).digest("hex").slice(0, 16),
+      // 摘要请求的实测用量；Provider 未报告耗时则不写 durationMs。
+      usage: { input: 1, cacheRead: 0, output: 1 },
+    });
+  });
+
+  it("空白 focus 等同无 focus", async () => {
+    const h = harness({ focus: "  \n " });
+    await compactHistory(h.options);
+    expect(h.requests[0]!.context.messages.at(-1)!.content).toBe(
+      "Summarize the conversation in 4096 tokens.",
+    );
   });
 
   it("已有 Checkpoint 时旧摘要作为头部 user 消息原样保留，不重复注入", async () => {
@@ -270,7 +320,7 @@ describe("摘要校验", () => {
   });
 
   it("默认加载器读取 prompts/compaction.md 并填充目标大小", async () => {
-    const h = harness({ loadPrompt: undefined });
+    const h = harness({ loadPrompt: undefined, focus: "关注认证流程" });
     const outcome = await compactHistory(h.options);
     expect(outcome.status).toBe("completed");
     const last = h.requests[0]!.context.messages.at(-1)!;
@@ -278,6 +328,9 @@ describe("摘要校验", () => {
     expect(last.content).toContain("4096");
     expect(last.content).toContain("## Goal");
     expect(last.content).not.toContain("{{TARGET_TOKENS}}");
+    // 模板自身结尾换行被 trimEnd，focus 段前恰一个空行。
+    expect(last.content).toContain("\n\nAdditional focus:\n关注认证流程");
+    expect(last.content).not.toContain("\n\n\nAdditional focus:\n");
   });
 });
 
@@ -490,6 +543,24 @@ describe("预算与回退路径", () => {
     ]);
     expect(messages[5]!.content).toBe("Summarize the conversation in 4096 tokens.");
     expect((records[2] as ToolResultRecord).content).toHaveLength(100000);
+  });
+
+  it("回退路径同样携带 focus，tools 仍为空", async () => {
+    const records = makeRecords();
+    (records[2] as ToolResultRecord).content = "x".repeat(100000);
+    const h = harness({
+      records,
+      context: makeContext(records),
+      model: makeModel({ contextWindow: fallbackWindow(records) }),
+      focus: "关注认证流程",
+    });
+    const outcome = await compactHistory(h.options);
+    expect(outcome).toMatchObject({ status: "completed", path: "fallback" });
+    const request = h.requests[0]!;
+    expect(request.context.tools).toEqual([]);
+    expect(request.context.messages.at(-1)!.content).toBe(
+      "Summarize the conversation in 4096 tokens.\n\nAdditional focus:\n关注认证流程",
+    );
   });
 
   it("回退请求中 previousSummary 作为头部 user 消息只出现一次，且不进入 System Prompt", async () => {
