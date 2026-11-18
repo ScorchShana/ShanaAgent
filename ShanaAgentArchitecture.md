@@ -133,8 +133,8 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - 阈值与可行性判定的 token 数优先**usage 锚定**：最近一次可信实测 prompt（`usage.input + cacheRead + cacheWrite`）+ 未测量增量的估算。Run 起点锚定须校验：实测前缀与当前重建上下文逐条一致（忽略 timestamp）、模型身份一致、工具 Schema 未变（经 run_started 的 settings 快照与 `input` 能力快照重建比对，视觉↔文本切换致工具集变化时回退）；usage 缺失/全零占位、换模型、校验不符或压后重建时回退纯估算。压缩内部相对预算（Turn 分解、裁剪阶梯、压后收口）保持纯估算自洽。已知有界残差：System Prompt/environment 不落盘，跨进程版本变更的头部漂移不可校验；旧记录 aborted thinking 读取剥离后，历史实测含当时发送的 thinking，锚定偏高、误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
 - 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；两次压缩间至少一个新 Turn；一次失败后该 Run 不再自动触发。
 - 保留策略：手动 /compact 与 (A) 覆盖全部 eligible Turn 不留尾；(B) 与溢出补救**逐字保留最新 eligible Turn**，保留预算按 Token 计并带 cap。
-- 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。
-- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。
+- 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。手动 `/compact` 可携带用户附加重点（`/compact <重点>`），追加在指令模板末尾的 `Additional focus` 段；focus 只进本次摘要请求，不入库、不写 checkpoint、不参与 `promptVersion`（与压缩指令不落盘同一口径），其 token 计入指令预算。
+- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。状态栏的 Cache/Speed 与 Context 同以最新 checkpoint 的 `coveredUpTo` 为界：只统计压后实测，压后尚无实测时显示 `0.0%` / `—`，下一条 assistant 落盘自动恢复；checkpoint 损坏时回退全量聚合。
 
 ## 8. 配置与模型管理
 

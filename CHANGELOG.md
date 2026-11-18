@@ -2,6 +2,9 @@
 
 ## 未发布
 
+- **变更**：TUI 斜杠命令菜单 Enter 由"补全并立即执行"改为"仅补全"（与 Tab/鼠标点击一致）；命令需第二次 Enter 才执行，选中项先填入输入区供确认或追加参数。
+- **新增**：`/compact [重点]`，重点追加到压缩指令末尾的 `Additional focus` 段，仅本次摘要请求可见、不入库、不参与 `promptVersion`。
+- **变更**：压缩完成后状态栏 Cache/Speed 切换到压后实测口径（以最新 checkpoint 的 `coveredUpTo` 为界），压后无实测时显示 `Cache: 0.0%` / `Speed: —`，与 Context 的 `~` 估算同一触发点；checkpoint 损坏时回退全量聚合。
 - **破坏性变更**：Session 格式升级 v2 → v3（meta 与首条记录均 `version: 3`）。v2 Session 不再可读（文件保留不删除，列表跳过），不迁移、不降级。**勿混跑新旧版本**：旧版二进制无法读取 v3 Session（列表会被 v3 meta 阻断）。
 - 新增：第七工具 `view_image`（条件启用）——仅当前模型 `input` 含 `image` 时注册；只读查看 png/jpg/jpeg/webp（扩展名白名单 + magic 校验，mimeType 以内容为准），大小上限 `viewImageMaxBytes`（默认 5 MiB）；仅成功携带单图（base64 + 宽高），权限同 read。非视觉模型回放含图历史时渲染期替换为显式占位文本，记录永久保留、切回视觉模型可逆。
 - 新增：TUI 内联图片——view_image 成功卡片在 kitty 协议终端 + PNG 显示真图（最高 14 行），其余终端/格式显示文本回退行；压缩覆盖/失败卡片不渲染图像。jpeg/webp → PNG 转码为后续项。
