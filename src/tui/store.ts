@@ -774,7 +774,8 @@ export class TuiStore {
     const records = this.state.history?.records ?? [];
     const plan = planEffectiveContext(records);
     const failed = new Set(plan.runs.flatMap((r) => r.excludedTurns.map((t) => t.assistant.recordSeq)));
-    // The in-flight turn has no result yet; planEffectiveContext excludes it until the tool finishes.
+    // 在途 Turn（执行中/等待审批）尚无结果，与崩溃窗口在记录层同形；planEffectiveContext
+    // 会把它判为缺结果 unknown，展示层按 pendingSeq 豁免合成标记，Run 收尾后自动恢复崩溃窗口语义。
     if (pendingSeq !== undefined) failed.delete(pendingSeq);
     // 零 Turn 的取消/失败 Run：Prompt 恒进上下文，展示同构地附对应标注。
     const cancelledPrompts = new Set(
@@ -940,7 +941,9 @@ export class TuiStore {
           call,
           result,
           failed: failed.has(record.recordSeq),
-          syntheticUnknown: eligible?.missingCalls.some((missing) => missing.toolCallId === call.id) ?? false,
+          syntheticUnknown:
+            record.recordSeq !== pendingSeq &&
+            (eligible?.missingCalls.some((missing) => missing.toolCallId === call.id) ?? false),
           compacted: compacted(record.recordSeq),
           activity: execution && !execution.completed ? "running" : "queued",
           liveOutput: execution && !execution.completed ? execution.liveOutput : undefined,
@@ -957,7 +960,7 @@ export class TuiStore {
           text: INTERRUPTED_RESPONSE_ANNOTATION,
           compacted: compacted(record.recordSeq),
         });
-      if (eligible?.hasUnknown)
+      if (eligible?.hasUnknown && record.recordSeq !== pendingSeq)
         items.push({
           id: `unknown-${record.recordSeq}`,
           runId: record.runId,

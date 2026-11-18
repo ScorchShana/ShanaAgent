@@ -1163,6 +1163,57 @@ it("shows unknown annotations and synthetic placeholders isomorphic to the model
   }
 });
 
+it("does not mark the in-flight turn as synthetic unknown while the Run is running", async () => {
+  let finish!: (value: { outcome: "completed" }) => void;
+  let runId = "";
+  const core = controller(async (handle) => {
+    runId = handle.runId;
+    return new Promise((resolve) => {
+      finish = resolve;
+    });
+  });
+  // 在途 Turn：assistant 已落盘、bash call 等待审批/执行，盘上无 tool_result——与崩溃窗口同形。
+  vi.spyOn(core, "readHistory").mockImplementation(async () => ({
+    meta: { version: 2, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    records: [
+      { type: "user_prompt", recordSeq: 1, ts: "now", runId, text: "task" },
+      {
+        type: "assistant_message",
+        recordSeq: 2,
+        ts: "now",
+        runId,
+        message: makeAssistantMessage([{ id: "u", name: "bash", arguments: { command: "x" } }], "", {
+          stopReason: "toolUse",
+        }),
+      },
+    ],
+    warnings: [],
+    fromRecordSeq: 1,
+  }));
+  const store = new TuiStore(core, parseSettings({}));
+  store.setDraft("task");
+  const run = store.submit();
+  try {
+    await vi.waitFor(() => expect(store.getSnapshot().core.status.kind).toBe("running"));
+    await vi.waitFor(() => expect(runId).not.toBe(""));
+    await store.refreshHistory();
+    const items = store.items();
+    expect(items.find((item) => item.id === "tool-2-u")).toMatchObject({ syntheticUnknown: false });
+    expect(items.some((item) => item.text === UNKNOWN_RESULT_ANNOTATION)).toBe(false);
+    finish({ outcome: "completed" });
+    await run;
+    await vi.waitFor(() => expect(store.getSnapshot().core.status.kind).toBe("idle"));
+    // Run 收尾后同一记录形态恢复崩溃窗口语义：合成占位 + unknown 标注。
+    const after = store.items();
+    expect(after.find((item) => item.id === "tool-2-u")).toMatchObject({ syntheticUnknown: true });
+    expect(after.some((item) => item.text === UNKNOWN_RESULT_ANNOTATION)).toBe(true);
+  } finally {
+    finish?.({ outcome: "completed" });
+    await run;
+    await store.dispose();
+  }
+});
+
 it("dims tool cards of excluded turns (G2)", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
