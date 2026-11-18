@@ -1244,7 +1244,7 @@ it("dims tool cards of excluded turns (G2)", async () => {
   }
 });
 
-it("dims records covered by the checkpoint summary and keeps the tail verbatim (G3/G9)", async () => {
+it("keeps records covered by the checkpoint summary verbatim without dimming (G3/G9)", async () => {
   const { records, core } = compactionFixture(async () => ({
     status: "noop",
     coveredUpTo: null,
@@ -1264,12 +1264,19 @@ it("dims records covered by the checkpoint summary and keeps the tail verbatim (
   const store = await loadedStore(core);
   try {
     const items = store.items();
-    expect(items.find((item) => item.id === "prompt-1")).toMatchObject({ compacted: true });
-    expect(items.find((item) => item.id === "assistant-2")).toMatchObject({ compacted: true });
+    // 压前记录不淡化、原文保留：compacted 标记已删除，压前/尾部同构。
+    const coveredPrompt = items.find((item) => item.id === "prompt-1");
+    const coveredAssistant = items.find((item) => item.id === "assistant-2");
+    expect(coveredPrompt).toMatchObject({ text: "old task" });
+    expect(coveredAssistant).toMatchObject({ text: "covered answer" });
+    for (const item of [coveredPrompt!, coveredAssistant!]) {
+      expect("compacted" in item).toBe(false);
+      expect(item.failed).toBeFalsy();
+    }
     const separator = items.find((item) => item.role === "compaction");
-    expect(separator).toMatchObject({ id: "compaction-3", text: "以上历史已由摘要替代", summary: "SUMMARY" });
-    expect(items.find((item) => item.id === "prompt-4")?.compacted).toBeFalsy();
-    expect(items.find((item) => item.id === "assistant-5")?.compacted).toBeFalsy();
+    expect(separator).toMatchObject({ id: "compaction-3", text: "compacted", summary: "SUMMARY" });
+    expect(items.find((item) => item.id === "prompt-4")).toMatchObject({ text: "new task" });
+    expect(items.find((item) => item.id === "assistant-5")).toMatchObject({ text: "retained answer" });
     // 摘要默认折叠，点击分隔线展开/再折叠（复用 expanded 机制）。
     expect(store.getSnapshot().expanded.has("compaction-3")).toBe(false);
     store.toggle("compaction-3");
@@ -1402,7 +1409,7 @@ it("enables /compact when idle and derives the separator after the covered block
     const items = store.items();
     const separators = items.filter((item) => item.role === "compaction");
     expect(separators).toHaveLength(1);
-    expect(separators[0]).toMatchObject({ id: "compaction-3", text: "以上历史已由摘要替代" });
+    expect(separators[0]).toMatchObject({ id: "compaction-3", text: "compacted" });
     expect(separators[0]?.summary).toBeTruthy();
     expect(items[items.indexOf(separators[0]!) - 1]).toMatchObject({ id: "assistant-2" });
     expect(items.some((item) => item.id === "prompt-1")).toBe(true);
@@ -1657,7 +1664,7 @@ it("shows a live compacting separator and replaces it with the checkpoint-derive
     finish({ status: "completed", coveredUpTo: 2, path: "primary" });
     await pending;
     await vi.waitFor(() =>
-      expect(store.items().some((item) => item.text === "以上历史已由摘要替代")).toBe(true),
+      expect(store.items().some((item) => item.text === "compacted")).toBe(true),
     );
     expect(store.items().some((item) => item.text === "compacting")).toBe(false);
     expect(store.items().filter((item) => item.role === "compaction")).toHaveLength(1);

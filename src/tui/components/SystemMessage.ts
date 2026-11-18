@@ -1,4 +1,3 @@
-import { stripVTControlCharacters } from "node:util";
 import { Text, type Component, type TuiMouseEvent } from "../framework/index.js";
 import { graphemes, cellWidth, sanitizeDisplayText, type ConversationItem, type TuiStore } from "../store.js";
 import { theme } from "../theme.js";
@@ -19,8 +18,7 @@ export class SystemMessage implements Component {
     const text = sanitizeDisplayText(item.text);
     const styled =
       item.role === "duration" ? theme.dim(text) : item.role === "failure" ? theme.error(text) : text;
-    // 被摘要替代的记录统一淡化，保留审计可见性但明示不再是上下文原文。
-    this.text.setText(item.compacted ? theme.muted(stripVTControlCharacters(styled)) : styled);
+    this.text.setText(styled);
   }
   render(width: number) {
     if (this.item.role !== "compaction") return this.text.render(width);
@@ -36,9 +34,9 @@ export class SystemMessage implements Component {
             .flatMap((line) => wrapDisplay(line, width))
             .map((line) => theme.muted(line)),
         );
-        lines.push(theme.muted("点击折叠摘要"));
+        lines.push(theme.muted("Click to collapse the chat summary"));
       } else {
-        lines.push(theme.muted("点击展开摘要（模型上下文中的版本）"));
+        lines.push(theme.muted("Click to expand the chat summary"));
       }
     }
     return lines;

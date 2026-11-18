@@ -178,6 +178,35 @@ it("renders compaction as the full-width separator", () => {
   );
 });
 
+it("renders covered history with normal colors instead of compaction dimming", () => {
+  // compacted 标记已删除：压前记录与尾部同构，不再整段 muted。
+  const user = message({ id: "u", role: "user", text: "old task" });
+  const userRaw = user.view.render(80).join("\n");
+  expect(userRaw).toContain(theme.user("old task"));
+  expect(userRaw).not.toContain(theme.muted("old task"));
+  const assistant = message({ id: "a", role: "assistant", text: "covered answer" });
+  const assistantRaw = assistant.view.render(80).join("\n");
+  expect(assistant.frame()).toContain("covered answer");
+  expect(assistantRaw).not.toContain(theme.muted("covered answer"));
+  const notice = message({ id: "n", role: "notice", text: "covered notice" });
+  const noticeRaw = notice.view.render(80).join("\n");
+  expect(noticeRaw).toContain("covered notice");
+  expect(noticeRaw).not.toContain(theme.muted("covered notice"));
+});
+
+it("shows English expand/collapse hints around the muted summary body", () => {
+  const item: ConversationItem = { id: "c", role: "compaction", text: "compacted", summary: "SUM" };
+  const h = message(item);
+  const collapsed = h.view.render(80);
+  expect(collapsed).toContain(theme.muted("Click to expand the chat summary"));
+  expect(collapsed.join("\n")).not.toContain("SUM");
+  h.expanded.add("c");
+  const expanded = h.view.render(80);
+  expect(expanded).toContain(theme.muted("<conversation_summary>"));
+  expect(expanded).toContain(theme.muted("SUM"));
+  expect(expanded).toContain(theme.muted("Click to collapse the chat summary"));
+});
+
 it("finishes streaming with an exact parse when text does not change", () => {
   const item: ConversationItem = {
     id: "a",

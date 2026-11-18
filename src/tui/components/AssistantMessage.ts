@@ -64,11 +64,7 @@ export class AssistantMessage implements Component {
           return [
             ...(rows.length && this.item.thinking ? [""] : []),
             ...rows.map((row) =>
-              this.item.failed
-                ? theme.failed(stripVTControlCharacters(row))
-                : this.item.compacted
-                  ? theme.muted(stripVTControlCharacters(row))
-                  : row,
+              this.item.failed ? theme.failed(stripVTControlCharacters(row)) : row,
             ),
             ...(this.item.failed ? new Text(theme.error("[failed]"), 0, 0).render(width) : []),
             ...(this.item.cancelled ? new Text(theme.muted("[cancelled]"), 0, 0).render(width) : []),

@@ -167,8 +167,8 @@ export class ToolExecution implements Component {
   }
   render(width: number) {
     const rows = this.tree.render(width);
-    // 被排除/被摘要替代的卡片整体淡化：保留审计可见性，明示不再是上下文原文。
-    if (this.item.failed || this.item.compacted)
+    // 被排除的卡片整体淡化：保留审计可见性，明示不再是上下文原文。
+    if (this.item.failed)
       return rows.map((row) => theme.muted(stripVTControlCharacters(row)));
     return rows;
   }
@@ -288,13 +288,12 @@ export class ToolExecution implements Component {
         : []),
     ];
     const img = this.item.result.images?.[0];
-    // failed/compacted 卡片不渲染 image：render() 的 dim 会 stripVT 撕掉 kitty 序列。
+    // failed 卡片不渲染 image：render() 的 dim 会 stripVT 撕掉 kitty 序列。
     if (
       this.item.call?.name === "view_image" &&
       this.item.result.status === "success" &&
       img &&
-      !this.item.failed &&
-      !this.item.compacted
+      !this.item.failed
     ) {
       const args = this.item.call.parse.status === "parsed" ? this.item.call.parse.arguments : undefined;
       this.image ??= new Image(

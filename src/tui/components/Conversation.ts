@@ -54,9 +54,9 @@ export class MessageView implements Component {
         .render(inner)
         .map((row) => " ".repeat(this.padding) + row + " ".repeat(this.padding));
     if (this.item.role === "assistant" || this.item.role === "attempt") return rows;
-    // 被排除/被摘要替代的卡片用中性背景；合成 unknown 占位与真实 unknown 结果同色。
+    // 被排除的卡片用中性背景；合成 unknown 占位与真实 unknown 结果同色。
     const status =
-      this.item.compacted || this.item.failed
+      this.item.failed
         ? "queued"
         : this.item.syntheticUnknown
           ? "unknown"
