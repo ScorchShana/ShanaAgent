@@ -15,7 +15,7 @@
 | I2   | 运行中允许草稿、取消、审批及调整后续 Run 思考强度（当前快照不变）；不可提交 Prompt、切换 Session/模型或执行其他普通命令。 |
 | I3   | Run 结束前工具执行/终止与关键日志收尾必须得到明确结果；一个 Run 只产生一次终止事件。                                      |
 | I4   | 工具意图记录成功持久化后才可开始执行；正式完成事件不得早于相应成功持久化。                                                |
-| I5   | Session History 永久保留完整审计（唯一例外：aborted partial 的半截 thinking 在落盘前剥离，经用户授权修订）；LLM Context 含可用的完整 Turn、受控的用户中断 Turn（aborted，显式标注）与未知/缺结果 Turn（显式 unknown 占位 + 询问标注）；用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附对应标注）。 |
+| I5   | Session History 永久保留完整审计（唯一例外：aborted partial 的半截 thinking 在落盘前剥离，经用户授权修订）；LLM Context 含可用的完整 Turn、受控的用户中断 Turn（aborted，显式标注）与未知/缺结果 Turn（显式 unknown 占位 + 询问标注）；用户 Prompt 恒进 Context（零 Turn 失败 Run 附失败标注；零 Turn 取消 Run 不附标注，其下一条 Prompt 渲染期前置中断前缀，不落盘，经用户裁决修订）。 |
 | I6   | 缺结果/未知结果的工具可在构建上下文时合成显式 unknown 占位（仅渲染期、不落盘、绝不写成确定态），使 Turn 受控进入上下文并附"停下询问用户"标注；恢复不自动重放工具；门控不变。 |
 | I7   | 权限以实际 Tool Call 为对象；区内写入、区外只读及 bash 可自动决策；文件工具区外写入必须逐次人工审批（§5）。               |
 | I8   | `/resume` 原子抢独占锁后续写原历史，不复制不新建身份；同一 Session 同时仅一个持锁写者；异常残锁仅人工确认处理。           |
@@ -113,7 +113,7 @@ flowchart TD
 - `workspace-id` = 规范化路径末段 slug + sha256 短哈希，多进程推导一致；是历史组织标识，不是锁。产品名 ShanaAgent，CLI 名 `shana`，数据目录 `~/.shana/`。
 - Session v4：meta 与首条记录均 `version: 4`；未知版本拒载、不迁移、不降级（v2/v3 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
 - 独占占用锁：原子独占创建抢锁，整个占用期持有；`/resume` 抢锁后**续写原 Session**（不复制、不改身份、前缀不改写），recordSeq 从真实尾部重建；残锁仅人工确认移除，不自动删锁/偷锁；尾部截断可只读展示但拒绝续写。
-- History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附取消/失败标注，纯思考取消剥离后无实质内容即走此路径）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
+- History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 失败 Run 附失败标注；零 Turn 取消 Run 不附标注，纯思考取消剥离后无实质内容即走此路径，其下一条 Prompt 渲染期前置 `[The previous request was interrupted before completion.]` + 换行——前缀是记录的确定性函数、仅渲染期注入不落盘，`user_prompt` 记录恒存用户原文，正式请求/压缩摘要输入/锚定重建同源，经用户裁决修订）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
 - 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。tool_result 可选 `images` 块（仅 view_image 成功携带：恰 1 项，base64 数据 + mimeType + 宽高，记录级严格校验）。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
 - Turn 上下文完整判据（回放/恢复/压缩共用）：响应已结束（stop/toolUse/length/aborted）且可合法回放；工具调用 ID 非空、同轮唯一、名称完整；每个 call 有唯一配对的已提交结果（任意 status，含 unknown）或无结果（崩溃窗口，构建时合成 unknown 占位）；错配/多余结果属协议损坏，判不完整；aborted 仅校验可配对 call（半截 call 剥离后不参与）；参数错误不使 Turn 不完整；截断普通文本不完整；length 例外见 §4。门控仍按记录判定（缺结果/unknown 均列出），不受此判据影响。
 - 关键提交：意图 fsync 后才执行工具；结果 fsync 后才宣布完成；写入 + fsync 是不可被取消中断的临界区；意图提交失败不执行未开始工具；结果提交失败停 Run 不重跑。
@@ -182,7 +182,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - Diff 两项独立决议：预览/历史回看纯展示层；模型可见结果不含 Diff → §3、§5、§6
 - 六工具固定 + `view_image` 条件启用（model.json `input` 含 `image` 时注册，否则不存在）；write 可覆盖；edit 精确匹配 + replace_all + 多重匹配报数量 → §5、Tool.md
 - UTF-8 ground rule（view_image 为显式二进制只读 carve-out）→ §5
-- 用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附标注）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
+- 用户 Prompt 恒进 Context（零 Turn 失败 Run 附标注；零 Turn 取消 Run 的下一条 Prompt 渲染期前置中断前缀，不落盘，经用户裁决修订）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
 - 意图先于执行、结果先于完成、fsync 临界区不可中断 → I4、§6
 - Session v4 七类记录与判据不由实现擅改（tool_result 可选 images 块，仅成功单图；checkpoint 可选 usage = 摘要请求实测用量；v2/v3 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
 - Shell 超时混合收尾与知情确认 → §5、§6
