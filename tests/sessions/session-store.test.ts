@@ -68,6 +68,7 @@ describe("V1 记录追加与读回", () => {
         coveredUpTo: 3,
         model: { providerId: "deepseek", modelId: "deepseek-flash" },
         promptVersion: "compaction-v1",
+        usage: { input: 1200, cacheRead: 800, output: 300, durationMs: 4321.5 },
       }),
       await store.appendRecord(ref, {
         type: "run_finished",
@@ -300,7 +301,7 @@ describe("V2 版本门", () => {
     await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
 
     const metaPath = metaPathOf(store.sessionsDir, ref);
-    const tampered = fs.readFileSync(metaPath, "utf8").replace('"version":3', '"version":99');
+    const tampered = fs.readFileSync(metaPath, "utf8").replace('"version":4', '"version":99');
     fs.writeFileSync(metaPath, tampered);
 
     const error = await store.loadSession(ref).catch((caught: unknown) => caught);
@@ -316,7 +317,7 @@ describe("V2 版本门", () => {
     await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
 
     const messagesPath = messagesPathOf(store.sessionsDir, ref);
-    const tampered = fs.readFileSync(messagesPath, "utf8").replace('"version":3', '"version":99');
+    const tampered = fs.readFileSync(messagesPath, "utf8").replace('"version":4', '"version":99');
     fs.writeFileSync(messagesPath, tampered);
 
     const error = await store.loadSession(ref).catch((caught: unknown) => caught);
@@ -394,19 +395,19 @@ describe("V11 查询接口", () => {
     const otherMetaPath = metaPathOf(store.sessionsDir, otherRef);
     fs.writeFileSync(
       otherMetaPath,
-      fs.readFileSync(otherMetaPath, "utf8").replace('"version":3', '"version":99'),
+      fs.readFileSync(otherMetaPath, "utf8").replace('"version":4', '"version":99'),
     );
 
     const listed = await store.listSessions(WORKSPACE_ID);
     expect(listed.map((meta) => meta.sessionId)).toEqual(["s2", "s1"]);
     expect(listed.every((meta) => meta.workspaceId === WORKSPACE_ID)).toBe(true);
 
-    // 不支持版本的 Session 跳过而非抛穿整个列表（v3 硬切后目录里可能残留 v2）。
+    // 不支持版本的 Session 跳过而非抛穿整个列表（v4 硬切后目录里可能残留 v2/v3）。
     expect(await store.listSessions(otherWorkspace)).toEqual([]);
     expect(await store.listSessions("nonexistent-workspace-0000")).toEqual([]);
   });
 
-  it("混版目录只列 v3；v2 Session 拒载但文件保留", async () => {
+  it("混版目录只列 v4；v3 Session 拒载但文件保留", async () => {
     const { store } = makeStore();
     await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: "new" });
     const oldRef = sessionRef("old");
@@ -414,15 +415,15 @@ describe("V11 查询接口", () => {
     await store.appendRecord(oldRef, { type: "user_prompt", runId: "r", text: "legacy" });
     const oldMetaPath = metaPathOf(store.sessionsDir, oldRef);
     const oldMessagesPath = messagesPathOf(store.sessionsDir, oldRef);
-    const oldMeta = fs.readFileSync(oldMetaPath, "utf8").replace('"version":3', '"version":2');
-    const oldMessages = fs.readFileSync(oldMessagesPath, "utf8").replace('"version":3', '"version":2');
+    const oldMeta = fs.readFileSync(oldMetaPath, "utf8").replace('"version":4', '"version":3');
+    const oldMessages = fs.readFileSync(oldMessagesPath, "utf8").replace('"version":4', '"version":3');
     fs.writeFileSync(oldMetaPath, oldMeta);
     fs.writeFileSync(oldMessagesPath, oldMessages);
 
     expect((await store.listSessions(WORKSPACE_ID)).map((meta) => meta.sessionId)).toEqual(["new"]);
     const error = await store.loadSession(oldRef).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(SessionVersionError);
-    expect((error as SessionVersionError).foundVersion).toBe(2);
+    expect((error as SessionVersionError).foundVersion).toBe(3);
     expect(fs.readFileSync(oldMetaPath, "utf8")).toBe(oldMeta);
     expect(fs.readFileSync(oldMessagesPath, "utf8")).toBe(oldMessages);
   });
