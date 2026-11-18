@@ -1,7 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, expect, it } from "vitest";
-import { Type } from "@earendil-works/pi-ai";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import { ModelService } from "../../src/llm/model-service.js";
 import { createConfiguredModels } from "../../src/llm/provider-adapter.js";
@@ -71,7 +70,12 @@ it.skipIf(process.env.SHANA_REAL_SESSION_V2 !== "1")(
           {
             name: "read",
             description: "Read a UTF-8 file.",
-            parameters: Type.Object({ path: Type.String() }),
+            parameters: {
+              type: "object",
+              properties: { path: { type: "string" } },
+              required: ["path"],
+              additionalProperties: false,
+            },
           },
         ];
         const requests: unknown[] = [];

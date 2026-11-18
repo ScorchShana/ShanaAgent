@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { Type, validateToolCall } from "@earendil-works/pi-ai";
+import { validateToolCall } from "@earendil-works/pi-ai";
 import { DEFAULT_EDIT_MAX_FILE_BYTES, parseSettings } from "../../src/llm/settings-store.js";
 import { createToolRegistry, TOOL_NAMES } from "../../src/tools/registry.js";
 
@@ -12,7 +12,7 @@ const PROMPTS_DIR = path.join(HERE, "..", "..", "prompts", "tools");
 const registry = createToolRegistry("linux", parseSettings(undefined));
 const tools = registry
   .list()
-  .map((tool) => ({ name: tool.name, description: tool.description, parameters: Type.Unsafe(tool.parameters) }));
+  .map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
 
 function renderedPrompt(name: string): string {
   const raw = fs.readFileSync(path.join(PROMPTS_DIR, `${name}.md`), "utf8");
@@ -77,7 +77,7 @@ describe("V4 六工具定义与确认稿一致", () => {
   });
 });
 
-describe("V4 TypeBox schema 被 pi-ai validateToolCall 接受", () => {
+describe("V4 工具 Schema 被 pi-ai validateToolCall 接受", () => {
   it.each(TOOL_NAMES.map((name) => [name]))("%s 合法调用通过校验", (name) => {
     const validated = validateToolCall(tools, toolCall(name, VALID_ARGS[name]!));
     expect(typeof validated).toBe("object");

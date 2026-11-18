@@ -9,7 +9,6 @@ import {
 } from "../../src/core/context-builder.js";
 import type { BusEvent } from "../../src/core/events.js";
 import { createToolRegistry } from "../../src/tools/registry.js";
-import { Type } from "@earendil-works/pi-ai";
 import { createDiagnostics } from "../../src/diagnostics.js";
 import fs from "node:fs";
 import path from "node:path";
@@ -577,7 +576,7 @@ it("exposes the fixed-overhead baseline before the first Run", async () => {
         .map((tool) => ({
           name: tool.name,
           description: tool.description,
-          parameters: Type.Unsafe(tool.parameters),
+          parameters: tool.parameters,
         })),
     },
     settings.tokenEstimate,
@@ -1323,7 +1322,7 @@ async function autoFixedTokens(workspaceRoot: string, settings: Settings): Promi
     .map((tool) => ({
       name: tool.name,
       description: tool.description,
-      parameters: Type.Unsafe(tool.parameters),
+      parameters: tool.parameters,
     }));
   return estimateContextTokens({ ...built.context, tools }, settings.tokenEstimate);
 }

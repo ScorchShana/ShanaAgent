@@ -5,7 +5,7 @@ import type { AutoDecisionStatus } from "./state.js";
 import type { Diagnostics } from "../diagnostics.js";
 import type { PendingShellCleanup } from "../tools/shell.js";
 import { randomUUID } from "node:crypto";
-import { Type, type JsonObject } from "@earendil-works/pi-ai";
+import type { JsonObject } from "@earendil-works/pi-ai";
 import {
   loadModelConfig,
   writeCurrentModel,
@@ -88,7 +88,7 @@ function toolDefinitions(platform: NodeJS.Platform | undefined, settings: Settin
     .map((tool) => ({
       name: tool.name,
       description: tool.description,
-      parameters: Type.Unsafe(tool.parameters),
+      parameters: tool.parameters,
     }));
 }
 
@@ -635,7 +635,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       built.context.tools = executor.registry.list().map((tool) => ({
         name: tool.name,
         description: tool.description,
-        parameters: Type.Unsafe(tool.parameters),
+        parameters: tool.parameters,
       }));
       contextTokens = estimateContextTokens(built.context, runSettings.tokenEstimate);
       // 估算对代码/JSON 系统性偏低会让阈值触发漂移；有可信实测时以其锚定历史大头。

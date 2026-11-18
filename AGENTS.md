@@ -4,7 +4,7 @@
 
 ## 1. 项目简介
 
-ShanaAgent 是单 Agent、仅 TUI 的本地编码代理：TypeScript · Node.js >=22.19.0 · 内置 shana-tui · `@earendil-works/pi-ai`（固定 1.4.0），主要面向 DeepSeek Flash / Qwen Flash。单进程单活动 Run，多进程可共用工作区，首发 Windows 与 Linux/WSL。
+ShanaAgent 是单 Agent、仅 TUI 的本地编码代理：TypeScript · Node.js >=22.19.0 · 内置 shana-tui · `@earendil-works/pi-ai`（固定 1.5.2），主要面向 DeepSeek Flash / Qwen Flash。单进程单活动 Run，多进程可共用工作区，首发 Windows 与 Linux/WSL。
 
 - `PROGRESS.md` — 当前状态与未验证项索引，每轮会话首选入口（本地保留，不入库）。
 - `Optmization.md` — 待优化事项清单（本地保留，不入库）。

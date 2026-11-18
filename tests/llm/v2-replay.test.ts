@@ -1,6 +1,5 @@
 import { createToolRegistry } from "../../src/tools/registry.js";
 import { afterEach, describe, expect, it } from "vitest";
-import { Type } from "@earendil-works/pi-ai";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import { ModelService } from "../../src/llm/model-service.js";
 import { createConfiguredModels } from "../../src/llm/provider-adapter.js";
@@ -91,7 +90,7 @@ describe("SDK v2 replay", () => {
       .map((tool) => ({
         name: tool.name,
         description: tool.description,
-        parameters: Type.Unsafe(tool.parameters),
+        parameters: tool.parameters,
       }));
     const target = { ...model, providerId: "p2", id: "m2" };
     let payload: Record<string, unknown> = {};
