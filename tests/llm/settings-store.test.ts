@@ -45,6 +45,7 @@ describe("settings-store", () => {
       escapeTimeoutMs: 30,
       logLevel: "info",
       editMaxFileBytes: 16777216,
+      viewImageMaxBytes: 5242880,
       globTimeoutMs: 30000,
       grepStderrMaxChars: 4000,
       compactionThresholdRatio: 0.8,
@@ -84,6 +85,7 @@ describe("settings-store", () => {
       maxRetries: 3,
       logLevel: "debug",
       editMaxFileBytes: 1024,
+      viewImageMaxBytes: 5242880,
       globTimeoutMs: 5000,
       grepStderrMaxChars: 64,
       compactionThresholdRatio: 0.8,
@@ -126,6 +128,7 @@ describe("settings-store", () => {
   it("工具数值配置边界严格校验且不修改原文件", () => {
     for (const [key, minimum, maximum] of [
       ["editMaxFileBytes", 1, 16777216],
+      ["viewImageMaxBytes", 1024, 16777216],
       ["globTimeoutMs", 1000, 120000],
       ["grepStderrMaxChars", 64, 65536],
       ["mouseScrollLines", 1, 100],

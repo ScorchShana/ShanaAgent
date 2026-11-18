@@ -127,7 +127,7 @@ function stateWith(
     ...snapshot,
     core: options.status === undefined ? snapshot.core : { ...snapshot.core, status: options.status },
     history: {
-      meta: { version: 2, workspaceId: "ws", sessionId, createdAt: "now" },
+      meta: { version: 3, workspaceId: "ws", sessionId, createdAt: "now" },
       records,
       warnings: [],
       fromRecordSeq: 1,

@@ -82,16 +82,16 @@ describe("V1 记录枚举与 Schema 校验", () => {
   it("合法记录通过校验；首条记录必须且仅允许首条携带 version", () => {
     const prompt = { recordSeq: 1, ts: TS, type: "user_prompt", runId: "run-1", text: "hi" };
     expect(parseSessionRecord(prompt, { expectVersion: false }).type).toBe("user_prompt");
-    expect(parseSessionRecord({ ...prompt, version: 2 }, { expectVersion: true }).recordSeq).toBe(1);
+    expect(parseSessionRecord({ ...prompt, version: 3 }, { expectVersion: true }).recordSeq).toBe(1);
     expect(() => parseSessionRecord(prompt, { expectVersion: true })).toThrow(/缺少 "version"/);
     expect(() =>
-      parseSessionRecord({ ...prompt, recordSeq: 2, version: 2 }, { expectVersion: false }),
+      parseSessionRecord({ ...prompt, recordSeq: 2, version: 3 }, { expectVersion: false }),
     ).toThrow(/仅首条记录允许/);
   });
 
   it("非法 type / status / outcome / 未知字段被拒绝", () => {
     expect(() =>
-      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 2 }, { expectVersion: true }),
+      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 3 }, { expectVersion: true }),
     ).toThrow(RecordValidationError);
     expect(() =>
       parseSessionRecord(
@@ -157,6 +157,64 @@ describe("V1 记录枚举与 Schema 校验", () => {
     // 新建文件的空快照必须合法，否则成功写入的 Session 会被误判损坏。
     const created = parseSessionRecord({ ...base, priorContent: "" }, { expectVersion: false });
     if (created.type === "tool_result") expect(created.priorContent).toBe("");
+  });
+
+  describe("tool_result 可选 images 块形态校验", () => {
+    const base = {
+      recordSeq: 2,
+      ts: TS,
+      type: "tool_result",
+      assistantRecordSeq: 1,
+      runId: "run-1",
+      toolCallId: "c1",
+      toolName: "view_image",
+      status: "success",
+      content: "attached",
+    };
+    const image = { data: "iVBORw0KGgo=", mimeType: "image/png", width: 1920, height: 1080 };
+    const parse = (raw: Record<string, unknown>) => parseSessionRecord(raw, { expectVersion: false });
+
+    it("合法单图通过；无 images 的旧记录照常", () => {
+      const parsed = parse({ ...base, images: [image] });
+      if (parsed.type === "tool_result") expect(parsed.images).toEqual([image]);
+      expect(parse(base).type).toBe("tool_result");
+    });
+
+    it("拒绝空数组、多图与非数组", () => {
+      for (const images of [[], [image, image], {}, "x"]) {
+        expect(() => parse({ ...base, images })).toThrow(/"images"/);
+      }
+    });
+
+    it("拒绝未知字段与非对象元素", () => {
+      expect(() => parse({ ...base, images: [{ ...image, extra: 1 }] })).toThrow(/未知字段/);
+      expect(() => parse({ ...base, images: ["x"] })).toThrow(/必须是对象/);
+    });
+
+    it("base64 字符集、padding 与长度校验", () => {
+      for (const data of ["", "a b==", "abc", "ab=d", "====", "ab==cd=="]) {
+        expect(() => parse({ ...base, images: [{ ...image, data }] })).toThrow(/base64|"data"/);
+      }
+      // 合法 padding 形态
+      for (const data of ["AAAA", "AAA=", "AA=="]) {
+        expect(parse({ ...base, images: [{ ...image, data }] }).type).toBe("tool_result");
+      }
+    });
+
+    it("解码后超过 16 MiB 硬上限被拒绝", () => {
+      const data = "A".repeat(Math.ceil((16_777_216 + 3) / 3) * 4);
+      expect(() => parse({ ...base, images: [{ ...image, data }] })).toThrow(/16777216/);
+    });
+
+    it("mimeType 枚举与宽高正安全整数", () => {
+      for (const mimeType of ["image/gif", "image/bmp", "text/plain", 42]) {
+        expect(() => parse({ ...base, images: [{ ...image, mimeType }] })).toThrow(/"mimeType"/);
+      }
+      for (const value of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, "8"]) {
+        expect(() => parse({ ...base, images: [{ ...image, width: value }] })).toThrow(/"images.width"/);
+        expect(() => parse({ ...base, images: [{ ...image, height: value }] })).toThrow(/"images.height"/);
+      }
+    });
   });
 });
 
@@ -262,12 +320,12 @@ describe("aborted Turn 完整判据与归一化", () => {
   });
 });
 
-it("accepts optional v2 elapsedMs and rejects invalid audit durations", () => {
+it("accepts optional elapsedMs and rejects invalid audit durations", () => {
   const record = {
     type: "run_finished",
     recordSeq: 1,
     ts: TS,
-    version: 2,
+    version: 3,
     runId: "r",
     outcome: "completed",
     persisted: true,
@@ -284,7 +342,7 @@ it("accepts optional v2 elapsedMs and rejects invalid audit durations", () => {
 });
 
 describe("autoDecisionEnabled metadata", () => {
-  const meta = { version: 2, sessionId: "s1", workspaceId: "ws", createdAt: TS };
+  const meta = { version: 3, sessionId: "s1", workspaceId: "ws", createdAt: TS };
   it("preserves absence and accepts both booleans", () => {
     expect(parseSessionMeta(meta)).not.toHaveProperty("autoDecisionEnabled");
     for (const enabled of [true, false]) {

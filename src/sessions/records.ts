@@ -14,7 +14,7 @@ export type StoredAssistantMessage = Omit<AssistantMessage, "content"> & {
   content: (Exclude<AssistantMessage["content"][number], { type: "toolCall" }> | StoredToolCall)[];
 };
 
-export const SESSION_FORMAT_VERSION = 2;
+export const SESSION_FORMAT_VERSION = 3;
 
 export const SESSION_RECORD_TYPES = [
   "user_prompt",
@@ -109,6 +109,17 @@ export interface AssistantMessageRecord extends RecordBase {
   message: StoredAssistantMessage;
 }
 
+export const IMAGE_MIME_TYPES = ["image/png", "image/jpeg", "image/webp"] as const;
+export type ImageMimeType = (typeof IMAGE_MIME_TYPES)[number];
+
+export interface ToolResultImage {
+  // base64 原文不脱敏（图像数据非凭据）；宽高仅供估算与 TUI，wire 消息块不带宽高。
+  data: string;
+  mimeType: ImageMimeType;
+  width: number;
+  height: number;
+}
+
 export interface ToolResultRecord extends RecordBase {
   type: "tool_result";
   runId: string;
@@ -119,6 +130,8 @@ export interface ToolResultRecord extends RecordBase {
   content: string;
   // write/edit 写入前旧文件全量快照，仅供 TUI 历史 Diff，不进入 LLM Context
   priorContent?: string;
+  // 仅 view_image 成功读取产出；恒单图。解析层只校形态，语义由工具层保证。
+  images?: ToolResultImage[];
 }
 
 export interface InterruptionRecord extends RecordBase {
@@ -347,6 +360,31 @@ function parseAssistantMessage(raw: unknown, scope: string): void {
   }
 }
 
+// base64 硬上限对应 settings 可配的最大 viewImageMaxBytes；运行期读取按实际配置收紧。
+const IMAGE_BASE64_MAX_DECODED_BYTES = 16_777_216;
+const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
+
+function parseToolResultImages(raw: unknown, scope: string): void {
+  if (!Array.isArray(raw) || raw.length !== 1) fail(scope, '"images" 必须是恰含 1 项的数组');
+  const image = raw[0];
+  if (!isPlainObject(image)) fail(scope, '"images" 项必须是对象');
+  checkKeys(image, ["data", "mimeType", "width", "height"], scope);
+  const data = requireString(image, "data", scope, { allowEmpty: false });
+  if (!BASE64_PATTERN.test(data) || data.length % 4 !== 0) {
+    fail(scope, '"images.data" 必须是合法 base64（长度为 4 的倍数）');
+  }
+  if (Buffer.byteLength(data, "base64") > IMAGE_BASE64_MAX_DECODED_BYTES) {
+    fail(scope, `"images.data" 解码后不得超过 ${IMAGE_BASE64_MAX_DECODED_BYTES} 字节`);
+  }
+  requireEnum(image, "mimeType", IMAGE_MIME_TYPES, scope);
+  for (const key of ["width", "height"] as const) {
+    const value = image[key];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+      fail(scope, `"images.${key}" 必须是正安全整数`);
+    }
+  }
+}
+
 function parseCheckpointModel(raw: unknown, scope: string): void {
   if (!isPlainObject(raw)) fail(scope, '"model" 必须是对象');
   checkKeys(raw, ["providerId", "modelId"], scope);
@@ -359,7 +397,7 @@ const TYPE_KEYS: Record<SessionRecordType, readonly string[]> = {
   user_prompt: ["text"],
   run_started: ["model", "settings", "agentsMd"],
   assistant_message: ["message"],
-  tool_result: ["assistantRecordSeq", "toolCallId", "toolName", "status", "content", "priorContent"],
+  tool_result: ["assistantRecordSeq", "toolCallId", "toolName", "status", "content", "priorContent", "images"],
   interruption: ["toolCallId", "reason", "detail"],
   run_finished: ["outcome", "persisted", "error", "elapsedMs"],
   checkpoint: ["summary", "coveredUpTo", "model", "promptVersion"],
@@ -421,6 +459,7 @@ export function parseSessionRecord(raw: unknown, options: ParseRecordOptions): S
       requireEnum(raw, "status", TOOL_RESULT_STATUSES, scope);
       requireString(raw, "content", scope);
       optionalString(raw, "priorContent", scope);
+      if (raw.images !== undefined) parseToolResultImages(raw.images, scope);
       break;
     }
     case "interruption":
