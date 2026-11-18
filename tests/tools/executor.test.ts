@@ -49,6 +49,35 @@ describe("V9 静态注册表与参数校验", () => {
     expect(executor.registry.get("shell")).toBeUndefined();
   });
 
+  it("imageInput=true 注册七件（view_image 末位），成功透传 images、错误不带", async () => {
+    const root = makeWorkspace();
+    const png = Buffer.alloc(24);
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png, 0);
+    png.writeUInt32BE(13, 8);
+    png.write("IHDR", 12, "ascii");
+    png.writeUInt32BE(2, 16);
+    png.writeUInt32BE(1, 20);
+    writeFileAt(root, "a.png", png);
+    const vision = makeExecutor(root, { imageInput: true });
+    expect(vision.registry.names()).toEqual([
+      "read",
+      "glob",
+      "grep",
+      "write",
+      "edit",
+      shellName,
+      "view_image",
+    ]);
+    const ok = await vision.execute(call("c1", "view_image", { path: "a.png" }));
+    expect(ok.status).toBe("success");
+    expect(ok.images).toEqual([
+      { data: png.toString("base64"), mimeType: "image/png", width: 2, height: 1 },
+    ]);
+    const bad = await vision.execute(call("c2", "view_image", { path: "missing.png" }));
+    expect(bad.status).toBe("error");
+    expect(bad.images).toBeUndefined();
+  });
+
   it("重复注册被拒绝", () => {
     const registry = makeExecutor(makeWorkspace()).registry;
     const tool = registry.get("read");
@@ -102,7 +131,12 @@ describe("V9 静态注册表与参数校验", () => {
         () =>
           new ToolExecutor({
             workspaceRoot: root,
-            settings: { editMaxFileBytes: value, globTimeoutMs: 30000, grepStderrMaxChars: 4000 },
+            settings: {
+              editMaxFileBytes: value,
+              viewImageMaxBytes: 5242880,
+              globTimeoutMs: 30000,
+              grepStderrMaxChars: 4000,
+            },
           }),
       ).toThrow(/editMaxFileBytes/);
     }

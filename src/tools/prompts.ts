@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-export const PROMPT_TOOL_NAMES = ["read", "glob", "grep", "write", "edit", "bash"] as const;
+export const PROMPT_TOOL_NAMES = ["read", "glob", "grep", "write", "edit", "bash", "view_image"] as const;
 export interface PromptBundle {
   system: string;
   tools: Record<string, string>;

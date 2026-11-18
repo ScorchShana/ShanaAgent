@@ -1,6 +1,6 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`V4 六工具定义与确认稿一致 > 定义快照（name/access/description/parameters）与确认稿冻结一致 1`] = `
+exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致 > 定义快照（name/access/description/parameters）与确认稿冻结一致 1`] = `
 [
   {
     "access": "read",
@@ -229,6 +229,31 @@ exports[`V4 六工具定义与确认稿一致 > 定义快照（name/access/descr
       },
       "required": [
         "command",
+      ],
+      "type": "object",
+    },
+  },
+  {
+    "access": "read",
+    "description": "View an image file (png, jpg, jpeg, webp) and return it as image content.
+
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Only successful reads return image information; failures return an Error without image data.
+- The file must match a supported format by content, not only by extension. Maximum 5242880 bytes.
+- Use this tool when the task requires seeing an image (screenshots, diagrams, UI). For text files use read instead.
+- Only available when the current model accepts image input.",
+    "name": "view_image",
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "description": "Image file path relative to the workspace or absolute.",
+          "minLength": 1,
+          "type": "string",
+        },
+      },
+      "required": [
+        "path",
       ],
       "type": "object",
     },

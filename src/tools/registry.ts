@@ -22,9 +22,12 @@ import {
   type TerminateProcessTree,
   type TerminationDetails,
 } from "./shell.js";
+import { viewImageFile, type ViewImageArguments } from "./view-image.js";
 import { writeFileContent, type WriteArguments } from "./write.js";
+import type { ToolResultImage } from "../sessions/records.js";
 
-export const TOOL_NAMES = ["read", "glob", "grep", "write", "edit", "bash"] as const;
+// 规范全集；默认注册表仅六件，view_image 按模型 image 输入能力条件注册。
+export const TOOL_NAMES = ["read", "glob", "grep", "write", "edit", "bash", "view_image"] as const;
 export type ToolName = (typeof TOOL_NAMES)[number];
 export const SHELL_TOOL_NAMES = ["bash"] as const;
 export type ShellToolName = (typeof SHELL_TOOL_NAMES)[number];
@@ -75,6 +78,8 @@ export interface ToolOutcome {
   termination?: TerminationDetails;
   // write/edit 写入前旧文件全量快照（新建文件为空串），仅供 tool_result.priorContent，不进入模型可见 content
   priorContent?: string;
+  // 仅 view_image 成功读取携带（恒单图）；错误/取消/拒绝路径不得携带。
+  images?: ToolResultImage[];
 }
 
 export interface ToolPlan {
@@ -111,6 +116,7 @@ export interface ToolContext {
   pathPolicy: PathPolicy;
   platform: NodeJS.Platform;
   editMaxFileBytes?: number;
+  viewImageMaxBytes?: number;
   globTimeoutMs?: number;
   grepStderrMaxChars?: number;
   signal?: AbortSignal;
@@ -520,6 +526,36 @@ const editTool = defineTool<EditArguments>({
   },
 });
 
+const viewImageTool = defineTool<ViewImageArguments>({
+  name: "view_image",
+  access: "read",
+  description: "",
+  parameters: {
+    type: "object",
+    properties: {
+      path: {
+        type: "string",
+        minLength: 1,
+        description: "Image file path relative to the workspace or absolute.",
+      },
+    },
+    required: ["path"],
+    additionalProperties: false,
+  },
+  parseArguments(raw) {
+    const record = toRecord(raw, "view_image");
+    checkAllowedKeys(record, ["path"], "view_image");
+    return { path: requireString(record, "path", "view_image", { allowEmpty: false }) };
+  },
+  prepare(args, context) {
+    const target = context.pathPolicy.resolve(args.path);
+    return {
+      action: { type: "read", paths: [target] },
+      execute: () => viewImageFile(args, target, withPathCheck(context, target)),
+    };
+  },
+});
+
 interface ShellArguments {
   command: string;
   timeout: number;
@@ -585,19 +621,23 @@ function createShellTool(shell: ShellDescriptor): RegisteredTool {
 
 export function createToolRegistry(
   platform: NodeJS.Platform = process.platform,
-  settings: Pick<Settings, "editMaxFileBytes" | "globTimeoutMs" | "grepStderrMaxChars"> = parseSettings(
-    undefined,
-  ),
+  settings: Pick<
+    Settings,
+    "editMaxFileBytes" | "viewImageMaxBytes" | "globTimeoutMs" | "grepStderrMaxChars"
+  > = parseSettings(undefined),
   prompts: PromptBundle = loadPrompts(),
+  imageInput = false,
 ): ToolRegistry {
   const shell = detectShell(platform);
+  const tools = [readTool, globTool, grepTool, writeTool, editTool, createShellTool(shell)];
+  // 无视觉能力时工具集中不存在 view_image，幻觉调用走既有 Unknown tool 错误。
+  if (imageInput) tools.push(viewImageTool);
   return new ToolRegistry(
-    [readTool, globTool, grepTool, writeTool, editTool, createShellTool(shell)].map((tool) => ({
+    tools.map((tool) => ({
       ...tool,
-      description: prompts.tools[tool.name]!.replaceAll(
-        "{editMaxFileBytes}",
-        String(settings.editMaxFileBytes),
-      ),
+      description: prompts.tools[tool.name]!
+        .replaceAll("{editMaxFileBytes}", String(settings.editMaxFileBytes))
+        .replaceAll("{viewImageMaxBytes}", String(settings.viewImageMaxBytes)),
     })),
   );
 }

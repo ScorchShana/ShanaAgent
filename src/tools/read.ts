@@ -18,7 +18,7 @@ function error(content: string, category: ToolOutcome["category"] = "io"): ToolO
   return { status: "error", category, content: `Error: ${content}` };
 }
 
-function ioError(cause: unknown): ToolOutcome {
+export function ioError(cause: unknown): ToolOutcome {
   if (cause instanceof PathTargetChangedError) return fileOperationError(cause);
   const code = (cause as NodeJS.ErrnoException)?.code;
   if (code === "ENOENT") return error("File not found.");
@@ -28,7 +28,7 @@ function ioError(cause: unknown): ToolOutcome {
   return error("File operation failed.");
 }
 
-function displayPath(value: string): string {
+export function displayPath(value: string): string {
   return formatSuccessPath(value).replace(
     /[<>]/g,
     (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,

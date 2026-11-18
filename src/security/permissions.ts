@@ -103,7 +103,7 @@ export function withGrant(grants: SessionGrants, key: ApprovalGrantKey): Session
 }
 
 export function evaluatePermission(subject: ToolCallSubject, grants: SessionGrants): PermissionVerdict {
-  if (!["read", "glob", "grep", "write", "edit", "bash"].includes(subject.toolName)) {
+  if (!["read", "glob", "grep", "write", "edit", "bash", "view_image"].includes(subject.toolName)) {
     return {
       outcome: "ask",
       request: { ...buildApprovalRequest(subject), access: "unknown", grantKey: null },
