@@ -53,7 +53,11 @@ export interface AgentLoopDriver {
 
 export interface CompactionDriver {
   // estimatedContextTokens：压后上下文纯估算，仅供状态栏即时显示，可选。
-  execute(signal: AbortSignal): Promise<CompactionOutcome & { estimatedContextTokens?: number }>;
+  // focus：手动 /compact 的用户附加重点，仅本次摘要请求可见。
+  execute(
+    signal: AbortSignal,
+    focus?: string,
+  ): Promise<CompactionOutcome & { estimatedContextTokens?: number }>;
 }
 
 export interface ControllerCommands {
@@ -193,7 +197,7 @@ export class SessionController {
     this.resolvePendingApproval(decision);
   }
 
-  compact(): Promise<CompactionOutcome> {
+  compact(focus?: string): Promise<CompactionOutcome> {
     if (this.commandPending) throw new BusyError("Session operation in progress");
     if (this.closing) throw new InvalidStateError("Session is closed");
     if (this.status.kind === "running") {
@@ -210,7 +214,7 @@ export class SessionController {
     this.bus.publish({ type: "compaction.started" } satisfies FormalEvent);
     const operation = (async (): Promise<CompactionOutcome> => {
       try {
-        const outcome = await compactor.execute(context.abortController.signal);
+        const outcome = await compactor.execute(context.abortController.signal, focus);
         const estimate = outcome.estimatedContextTokens;
         const validEstimate =
           typeof estimate === "number" && Number.isFinite(estimate) && estimate >= 0 ? estimate : null;

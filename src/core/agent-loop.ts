@@ -923,7 +923,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     startDecisionProbe();
   };
   const compactor: CompactionDriver = {
-    execute: async (signal) => {
+    execute: async (signal, focus) => {
       if (!ref) throw new Error("当前没有打开的 Session，无法压缩。");
       const model = structuredClone(currentModel());
       const settings = parseSettings(options.getSettings());
@@ -950,6 +950,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         signal,
         retainedContextBudget: 0,
         keepLatestTurn: false,
+        focus,
         modelService: options.modelService,
         appendRecord: append,
       });
