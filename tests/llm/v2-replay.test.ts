@@ -9,7 +9,10 @@ import { resumeSession } from "../../src/sessions/recovery.js";
 import {
   cleanupTempDirs,
   makeAssistantRecord,
+  makePngImage,
   makeStore,
+  makeToolResultRecord,
+  makeUserPromptRecord,
   sessionRef,
   WORKSPACE_ID,
   tempDir,
@@ -154,5 +157,38 @@ describe("SDK v2 replay", () => {
     });
     expect(count).toBe(2);
     expect(result.toolCalls[0]?.rawArguments).toBe('{"path":"ok"}');
+  });
+  it("含图 toolResult 经 replay 校验后以 image_url 到达 wire，tool 消息保持纯文本", async () => {
+    const vision: ResolvedModel = { ...model, input: ["text", "image"] };
+    const image = makePngImage();
+    const records = [
+      makeUserPromptRecord(1, "r", "look"),
+      makeAssistantRecord(2, "r", [{ id: "v1", name: "view_image", arguments: { path: "a.png" } }]),
+      makeToolResultRecord(3, "r", "v1", "success", {
+        toolName: "view_image",
+        content: "(Image attached: image/png, 4x3, 33 bytes.)",
+        images: [image],
+      }),
+    ];
+    const built = await buildContext({ records, workspacePath: tempDir(), imageInput: true });
+    let payload: Record<string, unknown> = {};
+    await new ModelService(createConfiguredModels([vision]), []).streamTurn({
+      model: vision,
+      context: built.context,
+      fetch: async (_url, init) => {
+        payload = JSON.parse(String(init?.body));
+        return response(undefined, "stop");
+      },
+    });
+    const messages = payload.messages as {
+      role: string;
+      content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    }[];
+    expect(messages.map((message) => message.role)).toEqual(["system", "user", "assistant", "tool", "user"]);
+    expect(messages[3]!.content).toBe("(Image attached: image/png, 4x3, 33 bytes.)");
+    expect(messages[4]!.content).toEqual([
+      { type: "text", text: "Attached image(s) from tool result:" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${image.data}` } },
+    ]);
   });
 });

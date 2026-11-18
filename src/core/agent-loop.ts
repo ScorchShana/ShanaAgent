@@ -82,8 +82,12 @@ export interface AgentSessionOptions {
 
 type ToolDefinitions = NonNullable<StoredContext["tools"]>;
 
-function toolDefinitions(platform: NodeJS.Platform | undefined, settings: Settings): ToolDefinitions {
-  return createToolRegistry(platform, settings)
+function toolDefinitions(
+  platform: NodeJS.Platform | undefined,
+  settings: Settings,
+  imageInput = false,
+): ToolDefinitions {
+  return createToolRegistry(platform, settings, undefined, imageInput)
     .list()
     .map((tool) => ({
       name: tool.name,
@@ -97,9 +101,10 @@ function computeBaselineTokens(
   context: StoredContext,
   settings: Settings,
   platform?: NodeJS.Platform,
+  imageInput = false,
 ): number {
   return estimateContextTokens(
-    { ...context, messages: [], tools: toolDefinitions(platform, settings) },
+    { ...context, messages: [], tools: toolDefinitions(platform, settings, imageInput) },
     settings.tokenEstimate,
   );
 }
@@ -268,9 +273,14 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let contextBaselineTokens: number | null = null;
   // Session 级冻结快照：进程启动、/new、/resume 时读取，Session 内不再重读。
   let sessionAgentsMd: AgentsMdLoad = await loadRootAgentsMd(options.workspaceRoot);
-  const applyBaseline = (context: StoredContext, settings: Settings): void => {
+  const applyBaseline = (context: StoredContext, settings: Settings, imageInput = false): void => {
     try {
-      contextBaselineTokens = computeBaselineTokens(context, settings, options.executorOptions?.platform);
+      contextBaselineTokens = computeBaselineTokens(
+        context,
+        settings,
+        options.executorOptions?.platform,
+        imageInput,
+      );
     } catch {
       contextBaselineTokens = null;
     }
@@ -284,7 +294,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         systemPrompt: options.systemPrompt,
         environment: options.environment,
       });
-      applyBaseline(baseline.context, parseSettings(options.getSettings()));
+      // currentModel 可能因 model.json 非法抛错，由外层 catch 统一降级为无 baseline。
+      applyBaseline(
+        baseline.context,
+        parseSettings(options.getSettings()),
+        currentModel().input.includes("image"),
+      );
     } catch {
       contextBaselineTokens = null;
     }
@@ -472,7 +487,11 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       }
       let previousTools: ToolDefinitions;
       try {
-        previousTools = toolDefinitions(options.executorOptions?.platform, parseSettings(started.settings));
+        previousTools = toolDefinitions(
+          options.executorOptions?.platform,
+          parseSettings(started.settings),
+          started.model.input.includes("image"),
+        );
       } catch {
         reason = "run_settings_unreadable";
         break;
@@ -489,6 +508,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
           environment: options.environment,
+          imageInput: runModel.input.includes("image"),
         });
       } catch {
         reason = "prefix_build_failed";
@@ -569,6 +589,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
           environment: options.environment,
+          imageInput: runModel.input.includes("image"),
         });
         // 复用原数组保证与上一次正式请求逐字节一致。
         built.context.tools = tools;
@@ -629,6 +650,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         },
         onToolOutput: (toolCallId, snapshot) => handle.streamToolOutput(toolCallId, snapshot),
         settings: runSettings,
+        imageInput: runModel.input.includes("image"),
         permissionGate: (request) => manager.requestPermission(request, { signal }),
         onCleanupWarning: (path) => options.onWarning?.({ kind: "temporary_file_cleanup_failed", path }),
       });
@@ -789,6 +811,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
               status: result.status,
               content: result.content,
               ...(result.priorContent !== undefined ? { priorContent: result.priorContent } : {}),
+              ...(result.images !== undefined ? { images: result.images } : {}),
             });
             results.push(result);
             if (result.status === "unknown") {
@@ -815,7 +838,15 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
               role: "toolResult" as const,
               toolCallId: result.toolCallId,
               toolName: result.toolName,
-              content: [{ type: "text" as const, text: result.content }],
+              // image 块字段序 {type,data,mimeType} 必须与 toolResultMessage 重建同序（sameSentMessage 锚定）。
+              content: [
+                { type: "text" as const, text: result.content },
+                ...(result.images ?? []).map((image) => ({
+                  type: "image" as const,
+                  data: image.data,
+                  mimeType: image.mimeType,
+                })),
+              ],
               isError: result.status !== "success",
               timestamp: Date.now(),
             })),
@@ -897,17 +928,19 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       const model = structuredClone(currentModel());
       const settings = parseSettings(options.getSettings());
       if (!recordsFresh) await resyncRecords();
+      const imageInput = model.input.includes("image");
       const fresh = await buildContext({
         records,
         workspacePath: options.workspaceRoot,
         agentsMd: sessionAgentsMd,
         systemPrompt: options.systemPrompt,
         environment: options.environment,
+        imageInput,
       });
       for (const warning of fresh.warnings) options.onWarning?.(warning);
       const context = {
         ...fresh.context,
-        tools: toolDefinitions(options.executorOptions?.platform, settings),
+        tools: toolDefinitions(options.executorOptions?.platform, settings, imageInput),
       };
       const outcome = await compactHistory({
         records,
@@ -929,11 +962,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
           environment: options.environment,
+          imageInput,
         });
         const estimatedContextTokens = estimateContextTokens(
           {
             ...rebuilt.context,
-            tools: toolDefinitions(options.executorOptions?.platform, settings),
+            tools: toolDefinitions(options.executorOptions?.platform, settings, imageInput),
           },
           settings.tokenEstimate,
         );
@@ -1142,8 +1176,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
           environment: options.environment,
+          imageInput: runModel.input.includes("image"),
         });
-        applyBaseline(built.context, runSettings);
+        applyBaseline(built.context, runSettings, runModel.input.includes("image"));
         for (const warning of built.warnings) options.onWarning?.(warning);
       },
       persistRunFinished: async ({ runId, outcome, elapsedMs }) => {

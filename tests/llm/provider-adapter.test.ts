@@ -1,10 +1,17 @@
 import { describe, expect, it } from "vitest";
+import {
+  IMAGE_COMPACTION_OMITTED_TEXT,
+  IMAGE_OMITTED_TEXT,
+  toolResultMessage,
+  trimCompactionMessages,
+} from "../../src/core/context-builder.js";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import { createConfiguredModels } from "../../src/llm/provider-adapter.js";
 import { ModelService } from "../../src/llm/model-service.js";
 import type { StoredContext } from "../../src/llm/history-replay.js";
-import type { StoredAssistantMessage } from "../../src/sessions/records.js";
+import type { StoredAssistantMessage, ToolResultImage } from "../../src/sessions/records.js";
 import type { Model } from "@earendil-works/pi-ai";
+import { makeAssistantMessage, makePngImage, makeToolResultRecord } from "../sessions/helpers.js";
 
 function makeResolved(overrides: Partial<ResolvedModel> = {}): ResolvedModel {
   return {
@@ -213,5 +220,152 @@ describe("无工具请求的 tools 字段（压缩摘要请求前缀回归）", 
       compat: { supportsDeveloperRole: false, requiresToolsWithToolHistory: false },
     });
     expect(body.tools).toBeUndefined();
+  });
+});
+
+describe("view_image wire 形态（pi-ai 原生批处理锁死）", () => {
+  const img1 = makePngImage(4, 3);
+  const img2 = makePngImage(8, 6);
+
+  function imageTurnContext(
+    calls: Array<{ id: string; name: string }>,
+    images: Record<string, ToolResultImage>,
+    imageInput = true,
+  ): StoredContext {
+    const assistant = makeAssistantMessage(
+      calls.map((call) => ({ ...call, arguments: { path: `${call.id}.png` } })),
+    );
+    const messages: StoredContext["messages"] = [
+      { role: "user", content: "look", timestamp: 1 },
+      assistant,
+    ];
+    for (const [index, call] of calls.entries()) {
+      const image = images[call.id];
+      messages.push(
+        toolResultMessage(
+          makeToolResultRecord(index + 3, "r", call.id, "success", {
+            toolName: call.name,
+            assistantRecordSeq: 2,
+            content: image ? `(Image attached: ${image.mimeType}.)` : "file body",
+            ...(image ? { images: [image] } : {}),
+          }),
+          imageInput,
+        ),
+      );
+    }
+    return { messages, tools: [] };
+  }
+
+  async function requestBody(
+    context: StoredContext,
+    input: string[] = ["text", "image"],
+  ): Promise<Record<string, unknown>> {
+    const apiKey = "sk-adapter-key-0123456789";
+    const resolved = makeResolved({ apiKey, thinking: false, input });
+    const models = createConfiguredModels([resolved]);
+    const { captured, fetchFn } = captureFetch();
+    await new ModelService(models, [apiKey]).streamTurn({ model: resolved, context, fetch: fetchFn });
+    if (captured.body === undefined) throw new Error("fetch 未被调用");
+    return captured.body;
+  }
+
+  type WireMessage = {
+    role: string;
+    content?: string | Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    tool_call_id?: string;
+  };
+  const wireMessages = (body: Record<string, unknown>) => body.messages as WireMessage[];
+  const imageUrls = (body: Record<string, unknown>) =>
+    wireMessages(body).flatMap((message) =>
+      Array.isArray(message.content)
+        ? message.content.filter((block) => block.type === "image_url").map((block) => block.image_url!.url)
+        : [],
+    );
+
+  it("同 Turn 两次 view_image → 恰一条 user 消息含全部 image_url，顺序与 call 一致，tool 消息纯文本", async () => {
+    const body = await requestBody(
+      imageTurnContext(
+        [
+          { id: "c1", name: "view_image" },
+          { id: "c2", name: "view_image" },
+        ],
+        { c1: img1, c2: img2 },
+      ),
+    );
+    const messages = wireMessages(body);
+    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "tool", "tool", "user"]);
+    // pi-ai 规范化 tool call id：只锁 tool 消息与 call 的顺序对应。
+    const callIds = (
+      messages[1] as { tool_calls?: { id: string }[] }
+    ).tool_calls!.map((call) => call.id);
+    expect([messages[2]!.tool_call_id, messages[3]!.tool_call_id]).toEqual(callIds);
+    expect(messages[2]).toMatchObject({ role: "tool", content: "(Image attached: image/png.)" });
+    expect(messages[3]).toMatchObject({ role: "tool", content: "(Image attached: image/png.)" });
+    expect(messages[4]!.content).toEqual([
+      { type: "text", text: "Attached image(s) from tool result:" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${img1.data}` } },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${img2.data}` } },
+    ]);
+  });
+
+  it("混合 read+view_image+read 同组仍恰一条 image user 消息", async () => {
+    const body = await requestBody(
+      imageTurnContext(
+        [
+          { id: "c1", name: "read" },
+          { id: "c2", name: "view_image" },
+          { id: "c3", name: "read" },
+        ],
+        { c2: img1 },
+      ),
+    );
+    const messages = wireMessages(body);
+    expect(messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "tool",
+      "tool",
+      "user",
+    ]);
+    expect(imageUrls(body)).toEqual([`data:image/png;base64,${img1.data}`]);
+  });
+
+  it("零图 Turn 无额外 user 消息", async () => {
+    const body = await requestBody(
+      imageTurnContext(
+        [
+          { id: "c1", name: "read" },
+          { id: "c2", name: "read" },
+        ],
+        {},
+      ),
+    );
+    expect(wireMessages(body).map((message) => message.role)).toEqual(["user", "assistant", "tool", "tool"]);
+    expect(imageUrls(body)).toEqual([]);
+  });
+
+  it("非视觉模型：pre-strip 上下文无 image_url，tool 消息含显式占位", async () => {
+    const body = await requestBody(
+      imageTurnContext([{ id: "c1", name: "view_image" }], { c1: img1 }, false),
+      ["text"],
+    );
+    expect(imageUrls(body)).toEqual([]);
+    const tool = wireMessages(body).find((message) => message.role === "tool");
+    expect(tool?.content).toBe(`(Image attached: image/png.)\n${IMAGE_OMITTED_TEXT}`);
+    expect(wireMessages(body).map((message) => message.role)).toEqual(["user", "assistant", "tool"]);
+  });
+
+  it("压缩 fallback 裁剪后 wire 无 image_url、含丢图占位", async () => {
+    const context = imageTurnContext([{ id: "c1", name: "view_image" }], { c1: img1 });
+    const trimmed = trimCompactionMessages(context.messages, {
+      tokenEstimate: { asciiCharsPerToken: 4, nonAsciiCharsPerToken: 1.5 },
+      toolResultMaxChars: 4000,
+      maxTokens: 100,
+    });
+    if (trimmed.status !== "ok") throw new Error("expected ok");
+    const body = await requestBody({ messages: trimmed.messages, tools: [] });
+    expect(imageUrls(body)).toEqual([]);
+    expect(JSON.stringify(body)).toContain(IMAGE_COMPACTION_OMITTED_TEXT);
   });
 });

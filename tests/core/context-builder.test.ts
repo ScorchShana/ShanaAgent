@@ -6,12 +6,15 @@ import {
   CANCELLED_REQUEST_ANNOTATION,
   CONTEXT_SAFETY_MARGIN_TOKENS,
   FAILED_REQUEST_ANNOTATION,
+  IMAGE_COMPACTION_OMITTED_TEXT,
+  IMAGE_OMITTED_TEXT,
   INTERRUPTED_RESPONSE_ANNOTATION,
   MISSING_TOOL_RESULT_TEXT,
   UNKNOWN_RESULT_ANNOTATION,
   assertCandidateCheckpointValid,
   buildContext,
   estimateContextTokens,
+  estimateMessageTokens,
   estimateTokens,
   isRequestFeasible,
   loadRootAgentsMd,
@@ -20,16 +23,19 @@ import {
   planEffectiveContext,
   reachesCompactionThreshold,
   toAgentsMdReference,
+  toolResultMessage,
   trimCompactionMessages,
+  turnMessages,
 } from "../../src/core/context-builder.js";
 import type { Usage } from "@earendil-works/pi-ai";
 import type { StoredContext } from "../../src/llm/history-replay.js";
 import { prepareReplay } from "../../src/llm/history-replay.js";
 import { CheckpointInvalidError } from "../../src/sessions/recovery.js";
-import type { SessionRecord } from "../../src/sessions/records.js";
+import type { SessionRecord, ToolResultRecord } from "../../src/sessions/records.js";
 import {
   makeAssistantRecord,
   makeCheckpointRecord,
+  makePngImage,
   makeRunFinishedRecord,
   makeToolResultRecord,
   makeUserPromptRecord,
@@ -1394,5 +1400,130 @@ describe("measuredPromptTokens", () => {
     expect(measuredPromptTokens(usage({ cacheRead: Number.NaN }))).toBeNull();
     expect(measuredPromptTokens(usage({ cacheWrite: Number.POSITIVE_INFINITY }))).toBeNull();
     expect(measuredPromptTokens({ ...usage(), input: undefined as unknown as number })).toBeNull();
+  });
+});
+
+describe("image 双模态（view_image）", () => {
+  const TOKEN_OPTS = { asciiCharsPerToken: 4, nonAsciiCharsPerToken: 1.5 };
+  const image = makePngImage(1920, 1080); // ceil(1920*1080/750) = 2765 tokens
+  const imageRecords: SessionRecord[] = [
+    makeUserPromptRecord(1, "run-1", "look"),
+    makeAssistantRecord(2, "run-1", [{ id: "c1", name: "view_image", arguments: { path: "a.png" } }]),
+    makeToolResultRecord(3, "run-1", "c1", "success", {
+      toolName: "view_image",
+      content: "(Image attached: image/png, 1920x1080, 44 bytes.)",
+      images: [image],
+    }),
+  ];
+  const imageResult = imageRecords[2] as ToolResultRecord;
+
+  it("toolResultMessage 双模态块形态；image 块字段序固定 {type,data,mimeType}", () => {
+    const vision = toolResultMessage(imageResult, true);
+    expect(vision.content).toEqual([
+      { type: "text", text: imageResult.content },
+      { type: "image", data: image.data, mimeType: "image/png" },
+    ]);
+    expect(Object.keys(vision.content[1]!)).toEqual(["type", "data", "mimeType"]);
+    const text = toolResultMessage(imageResult, false);
+    expect(text.content).toEqual([
+      { type: "text", text: imageResult.content },
+      { type: "text", text: IMAGE_OMITTED_TEXT },
+    ]);
+    // 无 images 的记录两种模式同构
+    const plain = makeToolResultRecord(3, "run-1", "c1", "success");
+    expect(toolResultMessage(plain, true)).toEqual(toolResultMessage(plain, false));
+  });
+
+  it("estimateMessageTokens：image 按宽高公式计费；非视觉计占位文本而非 image", () => {
+    const textTokens = estimateTokens(imageResult.content, TOKEN_OPTS);
+    expect(estimateMessageTokens(toolResultMessage(imageResult, true), TOKEN_OPTS)).toBe(
+      textTokens + 2765,
+    );
+    expect(estimateMessageTokens(toolResultMessage(imageResult, false), TOKEN_OPTS)).toBe(
+      textTokens + estimateTokens(IMAGE_OMITTED_TEXT, TOKEN_OPTS),
+    );
+    // 头部解析失败回退 4096
+    const broken = { ...imageResult, images: [{ ...image, data: "AAAA" }] };
+    expect(estimateMessageTokens(toolResultMessage(broken, true), TOKEN_OPTS)).toBe(textTokens + 4096);
+  });
+
+  it("buildContext 双模态：默认带 image 块；imageInput=false 全上下文无 image 块且含占位", async () => {
+    const workspacePath = makeWorkspace();
+    const vision = await buildContext({ records: imageRecords, workspacePath });
+    const rebuilt = vision.context.messages[2];
+    expect(rebuilt).toMatchObject({ role: "toolResult" });
+    expect(JSON.stringify(vision.context)).toContain('"type":"image"');
+    const text = await buildContext({ records: imageRecords, workspacePath, imageInput: false });
+    expect(JSON.stringify(text.context)).not.toContain('"type":"image"');
+    expect(JSON.stringify(text.context)).toContain(IMAGE_OMITTED_TEXT);
+    // turnMessages 与 buildContext 同构
+    const turn = vision.plan.runs[0]!.turns[0]!;
+    expect(turnMessages(turn, true)).toEqual(vision.context.messages.slice(1));
+    expect(turnMessages(turn, false)).toEqual(text.context.messages.slice(1));
+  });
+
+  it("planCompaction 双模态同构：摘要输入与正式请求按同一能力渲染", () => {
+    const options = {
+      keepLatestTurn: false,
+      retainedContextBudget: 0,
+      tokenEstimate: TOKEN_OPTS,
+    };
+    const vision = planCompaction(imageRecords, { ...options, imageInput: true });
+    const text = planCompaction(imageRecords, { ...options, imageInput: false });
+    if (!("messages" in vision) || !("messages" in text)) throw new Error("expected selection");
+    expect(JSON.stringify(vision.messages)).toContain('"type":"image"');
+    expect(JSON.stringify(text.messages)).not.toContain('"type":"image"');
+    expect(JSON.stringify(text.messages)).toContain(IMAGE_OMITTED_TEXT);
+    expect(vision.coveredUpTo).toBe(text.coveredUpTo);
+  });
+
+  it("保留预算按能力同构计费：image token 使尾部少保留 Turn", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success"),
+      makeAssistantRecord(4, "run-1", [{ id: "c2", name: "view_image" }]),
+      makeToolResultRecord(5, "run-1", "c2", "success", { toolName: "view_image", images: [image] }),
+    ];
+    const options = { keepLatestTurn: true, retainedContextBudget: 200, tokenEstimate: TOKEN_OPTS };
+    const vision = planCompaction(records, { ...options, imageInput: true });
+    // 最新 Turn 含 2765 image tokens，超出 200 预算 → 只保留最新 Turn，前一 Turn 被覆盖。
+    if (!("messages" in vision)) throw new Error("expected selection");
+    expect(vision.coveredUpTo).toBe(3);
+    // 非视觉渲染下两个 Turn 都是小文本 → 全部保留 → noop。
+    expect(planCompaction(records, { ...options, imageInput: false })).toEqual({ status: "noop" });
+  });
+
+  it("trimCompactionMessages：base 未超预算保留图；阶梯每档丢图换占位后收敛", () => {
+    const turn = planEffectiveContext(imageRecords).runs[0]!.turns[0]!;
+    const messages = turnMessages(turn, true);
+    const textOnlyTokens = estimateContextTokens(
+      { messages: turnMessages(turn, false) },
+      TOKEN_OPTS,
+    );
+    const base = trimCompactionMessages(messages, {
+      tokenEstimate: TOKEN_OPTS,
+      toolResultMaxChars: 4000,
+      maxTokens: 100_000,
+    });
+    if (base.status !== "ok") throw new Error("expected ok");
+    expect(base.toolResultLimit).toBeNull();
+    expect(JSON.stringify(base.messages)).toContain('"type":"image"');
+    const trimmed = trimCompactionMessages(messages, {
+      tokenEstimate: TOKEN_OPTS,
+      toolResultMaxChars: 4000,
+      maxTokens: textOnlyTokens + 100,
+    });
+    if (trimmed.status !== "ok") throw new Error("expected ok");
+    expect(trimmed.toolResultLimit).toBe(4000); // factor 1 档即丢图收敛
+    expect(JSON.stringify(trimmed.messages)).not.toContain('"type":"image"');
+    expect(JSON.stringify(trimmed.messages)).toContain(IMAGE_COMPACTION_OMITTED_TEXT);
+    expect(
+      trimCompactionMessages(messages, {
+        tokenEstimate: TOKEN_OPTS,
+        toolResultMaxChars: 4000,
+        maxTokens: 1,
+      }),
+    ).toEqual({ status: "too_large" });
   });
 });
