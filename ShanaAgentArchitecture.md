@@ -111,7 +111,7 @@ flowchart TD
 ```
 
 - `workspace-id` = 规范化路径末段 slug + sha256 短哈希，多进程推导一致；是历史组织标识，不是锁。产品名 ShanaAgent，CLI 名 `shana`，数据目录 `~/.shana/`。
-- Session v3：meta 与首条记录均 `version: 3`；未知版本拒载、不迁移、不降级（v2 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
+- Session v4：meta 与首条记录均 `version: 4`；未知版本拒载、不迁移、不降级（v2/v3 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
 - 独占占用锁：原子独占创建抢锁，整个占用期持有；`/resume` 抢锁后**续写原 Session**（不复制、不改身份、前缀不改写），recordSeq 从真实尾部重建；残锁仅人工确认移除，不自动删锁/偷锁；尾部截断可只读展示但拒绝续写。
 - History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附取消/失败标注，纯思考取消剥离后无实质内容即走此路径）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
 - 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。tool_result 可选 `images` 块（仅 view_image 成功携带：恰 1 项，base64 数据 + mimeType + 宽高，记录级严格校验）。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
@@ -134,7 +134,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；两次压缩间至少一个新 Turn；一次失败后该 Run 不再自动触发。
 - 保留策略：手动 /compact 与 (A) 覆盖全部 eligible Turn 不留尾；(B) 与溢出补救**逐字保留最新 eligible Turn**，保留预算按 Token 计并带 cap。
 - 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。手动 `/compact` 可携带用户附加重点（`/compact <重点>`），追加在指令模板末尾的 `Additional focus` 段；focus 只进本次摘要请求，不入库、不写 checkpoint、不参与 `promptVersion`（与压缩指令不落盘同一口径），其 token 计入指令预算。
-- 检查点 = 摘要 + `coveredUpTo(recordSeq)`；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。状态栏的 Cache/Speed 与 Context 同以最新 checkpoint 的 `coveredUpTo` 为界：只统计压后实测，压后尚无实测时显示 `0.0%` / `—`，下一条 assistant 落盘自动恢复；checkpoint 损坏时回退全量聚合。
+- 检查点 = 摘要 + `coveredUpTo(recordSeq)` + 摘要请求自身的实测 `usage`（`input/cacheRead/output/durationMs`，durationMs 缺省表示 Provider 未报告耗时）；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。状态栏的 Cache/Speed 是整段对话的累计口径（全部已计入 Run 的 assistant + 所有 checkpoint 的摘要请求，跨 Run、跨压缩持续累加，**压缩不重置**）：Cache = `ΣcacheRead / (Σinput + ΣcacheRead)`，Speed = `Σoutput / ΣdurationMs`；摘要请求是真实请求，其用量随 checkpoint 落盘，重启 / `/resume` 后累计完整；摘要请求耗时缺省时只计 token、不计速度。Context 不同：以最新 checkpoint 的 `coveredUpTo` 为界切换实测/压后估算（`~` 前缀），checkpoint 损坏时保持实测。
 
 ## 8. 配置与模型管理
 
@@ -184,7 +184,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - UTF-8 ground rule（view_image 为显式二进制只读 carve-out）→ §5
 - 用户 Prompt 恒进 Context（零 Turn 的取消/失败 Run 附标注）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
 - 意图先于执行、结果先于完成、fsync 临界区不可中断 → I4、§6
-- Session v3 七类记录与判据不由实现擅改（tool_result 可选 images 块，仅成功单图；v2 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
+- Session v4 七类记录与判据不由实现擅改（tool_result 可选 images 块，仅成功单图；checkpoint 可选 usage = 摘要请求实测用量；v2/v3 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
 - Shell 超时混合收尾与知情确认 → §5、§6
 - 溢出不可重试 + 每 Run 一次压缩补救 → §4
 - 压缩 A/B 触发、最新 Turn 保留、主路径/回退裁剪、摘要头部 user 消息 → §7
