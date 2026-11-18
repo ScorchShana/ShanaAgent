@@ -54,6 +54,20 @@ export function sessionContextMetrics(
     activeRunId !== null && assistants.some((record) => record.runId === activeRunId);
   const measuredRunId: string | null = activeHasAssistant ? activeRunId : (lastFinished?.runId ?? null);
 
+  // 最新 checkpoint 是"压后实测"的起点：更早的 usage 属于被摘要替代的上下文，
+  // 继续计入 Cache/Speed 会与 Context 口径分裂。checkpoint 损坏时无法判定边界，保持全量聚合，
+  // 状态栏不因坏记录崩溃（与 Context 估算降级同一策略）。
+  // 残差：Run 内压缩保留最新 Turn（keepLatestTurn）时，该 Turn 的 usage 是压缩前请求测得的；
+  // 它落在边界之外仍会被计入，下一条新 assistant 落盘后自动消除，方向安全。
+  let coveredUpTo: number | null = null;
+  try {
+    coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
+  } catch {
+    coveredUpTo = null;
+  }
+  const afterCompaction = (record: SessionRecord): boolean =>
+    coveredUpTo === null || record.recordSeq > coveredUpTo;
+
   let contextTokens: number | null;
   let contextWindow: number | null;
   let latestSeq = -1;
@@ -76,8 +90,10 @@ export function sessionContextMetrics(
       if (record.runId !== measuredRunId) continue;
       const output = finiteToken(usageOf(record)?.output);
       const durationMs = record.message.durationMs;
-      // 累加必须先于 latestSeq 跳过：Context 只取最大 seq 那条，Speed 要覆盖本 Run 全部 Turn。
+      // 累加必须先于 latestSeq 跳过：Context 只取最大 seq 那条，Speed 要覆盖本 Run 压后全部 Turn。
+      // 压缩前测得的 Turn 属于被摘要替代的上下文，不计入 Speed（见 afterCompaction）。
       if (
+        afterCompaction(record) &&
         output !== null &&
         typeof durationMs === "number" &&
         Number.isFinite(durationMs) &&
@@ -98,15 +114,9 @@ export function sessionContextMetrics(
 
   // 最新 checkpoint 覆盖了被测量的 assistant（或该 Run 尚无 assistant）：实测是压缩前旧值，
   // 改用压后估算，与模型实际所见同构；新实测落盘后 recordSeq 超出覆盖范围，自动切回。
-  // checkpoint 损坏时无法判定实测是否过期，保持实测显示，状态栏不因此崩溃。
+  // checkpoint 损坏时 coveredUpTo 为 null，保持实测显示。
   let contextEstimated = false;
   if (contextEstimate !== null && measuredRunId !== null) {
-    let coveredUpTo: number | null = null;
-    try {
-      coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
-    } catch {
-      coveredUpTo = null;
-    }
     if (coveredUpTo !== null && (latestSeq < 0 || coveredUpTo >= latestSeq)) {
       contextTokens = contextEstimate;
       contextEstimated = true;
@@ -121,6 +131,8 @@ export function sessionContextMetrics(
   let cacheComplete = true;
   for (const record of assistants) {
     if (!countedRunIds.has(record.runId)) continue;
+    // 已被摘要覆盖的 usage 属于旧上下文，计入会与 Context 口径分裂。
+    if (!afterCompaction(record)) continue;
     const usage = usageOf(record);
     const input = finiteToken(usage?.input);
     const cacheRead = finiteToken(usage?.cacheRead);
@@ -212,7 +224,15 @@ export class StatusBar implements Component {
               : latest,
           -1,
         ) ?? -1;
-      this.refreshKey = `${state.history?.meta.sessionId ?? ""}:${activeRunId ?? "idle"}:${seq}`;
+      // checkpoint 追加会改变 Cache/Speed 口径，但既有 seq（assistant/run_finished）可能不变，
+      // 必须把 checkpoint 维度计入键，否则压缩后不会重算。
+      const checkpointSeq =
+        state.history?.records.reduce(
+          (latest, record) =>
+            record.type === "checkpoint" && record.recordSeq > latest ? record.recordSeq : latest,
+          -1,
+        ) ?? -1;
+      this.refreshKey = `${state.history?.meta.sessionId ?? ""}:${activeRunId ?? "idle"}:${seq}:${checkpointSeq}`;
     }
     const contextWindow = (state.core.session.runModel ?? state.core.session.model)?.contextWindow ?? null;
     const contextTokens = state.core.session.contextBaselineTokens;
