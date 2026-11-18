@@ -1413,6 +1413,75 @@ it("enables /compact when idle and derives the separator after the covered block
   }
 });
 
+it("passes /compact <focus> to the compactor", async () => {
+  let captured: string | undefined;
+  const { records, core } = compactionFixture(async (_signal, focus) => {
+    captured = focus;
+    records.push(checkpointRecord(3, 2));
+    return { status: "completed", coveredUpTo: 2, path: "primary" };
+  });
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact 关注认证流程");
+    await store.submit();
+    expect(captured).toBe("关注认证流程");
+    expect(store.getSnapshot().notice?.text).toBe("压缩完成");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("keeps multi-line /compact focus verbatim", async () => {
+  let captured: string | undefined;
+  const { core } = compactionFixture(async (_signal, focus) => {
+    captured = focus;
+    return { status: "noop", coveredUpTo: null, path: "primary" };
+  });
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact 第一行\n第二行");
+    await store.submit();
+    expect(captured).toBe("第一行\n第二行");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("passes no focus for bare /compact and keeps /compactfoo unknown", async () => {
+  const focuses: Array<string | undefined> = [];
+  const { core } = compactionFixture(async (_signal, focus) => {
+    focuses.push(focus);
+    return { status: "noop", coveredUpTo: null, path: "primary" };
+  });
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact");
+    await store.submit();
+    expect(focuses).toEqual([undefined]);
+    store.setDraft("/compactfoo");
+    await store.submit();
+    expect(focuses).toHaveLength(1);
+    expect(store.getSnapshot().notice?.text).toContain("未知命令");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("hides the command menu once /compact carries an argument", async () => {
+  const { core } = compactionFixture(async () => ({
+    status: "noop",
+    coveredUpTo: null,
+    path: "primary",
+  }));
+  const store = await loadedStore(core);
+  try {
+    store.setDraft("/compact 关注");
+    expect(store.commandOptions()).toEqual([]);
+  } finally {
+    await store.dispose();
+  }
+});
+
 it("anchors the compacted line after a cancelled run's outcome and duration lines", async () => {
   const { records, core } = compactionFixture(async () => ({
     status: "noop",

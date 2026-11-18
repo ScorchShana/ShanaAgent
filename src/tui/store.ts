@@ -561,6 +561,17 @@ export class TuiStore {
         );
       });
     }
+    const compact = /^\/compact(?:\s+([\s\S]*))?$/.exec(command);
+    if (compact) {
+      // 参数是本次压缩的附加重点：只透传给摘要请求，不落盘。
+      const focus = compact[1]?.trim() || undefined;
+      return this.command(async () => {
+        const outcome = await this.controller.compact(focus);
+        if (outcome.status === "completed") this.notice("压缩完成");
+        else if (outcome.status === "noop") this.notice("No context to compact");
+        else this.notice("压缩已取消");
+      });
+    }
     switch (command) {
       case "/effort":
         this.openModels(true);
@@ -577,13 +588,6 @@ export class TuiStore {
         return this.command(async () => {
           const sessions = await this.controller.listSessions();
           this.update({ modal: { kind: "sessions", selection: 0, sessions } });
-        });
-      case "/compact":
-        return this.command(async () => {
-          const outcome = await this.controller.compact();
-          if (outcome.status === "completed") this.notice("压缩完成");
-          else if (outcome.status === "noop") this.notice("No context to compact");
-          else this.notice("压缩已取消");
         });
       case "/cancel":
         this.cancel();
