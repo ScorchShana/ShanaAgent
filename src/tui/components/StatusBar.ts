@@ -54,25 +54,18 @@ export function sessionContextMetrics(
     activeRunId !== null && assistants.some((record) => record.runId === activeRunId);
   const measuredRunId: string | null = activeHasAssistant ? activeRunId : (lastFinished?.runId ?? null);
 
-  // 最新 checkpoint 是"压后实测"的起点：更早的 usage 属于被摘要替代的上下文，
-  // 继续计入 Cache/Speed 会与 Context 口径分裂。checkpoint 损坏时无法判定边界，保持全量聚合，
-  // 状态栏不因坏记录崩溃（与 Context 估算降级同一策略）。
-  // 残差：Run 内压缩保留最新 Turn（keepLatestTurn）时，该 Turn 的 usage 是压缩前请求测得的；
-  // 它落在边界之外仍会被计入，下一条新 assistant 落盘后自动消除，方向安全。
+  // 最新 checkpoint 的 coveredUpTo 只服务于 Context：被覆盖的实测是压缩前旧值，改用压后估算。
+  // checkpoint 损坏时无法判定覆盖范围，保持实测显示，状态栏不因坏记录崩溃。
   let coveredUpTo: number | null = null;
   try {
     coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
   } catch {
     coveredUpTo = null;
   }
-  const afterCompaction = (record: SessionRecord): boolean =>
-    coveredUpTo === null || record.recordSeq > coveredUpTo;
 
   let contextTokens: number | null;
   let contextWindow: number | null;
   let latestSeq = -1;
-  let outputSum = 0;
-  let durationMsSum = 0;
   if (measuredRunId === null) {
     contextWindow = finiteToken(fallback?.contextWindow);
     if (contextWindow === null)
@@ -88,20 +81,6 @@ export function sessionContextMetrics(
     contextTokens = null;
     for (const record of assistants) {
       if (record.runId !== measuredRunId) continue;
-      const output = finiteToken(usageOf(record)?.output);
-      const durationMs = record.message.durationMs;
-      // 累加必须先于 latestSeq 跳过：Context 只取最大 seq 那条，Speed 要覆盖本 Run 压后全部 Turn。
-      // 压缩前测得的 Turn 属于被摘要替代的上下文，不计入 Speed（见 afterCompaction）。
-      if (
-        afterCompaction(record) &&
-        output !== null &&
-        typeof durationMs === "number" &&
-        Number.isFinite(durationMs) &&
-        durationMs > 0
-      ) {
-        outputSum += output;
-        durationMsSum += durationMs;
-      }
       if (record.recordSeq < latestSeq) continue;
       latestSeq = record.recordSeq;
       contextTokens = finiteToken(usageOf(record)?.totalTokens);
@@ -126,22 +105,51 @@ export function sessionContextMetrics(
   const countedRunIds = new Set(finished.map((record) => record.runId));
   if (activeRunId !== null) countedRunIds.add(activeRunId);
 
+  // Cache/Speed 是整段对话的累计口径：跨 Run、跨压缩都持续累加，压缩不重置。
+  // 摘要请求本身也是真实请求，其用量随 checkpoint 落盘并计入同一累计（重启 / /resume 后仍完整）。
   let inputSum = 0;
   let cacheReadSum = 0;
   let cacheComplete = true;
+  let outputSum = 0;
+  let durationMsSum = 0;
   for (const record of assistants) {
     if (!countedRunIds.has(record.runId)) continue;
-    // 已被摘要覆盖的 usage 属于旧上下文，计入会与 Context 口径分裂。
-    if (!afterCompaction(record)) continue;
     const usage = usageOf(record);
     const input = finiteToken(usage?.input);
     const cacheRead = finiteToken(usage?.cacheRead);
     if (input === null || cacheRead === null) {
       cacheComplete = false;
-      continue;
+    } else {
+      inputSum += input;
+      cacheReadSum += cacheRead;
     }
+    const output = finiteToken(usage?.output);
+    const durationMs = record.message.durationMs;
+    if (output !== null && typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs > 0) {
+      outputSum += output;
+      durationMsSum += durationMs;
+    }
+  }
+  for (const record of records) {
+    if (record.type !== "checkpoint") continue;
+    // 旧 checkpoint 无 usage（记录层可选）。字段非法时整条忽略（不补零、不部分采信），状态栏不崩。
+    const usage = record.usage;
+    const input = finiteToken(usage?.input);
+    const cacheRead = finiteToken(usage?.cacheRead);
+    const output = finiteToken(usage?.output);
+    if (input === null || cacheRead === null || output === null) continue;
+    const durationMs = usage?.durationMs;
+    const durationValid =
+      durationMs === undefined ||
+      (typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0);
+    if (!durationValid) continue;
     inputSum += input;
     cacheReadSum += cacheRead;
+    // 摘要请求耗时缺省（Provider 未报告）或为 0 时只计 token、不计速度。
+    if (durationMs !== undefined && durationMs > 0) {
+      outputSum += output;
+      durationMsSum += durationMs;
+    }
   }
 
   const denominator = inputSum + cacheReadSum;
