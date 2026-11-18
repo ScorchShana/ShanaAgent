@@ -17,6 +17,7 @@ export const DEFAULT_MOUSE_SCROLL_LINES = 3;
 export const DEFAULT_ESCAPE_TIMEOUT_MS = 30;
 export const DEFAULT_SHELL_TIMEOUT_MS = 120_000;
 export const DEFAULT_EDIT_MAX_FILE_BYTES = 16_777_216;
+export const DEFAULT_VIEW_IMAGE_MAX_BYTES = 5_242_880;
 export const DEFAULT_GLOB_TIMEOUT_MS = 30_000;
 export const DEFAULT_GREP_STDERR_MAX_CHARS = 4_000;
 export const DEFAULT_COMPACTION_THRESHOLD_RATIO = 0.8;
@@ -53,6 +54,7 @@ export interface Settings {
   escapeTimeoutMs: number;
   logLevel: LogLevel;
   editMaxFileBytes: number;
+  viewImageMaxBytes: number;
   globTimeoutMs: number;
   grepStderrMaxChars: number;
   compactionThresholdRatio: number;
@@ -98,6 +100,7 @@ export function parseSettings(raw: unknown): Settings {
       key !== "escapeTimeoutMs" &&
       key !== "logLevel" &&
       key !== "editMaxFileBytes" &&
+      key !== "viewImageMaxBytes" &&
       key !== "globTimeoutMs" &&
       key !== "grepStderrMaxChars" &&
       key !== "compactionThresholdRatio" &&
@@ -188,6 +191,7 @@ export function parseSettings(raw: unknown): Settings {
     ["ctrlCExitWindowMs", 1, 2_147_483_647],
     ["decisionTimeoutMs", 1, 2_147_483_647],
     ["editMaxFileBytes", 1, 16_777_216],
+    ["viewImageMaxBytes", 1024, 16_777_216],
     ["globTimeoutMs", 1000, 120_000],
     ["grepStderrMaxChars", 64, 65_536],
     ["mouseScrollLines", 1, 100],
@@ -246,6 +250,7 @@ export function parseSettings(raw: unknown): Settings {
     escapeTimeoutMs: (raw.escapeTimeoutMs as number | undefined) ?? DEFAULT_ESCAPE_TIMEOUT_MS,
     logLevel: (logLevel as LogLevel | undefined) ?? DEFAULT_LOG_LEVEL,
     editMaxFileBytes: (raw.editMaxFileBytes as number | undefined) ?? DEFAULT_EDIT_MAX_FILE_BYTES,
+    viewImageMaxBytes: (raw.viewImageMaxBytes as number | undefined) ?? DEFAULT_VIEW_IMAGE_MAX_BYTES,
     globTimeoutMs: (raw.globTimeoutMs as number | undefined) ?? DEFAULT_GLOB_TIMEOUT_MS,
     grepStderrMaxChars: (raw.grepStderrMaxChars as number | undefined) ?? DEFAULT_GREP_STDERR_MAX_CHARS,
     compactionThresholdRatio:

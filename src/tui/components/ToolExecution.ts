@@ -4,6 +4,7 @@ import { approvalSummaryLines } from "./ApprovalDialog.js";
 import { diffDisplayRows, styleDiffRow } from "./DiffView.js";
 import { stripVTControlCharacters } from "node:util";
 import {
+  Image,
   VStack,
   visibleWidth,
   MouseRegion,
@@ -63,6 +64,7 @@ export class ToolExecution implements Component {
   private commandSource?: string;
   private commandPreview = "";
   private readCode?: string[];
+  private image?: Image;
   private tree: VStack;
   private diff: HistoricalDiff;
   private diffItem?: ConversationItem;
@@ -159,6 +161,7 @@ export class ToolExecution implements Component {
     }
     if (old.result !== item.result || old.call !== item.call || this.readCode === undefined)
       this.readCode = highlightedReadContent(item);
+    if (old.result !== item.result) this.image = undefined;
     if (item.role === "diff") this.diff.update(item);
     else if (this.diffItem) this.diff.update(this.diffItem);
   }
@@ -174,6 +177,7 @@ export class ToolExecution implements Component {
   }
   invalidate() {
     this.tree.invalidate();
+    this.image?.invalidate();
   }
   private hits(row: string | undefined, x: number) {
     return row !== undefined && x >= 0 && x < visibleWidth(stripVTControlCharacters(row).trimEnd());
@@ -273,7 +277,7 @@ export class ToolExecution implements Component {
     const available = this.bodyWidth(width);
     const rows = resultRenderer(this.item.call?.name ?? "")(content, available, this.readCode);
     const limit = this.store.settings.toolResultPreviewLines;
-    return [
+    const output = [
       ...title,
       ...(this.item.call?.name === "bash" ? [""] : []),
       ...(this.resultsExpanded ? rows : rows.slice(0, limit)).map((row) =>
@@ -283,5 +287,27 @@ export class ToolExecution implements Component {
         ? [this.rail(truncateToWidth("点击结果展开全部", this.bodyWidth(width)), width)]
         : []),
     ];
+    const img = this.item.result.images?.[0];
+    // failed/compacted 卡片不渲染 image：render() 的 dim 会 stripVT 撕掉 kitty 序列。
+    if (
+      this.item.call?.name === "view_image" &&
+      this.item.result.status === "success" &&
+      img &&
+      !this.item.failed &&
+      !this.item.compacted
+    ) {
+      const args = this.item.call.parse.status === "parsed" ? this.item.call.parse.arguments : undefined;
+      this.image ??= new Image(
+        img.data,
+        img.mimeType,
+        { fallbackColor: theme.muted },
+        // 不传 maxWidthCells：render(width) 自适应；记录宽高免 TUI 重解析。
+        { maxHeightCells: 14, filename: String(args?.path ?? "") },
+        { widthPx: img.width, heightPx: img.height },
+      );
+      // 原子追加原始行：不 rail/不 wrap/不 sanitize/不切片，展开即显示。
+      output.push(...this.image.render(available));
+    }
+    return output;
   }
 }

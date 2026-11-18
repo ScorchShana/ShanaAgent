@@ -1,6 +1,6 @@
 import { fileOperationError } from "./write.js";
 import { parseSettings, type Settings } from "../llm/settings-store.js";
-import type { StoredToolCall } from "../sessions/records.js";
+import type { StoredToolCall, ToolResultImage } from "../sessions/records.js";
 import type { PermissionDenyReason } from "../security/approval-manager.js";
 import {
   createPathPolicy,
@@ -49,6 +49,8 @@ export interface ToolExecutionResult {
   errorCategory?: ToolErrorCategory;
   termination?: ToolOutcome["termination"];
   priorContent?: string;
+  // 仅 view_image 成功结果携带；错误/取消/拒绝路径不携带。
+  images?: ToolResultImage[];
 }
 
 export interface ToolExecutorOptions {
@@ -57,7 +59,9 @@ export interface ToolExecutorOptions {
   onCleanupWarning?: (temporaryPath: string) => void;
   onPendingShell?: (cleanup: import("./shell.js").PendingShellCleanup) => void;
   onToolOutput?: (toolCallId: string, snapshot: string) => void;
-  settings?: Pick<Settings, "editMaxFileBytes" | "globTimeoutMs" | "grepStderrMaxChars">;
+  settings?: Pick<Settings, "editMaxFileBytes" | "viewImageMaxBytes" | "globTimeoutMs" | "grepStderrMaxChars">;
+  // 当前模型接受 image 输入时注册 view_image；默认 false（六工具）。
+  imageInput?: boolean;
   permissionGate?: ToolPermissionGate;
   platform?: NodeJS.Platform;
   registry?: ToolRegistry;
@@ -77,7 +81,9 @@ export class ToolExecutor {
     this.#options = { ...options, settings: parseSettings(options.settings) };
     const platform = options.platform ?? process.platform;
     this.#pathPolicy = options.pathPolicy ?? createPathPolicy(options.workspaceRoot, platform);
-    this.#registry = options.registry ?? createToolRegistry(platform, options.settings);
+    this.#registry =
+      options.registry ??
+      createToolRegistry(platform, this.#options.settings, undefined, options.imageInput ?? false);
   }
 
   get registry(): ToolRegistry {
@@ -178,6 +184,7 @@ export class ToolExecutor {
       errorCategory: outcome.category,
       termination: outcome.termination,
       ...(outcome.priorContent !== undefined ? { priorContent: outcome.priorContent } : {}),
+      ...(outcome.images !== undefined ? { images: outcome.images } : {}),
     };
   }
 

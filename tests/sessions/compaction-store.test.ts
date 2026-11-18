@@ -3,10 +3,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { StopReason } from "@earendil-works/pi-ai";
 import {
   CONTEXT_SAFETY_MARGIN_TOKENS,
+  IMAGE_COMPACTION_OMITTED_TEXT,
+  IMAGE_OMITTED_TEXT,
   buildContext,
   estimateContextTokens,
   estimateTokens,
   planCompaction,
+  toolResultMessage,
   wrapConversationSummary,
 } from "../../src/core/context-builder.js";
 import type { StoredContext } from "../../src/llm/history-replay.js";
@@ -31,6 +34,7 @@ import {
   makeAssistantMessage,
   makeAssistantRecord,
   makeCheckpointRecord,
+  makePngImage,
   makeStore,
   makeToolResultRecord,
   makeUserPromptRecord,
@@ -598,5 +602,95 @@ describe("思考头部空间与 no-force", () => {
     await expect(compactHistory(thinking.options)).rejects.toThrow("仍超出预算");
     expect(thinking.requests).toHaveLength(0);
     expect(thinking.appended).toHaveLength(0);
+  });
+});
+
+describe("含图历史双模态压缩", () => {
+  function makeImageRecords(): SessionRecord[] {
+    return [
+      makeUserPromptRecord(1, "run-1", "look"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "view_image" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success", {
+        toolName: "view_image",
+        content: "(Image attached: image/png.)",
+        images: [makePngImage(1920, 1080)], // 2765 image tokens
+      }),
+      makeAssistantRecord(4, "run-1", [{ id: "c2", name: "read" }]),
+      makeToolResultRecord(5, "run-1", "c2", "success"),
+    ];
+  }
+
+  // makeContext 只产纯文本；按能力用 toolResultMessage 重建 toolResult 消息。
+  function makeImageContext(records: readonly SessionRecord[], imageInput: boolean): StoredContext {
+    const context = makeContext(records);
+    context.messages = context.messages.map((message) => {
+      if (message.role !== "toolResult") return message;
+      const record = records.find(
+        (candidate) => candidate.type === "tool_result" && candidate.toolCallId === message.toolCallId,
+      );
+      return record?.type === "tool_result" ? toolResultMessage(record, imageInput) : message;
+    });
+    return context;
+  }
+
+  it("主路径视觉模型：摘要请求原样携带 image 块", async () => {
+    const records = makeImageRecords();
+    const h = harness({
+      records,
+      context: makeImageContext(records, true),
+      model: makeModel({ input: ["text", "image"] }),
+    });
+    const outcome = await compactHistory(h.options);
+    expect(outcome).toEqual({ status: "completed", coveredUpTo: 5, path: "primary" });
+    expect(JSON.stringify(h.requests[0]!.context.messages)).toContain('"type":"image"');
+  });
+
+  it("主路径非视觉模型：摘要请求为占位文本，无 image 块", async () => {
+    const records = makeImageRecords();
+    const h = harness({ records, context: makeImageContext(records, false) });
+    const outcome = await compactHistory(h.options);
+    expect(outcome).toMatchObject({ status: "completed", path: "primary" });
+    const serialized = JSON.stringify(h.requests[0]!.context.messages);
+    expect(serialized).not.toContain('"type":"image"');
+    expect(serialized).toContain(IMAGE_OMITTED_TEXT);
+  });
+
+  it("imageInput 随 model.input 透传：同一预算下视觉少保留 Turn、非视觉 noop", async () => {
+    const records = makeImageRecords();
+    const vision = harness({
+      records,
+      context: makeImageContext(records, true),
+      model: makeModel({ input: ["text", "image"] }),
+      keepLatestTurn: true,
+      retainedContextBudget: 100,
+    });
+    // 最新 Turn 是小文本；含图 Turn 2765 tokens 超预算 → 被覆盖。
+    expect(await compactHistory(vision.options)).toMatchObject({ status: "completed", coveredUpTo: 3 });
+    const text = harness({
+      records,
+      context: makeImageContext(records, false),
+      keepLatestTurn: true,
+      retainedContextBudget: 100,
+    });
+    expect(await compactHistory(text.options)).toEqual({ status: "noop", coveredUpTo: null, path: "primary" });
+    expect(text.requests).toHaveLength(0);
+  });
+
+  it("fallback 视觉模型：阶梯丢图换占位后请求无 image 块且 tools 为空", async () => {
+    const records = makeImageRecords();
+    const h = harness({
+      records,
+      context: makeImageContext(records, true),
+      // 窗口 10000：摘要目标 4096 + 安全边距 4096 后余量 ≈1800 < 2765 image tokens，
+      // 主路径判定超窗 → fallback，base 超预算 → 第一档即丢图收敛。
+      model: makeModel({ input: ["text", "image"], contextWindow: 10000 }),
+    });
+    const outcome = await compactHistory(h.options);
+    expect(outcome).toEqual({ status: "completed", coveredUpTo: 5, path: "fallback" });
+    const request = h.requests[0]!;
+    expect(request.context.tools).toEqual([]);
+    const serialized = JSON.stringify(request.context.messages);
+    expect(serialized).not.toContain('"type":"image"');
+    expect(serialized).toContain(IMAGE_COMPACTION_OMITTED_TEXT);
   });
 });

@@ -256,6 +256,42 @@ describe("V12 priorContent 快照", () => {
   });
 });
 
+describe("view_image images 大行持久化", () => {
+  it("~5 MiB base64 单行 append/load 原样读回；尾撕裂按完整前缀恢复", async () => {
+    const { store } = makeStore({ now: fixedNow() });
+    const ref = sessionRef("s-image");
+    await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: "s-image" });
+    await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
+    await store.appendRecord(ref, {
+      type: "assistant_message",
+      runId: "run-1",
+      message: makeAssistantMessage([{ id: "c1", name: "view_image" }]),
+    });
+    const data = "A".repeat(6_990_508);
+    const appended = await store.appendRecord(ref, {
+      type: "tool_result",
+      assistantRecordSeq: 2,
+      runId: "run-1",
+      toolCallId: "c1",
+      toolName: "view_image",
+      status: "success",
+      content: "(Image attached: image/png, 1920x1080.)",
+      images: [{ data, mimeType: "image/png", width: 1920, height: 1080 }],
+    });
+    const loaded = await store.loadSession(ref);
+    expect(loaded.warnings).toEqual([]);
+    expect(loaded.records[2]).toEqual(appended);
+
+    // 模拟崩溃窗口的半截尾行：完整前缀原样恢复，原文件不被修改。
+    const messagesPath = messagesPathOf(store.sessionsDir, ref);
+    fs.appendFileSync(messagesPath, '{"recordSeq":4,"ts":"2026-10-27T10:00:00.000Z","type":"user_pr');
+    const torn = await store.loadSession(ref);
+    expect(torn.warnings).toHaveLength(1);
+    expect(torn.warnings[0]?.kind).toBe("tail_truncated");
+    expect(torn.records).toEqual(loaded.records);
+  });
+});
+
 describe("V2 版本门", () => {
   it("meta.json 版本不识别时拒绝加载并报告版本，文件不变", async () => {
     const { store } = makeStore();
@@ -264,7 +300,7 @@ describe("V2 版本门", () => {
     await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
 
     const metaPath = metaPathOf(store.sessionsDir, ref);
-    const tampered = fs.readFileSync(metaPath, "utf8").replace('"version":2', '"version":99');
+    const tampered = fs.readFileSync(metaPath, "utf8").replace('"version":3', '"version":99');
     fs.writeFileSync(metaPath, tampered);
 
     const error = await store.loadSession(ref).catch((caught: unknown) => caught);
@@ -280,7 +316,7 @@ describe("V2 版本门", () => {
     await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
 
     const messagesPath = messagesPathOf(store.sessionsDir, ref);
-    const tampered = fs.readFileSync(messagesPath, "utf8").replace('"version":2', '"version":99');
+    const tampered = fs.readFileSync(messagesPath, "utf8").replace('"version":3', '"version":99');
     fs.writeFileSync(messagesPath, tampered);
 
     const error = await store.loadSession(ref).catch((caught: unknown) => caught);
@@ -358,15 +394,37 @@ describe("V11 查询接口", () => {
     const otherMetaPath = metaPathOf(store.sessionsDir, otherRef);
     fs.writeFileSync(
       otherMetaPath,
-      fs.readFileSync(otherMetaPath, "utf8").replace('"version":2', '"version":99'),
+      fs.readFileSync(otherMetaPath, "utf8").replace('"version":3', '"version":99'),
     );
 
     const listed = await store.listSessions(WORKSPACE_ID);
     expect(listed.map((meta) => meta.sessionId)).toEqual(["s2", "s1"]);
     expect(listed.every((meta) => meta.workspaceId === WORKSPACE_ID)).toBe(true);
 
-    await expect(store.listSessions(otherWorkspace)).rejects.toBeInstanceOf(SessionVersionError);
+    // 不支持版本的 Session 跳过而非抛穿整个列表（v3 硬切后目录里可能残留 v2）。
+    expect(await store.listSessions(otherWorkspace)).toEqual([]);
     expect(await store.listSessions("nonexistent-workspace-0000")).toEqual([]);
+  });
+
+  it("混版目录只列 v3；v2 Session 拒载但文件保留", async () => {
+    const { store } = makeStore();
+    await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: "new" });
+    const oldRef = sessionRef("old");
+    await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: "old" });
+    await store.appendRecord(oldRef, { type: "user_prompt", runId: "r", text: "legacy" });
+    const oldMetaPath = metaPathOf(store.sessionsDir, oldRef);
+    const oldMessagesPath = messagesPathOf(store.sessionsDir, oldRef);
+    const oldMeta = fs.readFileSync(oldMetaPath, "utf8").replace('"version":3', '"version":2');
+    const oldMessages = fs.readFileSync(oldMessagesPath, "utf8").replace('"version":3', '"version":2');
+    fs.writeFileSync(oldMetaPath, oldMeta);
+    fs.writeFileSync(oldMessagesPath, oldMessages);
+
+    expect((await store.listSessions(WORKSPACE_ID)).map((meta) => meta.sessionId)).toEqual(["new"]);
+    const error = await store.loadSession(oldRef).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(SessionVersionError);
+    expect((error as SessionVersionError).foundVersion).toBe(2);
+    expect(fs.readFileSync(oldMetaPath, "utf8")).toBe(oldMeta);
+    expect(fs.readFileSync(oldMessagesPath, "utf8")).toBe(oldMessages);
   });
 
   it("readHistory 按 recordSeq 顺序返回并支持增量读取，不改文件", async () => {

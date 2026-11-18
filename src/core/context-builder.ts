@@ -20,6 +20,7 @@ import {
   responseExclusionReason,
   type ResponseExclusionReason,
 } from "../sessions/recovery.js";
+import { estimateImageTokens } from "../tools/image-header.js";
 
 // invalid_turn：协议损坏（非法 call 身份、多余/错配结果），正常落盘路径不会产生，防御性排除。
 export type TurnExclusionReason =
@@ -90,6 +91,7 @@ export function estimateMessageTokens(
     if (block.type === "text") total += estimateTokens(block.text, options);
     else if (block.type === "thinking") total += estimateTokens(block.thinking, options);
     else if (block.type === "toolCall") total += estimateTokens(block.rawArguments, options);
+    else if (block.type === "image") total += estimateImageTokens(block.data);
   }
   return total;
 }
@@ -304,6 +306,8 @@ export interface BuildContextInput {
   environment?: string;
   // 调用方传入的 Session 冻结快照；缺省时在本函数内读取一次（测试或独立调用）。
   agentsMd?: AgentsMdLoad;
+  // 当前模型是否接受 image 输入；false 时含图结果渲染为显式占位（默认 true）。
+  imageInput?: boolean;
   now?: () => Date;
 }
 
@@ -330,12 +334,29 @@ function summaryMessage(checkpoint: CheckpointRecord): UserMessage {
   };
 }
 
-function toolResultMessage(record: ToolResultRecord): ToolResultMessage {
+// 非视觉模型的渲染期占位：记录永久保留（I5），切回视觉模型后图片可逆恢复。
+export const IMAGE_OMITTED_TEXT = "[Image omitted: the current model does not accept image input.]";
+export const IMAGE_COMPACTION_OMITTED_TEXT = "[image omitted during compaction]";
+
+export function toolResultMessage(record: ToolResultRecord, imageInput = true): ToolResultMessage {
   return {
     role: "toolResult",
     toolCallId: record.toolCallId,
     toolName: record.toolName,
-    content: [{ type: "text", text: record.content }],
+    // image 块字段序 {type,data,mimeType} 与 agent-loop Run 内构造逐字段同序：
+    // 锚定前缀同一性用 JSON.stringify 比较（sameSentMessage），字段乱序会误判 prefix_mismatch。
+    content: [
+      { type: "text", text: record.content },
+      ...(imageInput
+        ? (record.images ?? []).map((image) => ({
+            type: "image" as const,
+            data: image.data,
+            mimeType: image.mimeType,
+          }))
+        : record.images?.length
+          ? [{ type: "text" as const, text: IMAGE_OMITTED_TEXT }]
+          : []),
+    ],
     isError: record.status !== "success",
     timestamp: Date.parse(record.ts),
   };
@@ -388,7 +409,7 @@ function assistantWithoutThinking(message: StoredAssistantMessage): StoredAssist
 
 // eligible Turn → 上下文消息：assistant（aborted 归一化并剥离 thinking）+ 按 call 顺序的工具结果
 // （缺结果合成 unknown 占位）+ 中断/未知标注。buildContext 与 planCompaction 共用，保证压缩与正式请求同构。
-export function turnMessages(turn: EligibleTurn): StoredContext["messages"] {
+export function turnMessages(turn: EligibleTurn, imageInput = true): StoredContext["messages"] {
   const aborted = turn.assistant.message.stopReason === "aborted";
   const message = aborted
     ? assistantWithoutThinking(normalizeAbortedMessage(turn.assistant.message))
@@ -399,7 +420,7 @@ export function turnMessages(turn: EligibleTurn): StoredContext["messages"] {
     const result = byCallId.get(call.id);
     messages.push(
       result !== undefined
-        ? toolResultMessage(result)
+        ? toolResultMessage(result, imageInput)
         : syntheticUnknownResultMessage({ toolCallId: call.id, toolName: call.name }, turn.assistant.ts),
     );
   }
@@ -434,7 +455,7 @@ export async function buildContext(input: BuildContextInput): Promise<BuiltConte
       messages.push(...zeroTurnAnnotations(run));
     }
     for (const turn of run.turns) {
-      messages.push(...turnMessages(turn));
+      messages.push(...turnMessages(turn, input.imageInput ?? true));
     }
   }
   if (input.currentPrompt !== undefined) {
@@ -479,6 +500,8 @@ export interface PlanCompactionOptions {
   keepLatestTurn: boolean;
   retainedContextBudget: number;
   tokenEstimate: TokenEstimateOptions;
+  // 与正式请求同构：预算估算和摘要输入消息都按当前模型能力渲染 image 块。
+  imageInput?: boolean;
 }
 
 interface PlannedTurn {
@@ -492,10 +515,14 @@ function turnBoundary(turn: EligibleTurn): number {
   return boundary;
 }
 
-function estimateTurnTokens(turn: EligibleTurn, tokenEstimate: TokenEstimateOptions): number {
+function estimateTurnTokens(
+  turn: EligibleTurn,
+  tokenEstimate: TokenEstimateOptions,
+  imageInput = true,
+): number {
   let total = estimateMessageTokens(turn.assistant.message, tokenEstimate);
   for (const result of turn.results) {
-    total += estimateMessageTokens(toolResultMessage(result), tokenEstimate);
+    total += estimateMessageTokens(toolResultMessage(result, imageInput), tokenEstimate);
   }
   // 合成占位与标注同样发送给 Provider，计入预算才不会高估可保留尾部。
   for (const call of turn.missingCalls) {
@@ -530,6 +557,7 @@ export function planCompaction(
   options: PlanCompactionOptions,
 ): CompactionSelection | { status: "noop" } {
   const plan = planEffectiveContext(records);
+  const imageInput = options.imageInput ?? true;
   const planned: PlannedTurn[] = [];
   for (const run of plan.runs) {
     for (const turn of run.turns) planned.push({ run, turn });
@@ -550,11 +578,11 @@ export function planCompaction(
     const latestIndex = planned.length - 1;
     const latest = planned[latestIndex]!;
     tailStart = latestIndex;
-    let retained = estimateTurnTokens(latest.turn, options.tokenEstimate);
+    let retained = estimateTurnTokens(latest.turn, options.tokenEstimate, imageInput);
     if (firstTurnOfRun.get(latest.run) === latestIndex) retained += promptTokens(latest.run);
     for (let index = latestIndex - 1; index >= 0; index -= 1) {
       const candidate = planned[index]!;
-      let cost = estimateTurnTokens(candidate.turn, options.tokenEstimate);
+      let cost = estimateTurnTokens(candidate.turn, options.tokenEstimate, imageInput);
       if (firstTurnOfRun.get(candidate.run) === index) cost += promptTokens(candidate.run);
       if (retained + cost > options.retainedContextBudget) break;
       retained += cost;
@@ -578,7 +606,7 @@ export function planCompaction(
       messages.push(...zeroTurnAnnotations(run));
     }
     for (const turn of turns) {
-      messages.push(...turnMessages(turn));
+      messages.push(...turnMessages(turn, imageInput));
     }
   }
   assertCandidateCheckpointValid(records, coveredUpTo);
@@ -621,8 +649,14 @@ function trimToolResults(messages: StoredContext["messages"], limit: number): St
     if (message.role !== "toolResult") return message;
     return {
       ...message,
+      // 阶梯每档（含 factor 1）都丢图换占位：摘要是文本请求，image 块只膨胀预算；
+      // base 未超预算的路径保留原图。
       content: message.content.map((block) =>
-        block.type === "text" ? { ...block, text: trimToolResultText(block.text, limit) } : block,
+        block.type === "text"
+          ? { ...block, text: trimToolResultText(block.text, limit) }
+          : block.type === "image"
+            ? { type: "text" as const, text: IMAGE_COMPACTION_OMITTED_TEXT }
+            : block,
       ),
     };
   });

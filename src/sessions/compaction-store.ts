@@ -70,6 +70,8 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
     keepLatestTurn: options.keepLatestTurn,
     retainedContextBudget: options.retainedContextBudget,
     tokenEstimate,
+    // 与调用方预构建 context 同能力渲染，预算与摘要输入才与正式请求同构。
+    imageInput: model.input.includes("image"),
   });
   if ("status" in selection) return { status: "noop", coveredUpTo: null, path: "primary" };
 

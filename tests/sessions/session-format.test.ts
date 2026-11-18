@@ -18,7 +18,7 @@ import {
 } from "./helpers.js";
 
 afterEach(cleanupTempDirs);
-describe("Session v2", () => {
+describe("Session v3", () => {
   it("rejects nonfinite parsed objects at the storage boundary", () => {
     const a = makeAssistantRecord(2, "r", [{ id: "x", name: "read", arguments: { nested: [Infinity] } }]);
     expect(() => parseSessionRecord(a, { expectVersion: false })).toThrow();
@@ -100,10 +100,11 @@ describe("Session v2", () => {
     expect((await context(before.records)).context).toEqual((await context(copy.records)).context);
     expect(JSON.stringify((await context(copy.records)).context)).not.toContain("snapshot-only");
     expect(JSON.stringify(copy.records)).toContain("synthetic-key");
+    // v3 硬切：旧 v2 meta 拒载、不迁移、文件不修改。
     const bytes = fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8");
-    fs.writeFileSync(metaPathOf(store.sessionsDir, ref), bytes.replace('"version":2', '"version":1'));
-    await expect(store.loadSession(ref)).rejects.toThrow(/版本 1/);
-    expect(fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8")).toContain('"version":1');
+    fs.writeFileSync(metaPathOf(store.sessionsDir, ref), bytes.replace('"version":3', '"version":2'));
+    await expect(store.loadSession(ref)).rejects.toThrow(/版本 2/);
+    expect(fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8")).toContain('"version":2');
     expect(fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8")).toContain("synthetic-key");
   });
   it("does not admit later turns in the same run through a checkpoint after an incomplete turn", () => {

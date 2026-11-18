@@ -10,6 +10,7 @@ const TOOL_SUMMARY_FIELDS: Record<string, readonly string[]> = {
   grep: ["pattern", "path", "glob", "limit"],
   write: ["path"],
   edit: ["path"],
+  view_image: ["path"],
 };
 const TOOL_ARGUMENT_DEFAULTS: Record<string, Record<string, unknown>> = {
   read: { offset: 1, limit: 2000 },
@@ -194,6 +195,7 @@ const renderers: Record<string, ResultRenderer> = {
   bash: (content, width) => bashResultDisplay(content, width).lines,
   write: (content, width) => plainResult(content, width),
   edit: (content, width) => plainResult(content, width),
+  view_image: (content, width) => plainResult(content, width),
 };
 const plainResult: ResultRenderer = (content, width) =>
   new Text(sanitizeDisplayText(content), 0, 0).render(width).map((text) => ({ text, soft: false }));

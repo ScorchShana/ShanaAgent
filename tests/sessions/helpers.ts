@@ -10,6 +10,7 @@ import type {
   RunFinishedRecord,
   RunModelSnapshot,
   SessionRunOutcome,
+  ToolResultImage,
   ToolResultRecord,
   ToolResultStatus,
   UserPromptRecord,
@@ -134,7 +135,12 @@ export function makeToolResultRecord(
   runId: string,
   toolCallId: string,
   status: ToolResultStatus,
-  options: { toolName?: string; content?: string; assistantRecordSeq?: number } = {},
+  options: {
+    toolName?: string;
+    content?: string;
+    assistantRecordSeq?: number;
+    images?: ToolResultImage[];
+  } = {},
 ): ToolResultRecord {
   return {
     recordSeq,
@@ -146,7 +152,19 @@ export function makeToolResultRecord(
     toolName: options.toolName ?? "read",
     status,
     content: options.content ?? "ok",
+    ...(options.images !== undefined ? { images: options.images } : {}),
   };
+}
+
+// 真实 PNG 头部（IHDR 宽高合法），供 images 块与估算测试共用。
+export function makePngImage(width = 4, height = 3): ToolResultImage {
+  const bytes = Buffer.alloc(33);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(bytes, 0);
+  bytes.writeUInt32BE(13, 8);
+  bytes.write("IHDR", 12, "ascii");
+  bytes.writeUInt32BE(width, 16);
+  bytes.writeUInt32BE(height, 20);
+  return { data: bytes.toString("base64"), mimeType: "image/png", width, height };
 }
 
 export function makeCheckpointRecord(

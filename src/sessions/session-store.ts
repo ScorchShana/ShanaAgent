@@ -675,7 +675,8 @@ export class SessionStore {
       try {
         metas.push(await this.readMeta({ workspaceId, sessionId: entry.name }));
       } catch (error) {
-        if (error instanceof SessionNotFoundError) continue;
+        // 只列出可打开的 Session：旧格式（如 v2）跳过而非抛穿整个列表；目录保留不删除。
+        if (error instanceof SessionNotFoundError || error instanceof SessionVersionError) continue;
         throw error;
       }
     }
