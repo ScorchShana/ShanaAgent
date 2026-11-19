@@ -18,7 +18,7 @@ import {
 } from "./helpers.js";
 
 afterEach(cleanupTempDirs);
-describe("Session v4", () => {
+describe("Session v5", () => {
   it("rejects nonfinite parsed objects at the storage boundary", () => {
     const a = makeAssistantRecord(2, "r", [{ id: "x", name: "read", arguments: { nested: [Infinity] } }]);
     expect(() => parseSessionRecord(a, { expectVersion: false })).toThrow();
@@ -100,11 +100,11 @@ describe("Session v4", () => {
     expect((await context(before.records)).context).toEqual((await context(copy.records)).context);
     expect(JSON.stringify((await context(copy.records)).context)).not.toContain("snapshot-only");
     expect(JSON.stringify(copy.records)).toContain("synthetic-key");
-    // v4 硬切：旧 v3 meta 拒载、不迁移、文件不修改。
+    // v5 硬切：旧 v4 meta 拒载、不迁移、文件不修改。
     const bytes = fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8");
-    fs.writeFileSync(metaPathOf(store.sessionsDir, ref), bytes.replace('"version":4', '"version":3'));
-    await expect(store.loadSession(ref)).rejects.toThrow(/版本 3/);
-    expect(fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8")).toContain('"version":3');
+    fs.writeFileSync(metaPathOf(store.sessionsDir, ref), bytes.replace('"version":5', '"version":4'));
+    await expect(store.loadSession(ref)).rejects.toThrow(/版本 4/);
+    expect(fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8")).toContain('"version":4');
     expect(fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8")).toContain("synthetic-key");
   });
   it("does not admit later turns in the same run through a checkpoint after an incomplete turn", () => {

@@ -1,4 +1,5 @@
 import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
+import path from "node:path";
 
 import type { ArgumentParse } from "../llm/argument-parser.js";
 import { hasNonFiniteNumber } from "../llm/argument-parser.js";
@@ -14,7 +15,7 @@ export type StoredAssistantMessage = Omit<AssistantMessage, "content"> & {
   content: (Exclude<AssistantMessage["content"][number], { type: "toolCall" }> | StoredToolCall)[];
 };
 
-export const SESSION_FORMAT_VERSION = 4;
+export const SESSION_FORMAT_VERSION = 5;
 
 export const SESSION_RECORD_TYPES = [
   "user_prompt",
@@ -68,10 +69,23 @@ interface RecordBase {
   version?: number;
 }
 
+// skill 名唯一字符集（大小写敏感）：加载器与记录校验共用，同时拒绝 ../、绝对路径与 NUL。
+export const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
+
+// 提交时快照：content 为剥 frontmatter 后正文，location 为 SKILL.md realpath 绝对路径。
+// 渲染展开是 (text, skill) 的纯函数，压缩/回放天然同构，无需重读磁盘。
+export interface SkillSnapshot {
+  name: string;
+  location: string;
+  content: string;
+}
+
 export interface UserPromptRecord extends RecordBase {
   type: "user_prompt";
   runId?: string;
+  // 恒存用户完整原文（含 /skill:name 命令行）；skill 仅在显式调用时快照。
   text: string;
+  skill?: SkillSnapshot;
 }
 
 export interface RunModelSnapshot {
@@ -421,12 +435,33 @@ function parseCheckpointUsage(raw: unknown, scope: string): void {
   }
 }
 
+function parseSkillSnapshot(raw: unknown, scope: string): void {
+  if (!isPlainObject(raw)) fail(scope, '"skill" 必须是对象');
+  checkKeys(raw, ["name", "location", "content"], scope);
+  const name = requireString(raw, "name", scope, { allowEmpty: false });
+  if (!SKILL_NAME_PATTERN.test(name)) fail(scope, '"skill.name" 含非法字符');
+  const location = requireString(raw, "location", scope, { allowEmpty: false });
+  // 会话文件可能跨平台拷贝，两种绝对路径形态都接受。
+  if (!path.win32.isAbsolute(location) && !path.posix.isAbsolute(location)) {
+    fail(scope, '"skill.location" 必须是绝对路径');
+  }
+  requireString(raw, "content", scope);
+}
+
 const COMMON_KEYS = ["recordSeq", "ts", "type", "runId", "version"] as const;
 const TYPE_KEYS: Record<SessionRecordType, readonly string[]> = {
-  user_prompt: ["text"],
+  user_prompt: ["text", "skill"],
   run_started: ["model", "settings", "agentsMd"],
   assistant_message: ["message"],
-  tool_result: ["assistantRecordSeq", "toolCallId", "toolName", "status", "content", "priorContent", "images"],
+  tool_result: [
+    "assistantRecordSeq",
+    "toolCallId",
+    "toolName",
+    "status",
+    "content",
+    "priorContent",
+    "images",
+  ],
   interruption: ["toolCallId", "reason", "detail"],
   run_finished: ["outcome", "persisted", "error", "elapsedMs"],
   checkpoint: ["summary", "coveredUpTo", "model", "promptVersion", "usage"],
@@ -462,6 +497,7 @@ export function parseSessionRecord(raw: unknown, options: ParseRecordOptions): S
   switch (type) {
     case "user_prompt":
       requireString(raw, "text", scope);
+      if (raw.skill !== undefined) parseSkillSnapshot(raw.skill, scope);
       break;
     case "run_started":
       if (typeof raw.runId !== "string" || raw.runId.length === 0) {

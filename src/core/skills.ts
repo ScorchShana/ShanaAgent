@@ -2,11 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { isPathInside } from "../security/path-policy.js";
+import { SKILL_NAME_PATTERN, type SkillSnapshot } from "../sessions/records.js";
+
+// Schema 归属 sessions/records（记录校验与加载器共用同一字符集与快照形态）。
+export type { SkillSnapshot } from "../sessions/records.js";
 
 export const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".shana", "skills");
-
-// 大小写敏感匹配目录；同时拒绝 ../、绝对路径与 NUL（字符集之外一律非法）。
-const SKILL_NAME_PATTERN = /^[a-z0-9][a-z0-9_-]*$/;
 
 export type SkillLoadErrorCode = "invalid_name" | "not_found" | "io" | "escape";
 
@@ -20,14 +21,6 @@ export class SkillLoadError extends Error {
     super(message);
     this.name = "SkillLoadError";
   }
-}
-
-export interface SkillSnapshot {
-  name: string;
-  /** SKILL.md 的 realpath 绝对路径 */
-  location: string;
-  /** 剥 frontmatter 并 trim 后的正文 */
-  content: string;
 }
 
 export interface SkillCommand {

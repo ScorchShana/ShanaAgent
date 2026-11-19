@@ -14,6 +14,7 @@ import {
   type StoredAssistantMessage,
   type ToolResultRecord,
   type UserPromptRecord,
+  type SkillSnapshot,
 } from "../sessions/records.js";
 import {
   findLatestCheckpoint,
@@ -21,6 +22,7 @@ import {
   type ResponseExclusionReason,
 } from "../sessions/recovery.js";
 import { estimateImageTokens } from "../tools/image-header.js";
+import { renderSkillMessage, splitSkillCommand } from "./skills.js";
 
 // invalid_turn：协议损坏（非法 call 身份、多余/错配结果），正常落盘路径不会产生，防御性排除。
 export type TurnExclusionReason =
@@ -306,6 +308,8 @@ export interface BuildContextInput {
   records: readonly SessionRecord[];
   // 仅在开始新请求时追加；从已含当前 Prompt 的记录重建时省略，避免重复。
   currentPrompt?: string;
+  // 与 currentPrompt 并列的 skill 快照，仅 Run 起点传入；重建路径由记录自带快照驱动。
+  currentSkill?: SkillSnapshot;
   workspacePath: string;
   systemPrompt?: string;
   // 仅提供环境正文；<environment> 区块由 buildContext 包裹。
@@ -324,10 +328,18 @@ export interface BuiltContext {
   warnings: ContextBuildWarning[];
 }
 
+// user_prompt 的唯一渲染内核：skill 展开 + 中断前缀。重建 / currentPrompt / 压缩估算共用，
+// 保证所有消费点逐字一致（锚定前缀同一性依赖此确定性）。前缀恒在最前，skill 块与请求相邻。
+function renderPromptText(text: string, skill: SkillSnapshot | undefined, prefixed: boolean): string {
+  const command = skill ? splitSkillCommand(text) : null;
+  const body = skill && command ? renderSkillMessage(skill, command.request) : text;
+  return prefixed ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + body : body;
+}
+
 function promptMessage(record: UserPromptRecord, prefixed = false): UserMessage {
   return {
     role: "user",
-    content: prefixed ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + record.text : record.text,
+    content: renderPromptText(record.text, record.skill, prefixed),
     timestamp: Date.parse(record.ts),
   };
 }
@@ -480,9 +492,7 @@ export async function buildContext(input: BuildContextInput): Promise<BuiltConte
     const prefixed = previous !== undefined && previous.cancelled && previous.turns.length === 0;
     messages.push({
       role: "user",
-      content: prefixed
-        ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + input.currentPrompt
-        : input.currentPrompt,
+      content: renderPromptText(input.currentPrompt, input.currentSkill, prefixed),
       timestamp: now().getTime(),
     });
   }
@@ -595,10 +605,10 @@ export function planCompaction(
     const promptTokens = (run: RunPlan) =>
       run.prompt === null
         ? 0
-        : estimateTokens(run.prompt.text, options.tokenEstimate) +
-          (run.followsCancelledZeroTurn
-            ? estimateTokens(PREVIOUS_REQUEST_INTERRUPTED_PREFIX, options.tokenEstimate)
-            : 0);
+        : estimateTokens(
+            renderPromptText(run.prompt.text, run.prompt.skill, run.followsCancelledZeroTurn),
+            options.tokenEstimate,
+          );
 
     const latestIndex = planned.length - 1;
     const latest = planned[latestIndex]!;

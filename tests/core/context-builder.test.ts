@@ -31,7 +31,8 @@ import type { Usage } from "@earendil-works/pi-ai";
 import type { StoredContext } from "../../src/llm/history-replay.js";
 import { prepareReplay } from "../../src/llm/history-replay.js";
 import { CheckpointInvalidError } from "../../src/sessions/recovery.js";
-import type { SessionRecord, ToolResultRecord } from "../../src/sessions/records.js";
+import type { SessionRecord, SkillSnapshot, ToolResultRecord, UserPromptRecord } from "../../src/sessions/records.js";
+import { renderSkillMessage } from "../../src/core/skills.js";
 import {
   makeAssistantRecord,
   makeCheckpointRecord,
@@ -1661,5 +1662,136 @@ describe("image 双模态（view_image）", () => {
         maxTokens: 1,
       }),
     ).toEqual({ status: "too_large" });
+  });
+});
+
+describe("skill 显式调用渲染同构", () => {
+  const skill: SkillSnapshot = {
+    name: "review",
+    location: "/skills/review/SKILL.md",
+    content: "# Review\n\ncheck the diff",
+  };
+  const skillPrompt = (seq: number, runId: string, text: string): UserPromptRecord => ({
+    ...makeUserPromptRecord(seq, runId, text),
+    skill,
+  });
+
+  it("重建路径：快照展开为权威格式，记录恒存完整原文", async () => {
+    const records = [skillPrompt(1, "run-1", "/skill:review fix the bug")];
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
+    expect(built.context.messages[0]).toMatchObject({
+      content: renderSkillMessage(skill, "fix the bug"),
+    });
+    expect(records[0]!.text).toBe("/skill:review fix the bug");
+  });
+
+  it("prior + currentPrompt/currentSkill 与记录重建逐字一致（锚定同一性护栏）", async () => {
+    const rebuilt = await buildContext({
+      records: [skillPrompt(1, "run-1", "/skill:review fix the bug")],
+      workspacePath: makeWorkspace(),
+    });
+    const sent = await buildContext({
+      records: [],
+      currentPrompt: "/skill:review fix the bug",
+      currentSkill: skill,
+      workspacePath: makeWorkspace(),
+      now: () => new Date(RECORD_TS),
+    });
+    expect(sent.context.messages).toEqual(rebuilt.context.messages);
+  });
+
+  it("空请求：消息以 </skill> 结束，双路径一致", async () => {
+    const rebuilt = await buildContext({
+      records: [skillPrompt(1, "run-1", "/skill:review")],
+      workspacePath: makeWorkspace(),
+    });
+    const sent = await buildContext({
+      records: [],
+      currentPrompt: "/skill:review",
+      currentSkill: skill,
+      workspacePath: makeWorkspace(),
+      now: () => new Date(RECORD_TS),
+    });
+    expect(sent.context.messages).toEqual(rebuilt.context.messages);
+    expect((sent.context.messages[0] as { content: string }).content.endsWith("</skill>")).toBe(true);
+  });
+
+  it("零 Turn 取消叠加：前缀在最前，skill 块与请求相邻，双路径一致", async () => {
+    const prior: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "cancelled task"),
+      makeRunFinishedRecord(2, "run-1", "cancelled"),
+    ];
+    const expected = PREVIOUS_REQUEST_INTERRUPTED_PREFIX + renderSkillMessage(skill, "fix the bug");
+    const rebuilt = await buildContext({
+      records: [...prior, skillPrompt(3, "run-2", "/skill:review fix the bug")],
+      workspacePath: makeWorkspace(),
+    });
+    const sent = await buildContext({
+      records: prior,
+      currentPrompt: "/skill:review fix the bug",
+      currentSkill: skill,
+      workspacePath: makeWorkspace(),
+      now: () => new Date(RECORD_TS),
+    });
+    expect(sent.context.messages).toEqual(rebuilt.context.messages);
+    expect(rebuilt.context.messages.at(-1)).toMatchObject({ content: expected });
+  });
+
+  it("planCompaction 摘要输入与重建同源展开", () => {
+    const records: SessionRecord[] = [
+      skillPrompt(1, "run-1", "/skill:review first"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success"),
+      makeUserPromptRecord(4, "run-2", "second"),
+      makeAssistantRecord(5, "run-2", [{ id: "c2", name: "read" }]),
+      makeToolResultRecord(6, "run-2", "c2", "success"),
+    ];
+    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    expect(selection.messages[0]).toMatchObject({
+      content: renderSkillMessage(skill, "first"),
+    });
+  });
+
+  it("保留预算按展开全文计费：裸命令文本能保留的预算，展开后保留不下", () => {
+    const records: SessionRecord[] = [
+      skillPrompt(1, "run-1", "/skill:review first"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(3, "run-1", "c1", "success"),
+      makeAssistantRecord(4, "run-1", [{ id: "c2", name: "read" }]),
+      makeToolResultRecord(5, "run-1", "c2", "success"),
+      makeUserPromptRecord(6, "run-2", "second"),
+      makeAssistantRecord(7, "run-2", [{ id: "c3", name: "read" }]),
+      makeToolResultRecord(8, "run-2", "c3", "success"),
+      makeAssistantRecord(9, "run-2", [{ id: "c4", name: "read" }]),
+      makeToolResultRecord(10, "run-2", "c4", "success"),
+    ];
+    // 每 Turn 估算 3、run-2 Prompt 2：walk-back 保留至 run-1 首 Turn 前已计 11；
+    // 加上 run-1 首 Turn（3 + Prompt）时，裸命令文本 5 token 合计 19 恰好全保留 → noop，
+    // 展开全文 81 token 合计 95 超预算 → 首 Turn 被覆盖、其 Prompt 展开进摘要输入。
+    const selection = expectSelection(
+      planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 19 }),
+    );
+    expect(selection.coveredUpTo).toBe(3);
+    expect(selection.messages[0]).toMatchObject({
+      content: renderSkillMessage(skill, "first"),
+    });
+    // 反证：同一预算按裸 text（无快照）估算会保留全部 Turn。
+    const raw: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "/skill:review first"),
+      ...records.slice(1),
+    ];
+    expect(planCompaction(raw, { ...TAIL_COMPACTION, retainedContextBudget: 19 })).toEqual({
+      status: "noop",
+    });
+  });
+
+  it("无快照的普通 Prompt 渲染不受影响", async () => {
+    const built = await buildContext({
+      records: [makeUserPromptRecord(1, "run-1", "/skill:review 不是调用（无快照）")],
+      workspacePath: makeWorkspace(),
+    });
+    expect(built.context.messages[0]).toMatchObject({
+      content: "/skill:review 不是调用（无快照）",
+    });
   });
 });

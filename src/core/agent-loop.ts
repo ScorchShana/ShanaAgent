@@ -25,6 +25,7 @@ import {
   type SessionMeta,
   type SessionRecord,
   type StoredAssistantMessage,
+  type UserPromptRecord,
 } from "../sessions/records.js";
 import type { SessionRef, SessionStore, SessionLoadWarning } from "../sessions/session-store.js";
 import { createToolExecutor, type ToolExecutorOptions, type ToolExecutionResult } from "../tools/executor.js";
@@ -48,6 +49,7 @@ import {
   type RunHandle,
   type LoopEnd,
 } from "./session-controller.js";
+import { splitSkillCommand } from "./skills.js";
 
 export interface AgentSessionOptions {
   store: SessionStore;
@@ -58,6 +60,8 @@ export interface AgentSessionOptions {
   workspaceId: string;
   ref?: SessionRef;
   workspaceRoot: string;
+  // skills 根可注入（测试用临时目录）；缺省 ~/.shana/skills。
+  skillsRoot?: string;
   getModel(): ResolvedModel;
   getSettings(): Settings;
   modelService: Pick<ModelService, "streamTurn">;
@@ -230,13 +234,20 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let recordsFresh = true;
   let recordsEpoch = 0;
   let resyncPromise: Promise<void> | null = null;
+  // 标题/预览只显示请求原文（剥 /skill:name 命令前缀），记录恒存完整原文；
+  // 空请求回退 skill:<name>，避免标题/预览空白。
+  const displayPromptText = (record: UserPromptRecord): string => {
+    const command = splitSkillCommand(record.text);
+    if (!command) return record.text;
+    return command.request.trim() ? command.request : `skill:${command.name}`;
+  };
   const titleOf = (history: readonly SessionRecord[]): string => {
     const prompt = history.find((record) => record.type === "user_prompt" && record.text.trim());
     return prompt?.type === "user_prompt"
-      ? prompt.text
+      ? (displayPromptText(prompt)
           .split(/\r?\n/)
-          .find((line) => line.trim())!
-          .trim()
+          .find((line) => line.trim())
+          ?.trim() ?? "未命名会话")
       : "未命名会话";
   };
   let sessionTitle = ref ? titleOf(records) : null;
@@ -982,6 +993,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   const controller = new SessionController({
     driver,
     compactor,
+    skillsRoot: options.skillsRoot,
     commands: {
       getAutoDecisionStatus: async () => {
         if (ref) {
@@ -1049,7 +1061,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           const runCount = Math.max(started.size, prompted.size + promptsWithoutRunId);
           entries.push({
             title: titleOf(history.records),
-            preview: prompts.at(-1)?.text ?? "",
+            preview: prompts.at(-1) ? displayPromptText(prompts.at(-1)!) : "",
             lastActiveAt: history.records.at(-1)?.ts ?? meta.createdAt,
             occupied: await options.store.isSessionOccupied({ workspaceId, sessionId: meta.sessionId }),
             ...meta,
@@ -1134,12 +1146,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         if (shellBlocked) throw new Error("Shell termination is not confirmed. Cannot start a new Run.");
         gate.assertCanStartRun();
       },
-      persistRunStart: async (runId, prompt) => {
+      persistRunStart: async (runId, prompt, skill) => {
         if (!recordsFresh) await resyncRecords();
         const prior = records.slice();
         const snapshot = createModelSnapshot(runModel);
         const initialRecords: NewSessionRecord[] = [
-          { type: "user_prompt", runId, text: prompt },
+          { type: "user_prompt", runId, text: prompt, ...(skill ? { skill } : {}) },
           {
             type: "run_started",
             runId,
@@ -1174,6 +1186,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         built = await buildContext({
           records: prior,
           currentPrompt: prompt,
+          currentSkill: skill,
           workspacePath: options.workspaceRoot,
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
