@@ -19,7 +19,7 @@ export type ImageTranscoder = (base64Data: string, mimeType: string) => string |
 
 let imageTranscoder: ImageTranscoder | undefined;
 // Backstop for callers that recreate Image instances. Keyed by source data, least recently used first.
-const pngCache = new Map<string, string | null>();
+const pngCache = new Map<string, string>();
 
 /**
  * Register the converter used for non-PNG images on Kitty-protocol terminals, which only accept PNG.
@@ -33,10 +33,18 @@ export function setImageTranscoder(transcoder: ImageTranscoder | undefined): voi
 function toPng(base64Data: string, mimeType: string): string | null {
 	if (!imageTranscoder) return null;
 	const cached = pngCache.get(base64Data);
-	const png = cached === undefined ? imageTranscoder(base64Data, mimeType) : cached;
-	pngCache.delete(base64Data);
-	pngCache.set(base64Data, png);
-	if (pngCache.size > 32) pngCache.delete(pngCache.keys().next().value!);
+	if (cached !== undefined) {
+		pngCache.delete(base64Data);
+		pngCache.set(base64Data, cached);
+		return cached;
+	}
+	const png = imageTranscoder(base64Data, mimeType);
+	// Only successes are cached: null must stay retryable on later renders so an
+	// async transcoder can deliver the PNG once its background job finishes.
+	if (png !== null) {
+		pngCache.set(base64Data, png);
+		if (pngCache.size > 32) pngCache.delete(pngCache.keys().next().value!);
+	}
 	return png;
 }
 
