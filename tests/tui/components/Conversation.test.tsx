@@ -512,3 +512,30 @@ it("non-bash tools never show live output", () => {
   const item = { id: "tool-live", role: "tool", text: "", activity: "running", liveOutput: "private output", call: { name: "read", parse: { status: "parsed", arguments: { path: "a" } } } } as ConversationItem;
   expect(message(item).frame()).not.toContain("private output");
 });
+
+it("renders the skill card collapsed with a blue header and expands Markdown on click", () => {
+  const item: ConversationItem = {
+    id: "skill-1",
+    role: "skill",
+    text: "skill:review",
+    skillContent: "# Review\n\ncheck the diff",
+  };
+  const h = message(item);
+  const raw = h.view.render(80).join("\n");
+  expect(raw).toContain(theme.blue("skill:review (collapsed)"));
+  expect(h.frame()).toContain("skill:review (collapsed)");
+  expect(h.frame()).not.toContain("check the diff");
+  // 卡片上下各一行 padding；标题在第二行，点击标题行触发 toggle。
+  const rows = h.view.render(80);
+  expect(rows.length).toBe(3);
+  h.view.handleMouse({ type: "click", x: 1, y: 1, width: 80, height: rows.length, button: "left" });
+  expect(h.expanded.has("skill-1")).toBe(true);
+  h.view.update(item);
+  const expanded = h.frame();
+  expect(expanded).toContain("skill:review (expanded)");
+  expect(expanded).toContain("Review");
+  expect(expanded).toContain("check the diff");
+  // padding 行不响应点击。
+  h.view.handleMouse({ type: "click", x: 1, y: 0, width: 80, height: rows.length, button: "left" });
+  expect(h.expanded.has("skill-1")).toBe(true);
+});

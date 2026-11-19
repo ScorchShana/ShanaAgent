@@ -210,7 +210,9 @@ it("fills the selected completion without executing it", async () => {
   try {
     test.terminal.sendInput("/");
     await vi.waitFor(() => expect(test.app.editor.capturesViewportInput).toBe(true));
-    for (let i = 0; i < 7; i++) test.terminal.sendInput("\x1b[B");
+    // 下移到 /exit：次数按菜单中的实际位置派生，新增命令不再使本用例过期。
+    const downs = test.store.commandOptions().findIndex((option) => option.name === "/exit");
+    for (let i = 0; i < downs; i++) test.terminal.sendInput("\x1b[B");
     test.terminal.sendInput("\r");
     expect(test.app.editor.getText()).toBe("/exit");
     expect(test.store.getSnapshot().draft).toBe("/exit");

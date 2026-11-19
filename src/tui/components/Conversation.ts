@@ -4,9 +4,10 @@ import { Text, type Component, type MarkdownTheme, type TuiMouseEvent } from "..
 import { type ConversationItem, type TuiStore } from "../store.js";
 import { UserMessage } from "./UserMessage.js";
 import { AssistantMessage } from "./AssistantMessage.js";
+import { SkillMessage } from "./SkillMessage.js";
 import { SystemMessage } from "./SystemMessage.js";
 import { ToolExecution } from "./ToolExecution.js";
-import { toolBackground, MESSAGE_PADDING_X, MESSAGE_PADDING_Y } from "../theme.js";
+import { toolBackground, skillBackground, MESSAGE_PADDING_X, MESSAGE_PADDING_Y } from "../theme.js";
 export { compactionSeparatorLine } from "./SystemMessage.js";
 export {
   bashResultDisplay,
@@ -29,7 +30,9 @@ export class MessageView implements Component {
           ? new AssistantMessage(item, store, theme)
           : item.role === "tool" || item.role === "diff"
             ? new ToolExecution(item, store, theme)
-            : new SystemMessage(item, store);
+            : item.role === "skill"
+              ? new SkillMessage(item, store, theme)
+              : new SystemMessage(item, store);
   }
   setApproval(approval?: PendingApproval, preview?: ApprovalPreview) {
     if (this.component instanceof ToolExecution) this.component.setApproval(approval, preview);
@@ -46,7 +49,10 @@ export class MessageView implements Component {
   }
   render(width: number) {
     this.lastWidth = width;
-    if (this.item.role === "user" || !["assistant", "attempt", "tool", "diff"].includes(this.item.role))
+    if (
+      this.item.role === "user" ||
+      !["assistant", "attempt", "tool", "diff", "skill"].includes(this.item.role)
+    )
       return this.component.render(width);
     this.padding = width > MESSAGE_PADDING_X * 2 ? MESSAGE_PADDING_X : 0;
     const inner = Math.max(1, width - this.padding * 2),
@@ -61,7 +67,7 @@ export class MessageView implements Component {
         : this.item.syntheticUnknown
           ? "unknown"
           : (this.item.result?.status ?? this.item.activity ?? "queued");
-    const bg = toolBackground(status);
+    const bg = this.item.role === "skill" ? skillBackground : toolBackground(status);
     return [
       ...Array<string>(MESSAGE_PADDING_Y).fill(" ".repeat(width)),
       ...rows,
@@ -69,7 +75,7 @@ export class MessageView implements Component {
     ].map((row) => new Text(row, 0, 0, bg).render(width)[0] ?? bg(" ".repeat(width)));
   }
   handleMouse(event: TuiMouseEvent) {
-    const tool = this.item.role === "tool" || this.item.role === "diff";
+    const tool = this.item.role === "tool" || this.item.role === "diff" || this.item.role === "skill";
     if (
       event.x < this.padding ||
       event.x >= this.lastWidth - this.padding ||

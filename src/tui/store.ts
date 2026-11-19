@@ -10,6 +10,7 @@ import {
   type EligibleTurn,
 } from "../core/context-builder.js";
 import { UnknownSideEffectsError } from "../sessions/recovery.js";
+import { listSkillNames, splitSkillCommand } from "../core/skills.js";
 import type { SessionHistory } from "../sessions/session-store.js";
 import type { StoredToolCall, ToolResultRecord } from "../sessions/records.js";
 import type { Settings } from "../llm/settings-store.js";
@@ -50,6 +51,7 @@ export const COMMANDS = [
   { name: "/new", description: "回到空白会话" },
   { name: "/resume", description: "选择历史会话并继续" },
   { name: "/compact", description: "压缩上下文" },
+  { name: "/skill:", description: "显式调用 skill（/skill:<name> [请求]）" },
   { name: "/cancel", description: "取消当前运行" },
   { name: "/exit", description: "退出并清理 Session" },
   { name: "/quit", description: "退出并清理 Session（同 /exit）" },
@@ -74,7 +76,17 @@ export interface ConversationItem {
   runId?: string;
   turn?: number;
   id: string;
-  role: "user" | "assistant" | "tool" | "notice" | "failure" | "attempt" | "diff" | "duration" | "compaction";
+  role:
+    | "user"
+    | "assistant"
+    | "tool"
+    | "notice"
+    | "failure"
+    | "attempt"
+    | "diff"
+    | "duration"
+    | "compaction"
+    | "skill";
   text: string;
   thinking?: string;
   failed?: boolean;
@@ -84,6 +96,8 @@ export interface ConversationItem {
   syntheticUnknown?: boolean;
   // compaction 分隔线携带的摘要正文，默认折叠、点击展开。
   summary?: string;
+  // skill 块携带的快照正文（Markdown），默认折叠、点击展开；标题在 text（skill:<name>）。
+  skillContent?: string;
   call?: StoredToolCall;
   result?: ToolResultRecord;
   activity?: "queued" | "running";
@@ -157,6 +171,8 @@ export class TuiStore {
       onExit?: (error?: Error) => void;
       workspace?: string;
       diagnostics?: Diagnostics;
+      // skills 根可注入（测试用临时目录）；缺省 ~/.shana/skills。
+      skillsRoot?: string;
     } = {},
   ) {
     const subscription = controller.subscribe((event) => {
@@ -440,6 +456,14 @@ export class TuiStore {
   commandOptions(): CommandOption[] {
     const core = this.controller.getSnapshot();
     const idle = core.status.kind === "idle" && !this.runRequest;
+    // /skill: 补全按需读目录（无缓存）：运行期间新增 skill 立即可补全；缺目录 → 空列表。
+    if (this.state.draft.startsWith("/skill:")) {
+      const enabled =
+        !this.closing && !core.sessionOperation && !core.pendingApproval && idle;
+      return listSkillNames(this.options.skillsRoot)
+        .map((name) => ({ name: `/skill:${name}`, description: "显式调用 skill", enabled }))
+        .filter((option) => option.name.startsWith(this.state.draft));
+    }
     return COMMANDS.filter((option) => option.name.startsWith(this.state.draft)).map((option) => ({
       ...option,
       enabled:
@@ -496,7 +520,9 @@ export class TuiStore {
       }
       return Promise.resolve();
     }
-    if (prompt.startsWith("/")) return this.submitCommand(prompt.trim());
+    // /skill: 是 Prompt 而非命令：放行进 submitPrompt（Core 权威解析），其余 / 走命令。
+    if (prompt.startsWith("/") && !prompt.startsWith("/skill:"))
+      return this.submitCommand(prompt.trim());
     if (!this.controller.getSnapshot().session.model) {
       this.notice("请手动编辑 model.json 配置模型。", true);
       return Promise.resolve();
@@ -596,7 +622,10 @@ export class TuiStore {
         else this.startExit();
         return Promise.resolve();
       default:
-        this.notice("未知命令。可用：/model /effort /new /resume /compact /autodecision /cancel /exit", true);
+        this.notice(
+          "未知命令。可用：/model /effort /new /resume /compact /skill: /autodecision /cancel /exit",
+          true,
+        );
         return Promise.resolve();
     }
   }
@@ -838,11 +867,28 @@ export class TuiStore {
             role: "notice",
             text: PREVIOUS_REQUEST_INTERRUPTED_PREFIX.trimEnd(),
           });
-        items.push({
-          id: `prompt-${record.recordSeq}`,
-          role: "user",
-          text: record.text,
-        });
+        // skill 块在气泡之前（与模型所见顺序同构）；气泡只显示请求原文，命令信息由 skill 块承载。
+        const command = record.skill ? splitSkillCommand(record.text) : null;
+        if (record.skill && command) {
+          items.push({
+            id: `skill-${record.recordSeq}`,
+            role: "skill",
+            text: `skill:${record.skill.name}`,
+            skillContent: record.skill.content,
+          });
+          if (command.request.trim())
+            items.push({
+              id: `prompt-${record.recordSeq}`,
+              role: "user",
+              text: command.request,
+            });
+        } else {
+          items.push({
+            id: `prompt-${record.recordSeq}`,
+            role: "user",
+            text: record.text,
+          });
+        }
         if (failedPrompts.has(record.recordSeq))
           items.push({
             id: `failed-prompt-${record.recordSeq}`,
