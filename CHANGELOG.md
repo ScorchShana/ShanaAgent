@@ -1,5 +1,9 @@
 # CHANGELOG
 
+## 0.2.6 — 2026-11-19
+
+- 新增：kitty 协议终端下 view_image 的 jpeg/webp 真图显示。sharp 后台异步转码为 PNG：渲染期同步查表，未命中先显示文本回退行，就绪后自动重渲染出真图；EXIF 方向自动旋转，长边超过 2048px 只缩不放（显示最高 14 行，远超所需），动图 webp 取首帧。转码为纯显示层缓存：Session 记录保留原图 base64，不落盘、格式零变更，resume 后按需重转码。iTerm2 与无协议终端行为不变。新增依赖 sharp（native prebuild，Windows x64 / Linux x64）。
+
 ## 0.2.5 — 2026-11-19
 
 - **变更**：压缩覆盖的历史记录不再整段淡化——压前的 Prompt/回复/工具卡/提示保留原配色，工具卡背景按真实结果状态着色，压前 view_image 卡展开正常显示真图（失败卡片仍淡化且不渲染图像）。压缩分隔线文案改为 `compacted`，摘要展开/折叠提示改为英文（`Click to expand/collapse the chat summary`）。

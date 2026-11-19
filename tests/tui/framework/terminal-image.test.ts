@@ -923,8 +923,41 @@ describe("Image transcoding", () => {
 		assert.ok(image.render(80)[0].includes("\x1b_G"));
 	});
 
+	it("retries a failed conversion on later renders without re-registering", () => {
+		let ready = false;
+		setImageTranscoder((data) => {
+			calls.push(data);
+			return ready && data === jpeg ? png : null;
+		});
+		const image = new Image(jpeg, "image/jpeg", { fallbackColor: (value) => value });
+		assert.match(image.render(80)[0], /^\[Image: \[image\/jpeg\]/);
+		ready = true;
+		image.invalidate();
+		assert.ok(image.render(80)[0].includes("\x1b_G"));
+		assert.strictEqual(calls.filter((data) => data === jpeg).length, 2);
+	});
+
+	it("does not cache failed conversions across instances", () => {
+		let ready = false;
+		setImageTranscoder((data) => {
+			calls.push(data);
+			return ready && data === jpeg ? png : null;
+		});
+		const first = new Image(jpeg, "image/jpeg", { fallbackColor: (value) => value });
+		assert.match(first.render(80)[0], /^\[Image: \[image\/jpeg\]/);
+		ready = true;
+		// A fresh instance must consult the transcoder again, not a cached failure.
+		assert.ok(render(jpeg, "image/jpeg")[0].includes("\x1b_G"));
+		assert.strictEqual(calls.filter((data) => data === jpeg).length, 2);
+	});
+
 	it("converts each image once", () => {
-		setImageTranscoder(transcode);
+		// Every source succeeds so the 40 fillers actually evict the shared entry
+		// (failed conversions are no longer cached).
+		setImageTranscoder((data) => {
+			calls.push(data);
+			return png;
+		});
 		const image = new Image(jpeg, "image/jpeg", { fallbackColor: (value) => value });
 		image.render(80);
 		render(jpeg, "image/jpeg"); // New instance hits the shared cache.

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { theme } from "./tui/theme.js";
-import { ProcessTerminal, TuiAltScreen, getKeybindings, getNativeClipboard, type Terminal } from "./tui/framework/index.js";
+import { ProcessTerminal, TuiAltScreen, getKeybindings, getNativeClipboard, setImageTranscoder, type Terminal } from "./tui/framework/index.js";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
 import path from "node:path";
@@ -14,6 +14,7 @@ import { collectSettingsWarnings } from "./llm/settings-store.js";
 import { SessionStore } from "./sessions/session-store.js";
 import { TuiStore } from "./tui/store.js";
 import { TuiApp } from "./tui/app.js";
+import { onTranscodeReady, transcodeToPng } from "./tui/image-transcoder.js";
 
 export const App = TuiApp;
 
@@ -58,8 +59,16 @@ export function renderTui(store: TuiStore, options: { terminal?: Terminal } = {}
       },
     },
   );
+  // kitty 只接受 PNG：jpeg/webp 由 sharp 后台异步转码，就绪后全树失效重渲染（与 resize 路径同构）。
+  setImageTranscoder(transcodeToPng);
+  const offTranscodeReady = onTranscodeReady(() => {
+    tui.invalidate();
+    tui.requestRender();
+  });
   function close(error?: unknown): Promise<void> {
     return (closing ??= (async () => {
+      // 先退订：转码完成回调不得触碰正在销毁的 tui。
+      offTranscodeReady();
       const failures: unknown[] = [];
       if (error !== undefined) failures.push(error);
       try { await store.dispose(); } catch (failure) { failures.push(failure); }
