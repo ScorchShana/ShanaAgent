@@ -1,6 +1,6 @@
 # CHANGELOG
 
-## 未发布
+## 0.2.6 — 2026-11-19
 
 - 新增：kitty 协议终端下 view_image 的 jpeg/webp 真图显示。sharp 后台异步转码为 PNG：渲染期同步查表，未命中先显示文本回退行，就绪后自动重渲染出真图；EXIF 方向自动旋转，长边超过 2048px 只缩不放（显示最高 14 行，远超所需），动图 webp 取首帧。转码为纯显示层缓存：Session 记录保留原图 base64，不落盘、格式零变更，resume 后按需重转码。iTerm2 与无协议终端行为不变。新增依赖 sharp（native prebuild，Windows x64 / Linux x64）。
 
