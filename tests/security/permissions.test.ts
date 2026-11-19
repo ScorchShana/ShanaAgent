@@ -12,6 +12,7 @@ import {
   type SessionGrants,
 } from "../../src/security/permissions.js";
 import { createToolRegistry, type ToolAction } from "../../src/tools/registry.js";
+import { parseSettings } from "../../src/llm/settings-store.js";
 import { detectShell } from "../../src/tools/shell.js";
 import {
   cleanupTempDirs,
@@ -294,5 +295,114 @@ describe("V8 判定依据是解析后的真实路径", () => {
       outcome: "allow",
       basis: "workspace_read",
     });
+  });
+});
+
+describe("skills 只读区权限（D3）", () => {
+  async function verdictWithSkills(
+    root: string,
+    skillsRoot: string,
+    toolName: string,
+    args: Record<string, unknown>,
+    options: { imageInput?: boolean; grants?: SessionGrants } = {},
+  ): Promise<PermissionVerdict> {
+    const registry = createToolRegistry(
+      process.platform,
+      parseSettings(undefined),
+      undefined,
+      options.imageInput ?? false,
+    );
+    const tool = registry.get(toolName);
+    if (!tool) throw new Error(`tool not registered: ${toolName}`);
+    const plan = await tool.prepare(args as JsonObject, {
+      workspaceRoot: root,
+      pathPolicy: createPathPolicy(root, process.platform, skillsRoot),
+      platform: process.platform,
+    });
+    return evaluatePermission(
+      { toolCallId: "call-1", toolName, action: plan.action },
+      options.grants ?? emptySessionGrants(),
+    );
+  }
+
+  function makeSkillsLayout(): { root: string; skills: string } {
+    const parent = tempDir("shana-home-");
+    const root = path.join(parent, "ws");
+    fs.mkdirSync(root);
+    const skills = path.join(parent, ".shana", "skills");
+    fs.mkdirSync(skills, { recursive: true });
+    return { root, skills };
+  }
+
+  it("read/glob/grep/view_image 命中 skills 区免审批，basis 为 skills_read", async () => {
+    const { root, skills } = makeSkillsLayout();
+    writeFileAt(skills, "review/SKILL.md", "needle");
+    writeFileAt(skills, "review/img.png", "x");
+    for (const [toolName, args, imageInput] of [
+      ["read", { path: path.join(skills, "review", "SKILL.md") }, false],
+      ["glob", { pattern: "**/*.md", path: skills }, false],
+      ["grep", { pattern: "needle", path: skills }, false],
+      ["view_image", { path: path.join(skills, "review", "img.png") }, true],
+    ] as const) {
+      const verdict = await verdictWithSkills(root, skills, toolName, args, { imageInput });
+      expect(verdict).toEqual({ outcome: "allow", basis: "skills_read" });
+    }
+  });
+
+  it("纯区内读取 basis 仍 workspace_read；混合路径（区内 + skills）allow skills_read", async () => {
+    const { root, skills } = makeSkillsLayout();
+    writeFileAt(root, "a.txt", "x");
+    const skillFile = writeFileAt(skills, "review/SKILL.md", "x");
+    const policy = createPathPolicy(root, process.platform, skills);
+    const mixed: ToolAction = {
+      type: "read",
+      paths: [policy.resolve("a.txt"), policy.resolve(skillFile)],
+    };
+    expect(evaluatePermission({ toolCallId: "c", toolName: "read", action: mixed }, emptySessionGrants())).toEqual({
+      outcome: "allow",
+      basis: "skills_read",
+    });
+    const pure: ToolAction = { type: "read", paths: [policy.resolve("a.txt")] };
+    expect(evaluatePermission({ toolCallId: "c", toolName: "read", action: pure }, emptySessionGrants())).toEqual({
+      outcome: "allow",
+      basis: "workspace_read",
+    });
+  });
+
+  it("skills 内 write/edit 仍 ask，且会话授权不豁免（区外写入）", async () => {
+    const { root, skills } = makeSkillsLayout();
+    const target = writeFileAt(skills, "review/SKILL.md", "x");
+    for (const toolName of ["write", "edit"] as const) {
+      const args =
+        toolName === "write"
+          ? { path: target, content: "y" }
+          : { path: target, old_string: "x", new_string: "y" };
+      const verdict = await verdictWithSkills(root, skills, toolName, args, {
+        grants: grantFor(toolName),
+      });
+      const request = requireAsk(verdict);
+      expect(request.touchesOutsideWorkspace).toBe(true);
+    }
+  });
+
+  it("bash 不豁免；~/.shana 其他子目录读取不放行", async () => {
+    const { root, skills } = makeSkillsLayout();
+    const bash = await verdictWithSkills(root, skills, "bash", { command: "echo hi" });
+    expect(bash.outcome).toBe("ask");
+    const sessionsFile = writeFileAt(path.dirname(skills), "sessions/s.jsonl", "{}");
+    const verdict = await verdictWithSkills(root, skills, "read", { path: sessionsFile });
+    expect(requireAsk(verdict).touchesOutsideWorkspace).toBe(true);
+  });
+
+  it("skills 内目录链接逃逸不豁免", async () => {
+    if (!DIR_LINKS) return;
+    const { root, skills } = makeSkillsLayout();
+    const outside = tempDir("shana-out-");
+    writeFileAt(outside, "secret.txt", "secret");
+    createDirLink(outside, path.join(skills, "escape"));
+    const verdict = await verdictWithSkills(root, skills, "read", {
+      path: path.join(skills, "escape", "secret.txt"),
+    });
+    expect(requireAsk(verdict).touchesOutsideWorkspace).toBe(true);
   });
 });

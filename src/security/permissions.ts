@@ -40,7 +40,7 @@ export interface ToolCallSubject {
 }
 
 export type PermissionVerdict =
-  | { outcome: "allow"; basis: "workspace_read" | "session_grant" }
+  | { outcome: "allow"; basis: "workspace_read" | "skills_read" | "session_grant" }
   | { outcome: "ask"; request: ApprovalRequest };
 
 const FILE_TOOLS_WITH_GRANT = new Set(["write", "edit"]);
@@ -110,7 +110,12 @@ export function evaluatePermission(subject: ToolCallSubject, grants: SessionGran
     };
   }
   if (!defaultNeedsApproval(subject.action)) {
-    return { outcome: "allow", basis: "workspace_read" };
+    // 含 skills 区路径的只读放行列 skills_read；纯区内仍 workspace_read。
+    const basis =
+      subject.action.type === "read" && subject.action.paths.some((target) => target.insideSkills)
+        ? "skills_read"
+        : "workspace_read";
+    return { outcome: "allow", basis };
   }
   const request = buildApprovalRequest(subject);
   if (request.grantKey !== null && !request.touchesOutsideWorkspace && hasGrant(grants, request.grantKey)) {

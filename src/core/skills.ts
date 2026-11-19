@@ -1,13 +1,12 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { isPathInside } from "../security/path-policy.js";
+import { DEFAULT_SKILLS_ROOT, isPathInside } from "../security/path-policy.js";
 import { SKILL_NAME_PATTERN, type SkillSnapshot } from "../sessions/records.js";
 
-// Schema 归属 sessions/records（记录校验与加载器共用同一字符集与快照形态）。
+// Schema 归属 sessions/records（记录校验与加载器共用同一字符集与快照形态）；
+// 根路径常量归属 security/path-policy（只读放行边界与加载器共用同一根）。
 export type { SkillSnapshot } from "../sessions/records.js";
-
-export const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".shana", "skills");
+export { DEFAULT_SKILLS_ROOT } from "../security/path-policy.js";
 
 export type SkillLoadErrorCode = "invalid_name" | "not_found" | "io" | "escape";
 

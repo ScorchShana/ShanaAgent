@@ -143,7 +143,9 @@ export class ToolArgumentError extends Error {
 }
 
 export function defaultNeedsApproval(action: ToolAction): boolean {
-  if (action.type === "read") return action.paths.some((target) => !target.insideWorkspace);
+  // skills 区只读默认放行（与区内读取同档）；write/edit/bash 不豁免。
+  if (action.type === "read")
+    return action.paths.some((target) => !target.insideWorkspace && !target.insideSkills);
   return true;
 }
 

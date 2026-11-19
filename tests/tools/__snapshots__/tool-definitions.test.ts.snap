@@ -6,7 +6,7 @@ exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致
     "access": "read",
     "description": "Read a UTF-8 text file with line numbers.
 
-- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval. Read-only access to \`~/.shana/skills\` is always allowed without approval.
 - Output is limited to 24000 characters. Lines longer than 2000 characters are truncated.
 - Use the returned continuation offset when more lines are available. Increasing offset cannot recover the omitted part of a truncated line.
 - Empty files and offsets beyond EOF return informational results.
@@ -46,7 +46,7 @@ exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致
     "access": "read",
     "description": "Find files by glob pattern. Returns one path per line, newest first.
 
-- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval. Read-only access to \`~/.shana/skills\` is always allowed without approval.
 - Directory patterns recursively find files beneath them. Directory symlinks are not followed; file symlinks are returned.
 - Respects .gitignore, includes non-ignored hidden files, and excludes .git/. Explicit patterns also respect .gitignore.
 - Paths are workspace-relative unless the search path is absolute.
@@ -80,7 +80,7 @@ exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致
     "access": "read",
     "description": "Search text files using regular expressions. Returns matching lines as path:line: content.
 
-- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval. Read-only access to \`~/.shana/skills\` is always allowed without approval.
 - Uses the default ripgrep regex engine without PCRE2.
 - Paths use visible escapes for backslashes and control characters. Decode display escapes before using a path in another tool call.
 - Directory searches respect ignore files, skip hidden and binary files, and do not follow directory symlinks. Explicit file paths and glob filters follow ripgrep's filtering precedence.
@@ -237,7 +237,7 @@ exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致
     "access": "read",
     "description": "View an image file (png, jpg, jpeg, webp) and return it as image content.
 
-- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval. Read-only access to \`~/.shana/skills\` is always allowed without approval.
 - Only successful reads return image information; failures return an Error without image data.
 - The file must match a supported format by content, not only by extension. Maximum 5242880 bytes.
 - Use this tool when the task requires seeing an image (screenshots, diagrams, UI). For text files use read instead.

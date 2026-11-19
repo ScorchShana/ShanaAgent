@@ -1,6 +1,6 @@
 Find files by glob pattern. Returns one path per line, newest first.
 
-- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval.
+- Stay inside the workspace unless the user asks for a specific outside path; each outside path needs user approval. Read-only access to `~/.shana/skills` is always allowed without approval.
 - Directory patterns recursively find files beneath them. Directory symlinks are not followed; file symlinks are returned.
 - Respects .gitignore, includes non-ignored hidden files, and excludes .git/. Explicit patterns also respect .gitignore.
 - Paths are workspace-relative unless the search path is absolute.
