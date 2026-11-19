@@ -1,8 +1,10 @@
 import { stripVTControlCharacters } from "node:util";
+import sharp from "sharp";
 import { afterEach, describe, expect, it } from "vitest";
 import { parseSettings } from "../../../src/llm/settings-store.js";
 import { ToolExecution } from "../../../src/tui/components/ToolExecution.js";
-import { Image, setCapabilities } from "../../../src/tui/framework/index.js";
+import { Image, setCapabilities, setImageTranscoder } from "../../../src/tui/framework/index.js";
+import { onTranscodeReady, transcodeToPng } from "../../../src/tui/image-transcoder.js";
 import type { ConversationItem, TuiStore } from "../../../src/tui/store.js";
 import { makePngImage } from "../../sessions/helpers.js";
 import { defaultMarkdownTheme } from "../framework/test-themes.js";
@@ -153,5 +155,52 @@ describe("ToolExecution view_image 内联图片", () => {
     const rows = h.view.render(80);
     expect(rows.some(isKittyLine)).toBe(false);
     expect(rows.join("\n")).not.toContain("(Image attached:");
+  });
+});
+
+describe("ToolExecution view_image jpeg 异步转码", () => {
+  it("kitty+jpeg：首帧文本回退，转码就绪 invalidate 重渲染出真图", async () => {
+    setCapabilities({ images: "kitty", trueColor: true, hyperlinks: false });
+    const jpegData = (
+      await sharp({ create: { width: 40, height: 30, channels: 3, background: { r: 120, g: 60, b: 30 } } })
+        .jpeg()
+        .toBuffer()
+    ).toString("base64");
+    const item = imageItem({
+      call: { name: "view_image", parse: { status: "parsed", arguments: { path: "photo.jpg" } } },
+      result: {
+        status: "success",
+        content: "(Image attached: image/jpeg, 40x30, 999 bytes.)",
+        images: [{ data: jpegData, mimeType: "image/jpeg", width: 40, height: 30 }],
+      },
+    });
+    const h = harness(item);
+    setImageTranscoder(transcodeToPng);
+    // 模拟 main.ts 接线：就绪回调失效组件（真实接线为 tui.invalidate 全树）。
+    let off!: () => void;
+    const ready = new Promise<void>((resolve) => {
+      off = onTranscodeReady(() => {
+        off();
+        h.view.invalidate();
+        resolve();
+      });
+    });
+    try {
+      const first = h.view.render(80);
+      expect(first.some(isKittyLine)).toBe(false);
+      expect(first.map((row) => stripVTControlCharacters(row)).join("\n")).toContain(
+        "[Image: photo.jpg [image/jpeg] 40x30]",
+      );
+      await ready;
+      const second = h.view.render(80);
+      const kittyRow = second.find(isKittyLine);
+      expect(kittyRow).toBeDefined();
+      expect(kittyRow).toContain("f=100");
+      // 载荷是转码后的 PNG（base64 以 PNG 签名开头），不是原始 jpeg。
+      expect(kittyRow).toContain("iVBORw0KGgo");
+    } finally {
+      off();
+      setImageTranscoder(undefined);
+    }
   });
 });
