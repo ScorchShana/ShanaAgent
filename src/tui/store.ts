@@ -456,15 +456,15 @@ export class TuiStore {
   commandOptions(): CommandOption[] {
     const core = this.controller.getSnapshot();
     const idle = core.status.kind === "idle" && !this.runRequest;
-    // /skill: 补全按需读目录（无缓存）：运行期间新增 skill 立即可补全；缺目录 → 空列表。
-    if (this.state.draft.startsWith("/skill:")) {
-      const enabled =
-        !this.closing && !core.sessionOperation && !core.pendingApproval && idle;
-      return listSkillNames(this.options.skillsRoot)
-        .map((name) => ({ name: `/skill:${name}`, description: "显式调用 skill", enabled }))
-        .filter((option) => option.name.startsWith(this.state.draft));
-    }
-    return COMMANDS.filter((option) => option.name.startsWith(this.state.draft)).map((option) => ({
+    // / 菜单按需读目录（无缓存）：运行期间新增 skill 立即可补全；缺目录 → 空列表。
+    const skillEnabled =
+      !this.closing && !core.sessionOperation && !core.pendingApproval && idle;
+    const skills = listSkillNames(this.options.skillsRoot)
+      .map((name) => ({ name: `/skill:${name}`, description: "显式调用 skill", enabled: skillEnabled }))
+      .filter((option) => option.name.startsWith(this.state.draft));
+    // /skill: 前缀只列具体 skill（占位项无意义）；其余 / 前缀命令在前、skill 追加在后。
+    if (this.state.draft.startsWith("/skill:")) return skills;
+    const commands = COMMANDS.filter((option) => option.name.startsWith(this.state.draft)).map((option) => ({
       ...option,
       enabled:
         !this.closing &&
@@ -480,6 +480,7 @@ export class TuiStore {
                 ? idle && !!core.session.model
                 : idle),
     }));
+    return [...commands, ...skills];
   }
   submit(): Promise<void> {
     if (/^\/autodecision(?:\s|$)/.test(this.state.draft.trim()) && !this.closing && !this.state.modal) {

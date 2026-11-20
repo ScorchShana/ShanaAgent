@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionController } from "../../src/core/session-controller.js";
 import type { SessionRecord, SkillSnapshot } from "../../src/sessions/records.js";
 import { parseSettings } from "../../src/llm/settings-store.js";
-import { TuiStore } from "../../src/tui/store.js";
+import { COMMANDS, TuiStore } from "../../src/tui/store.js";
 import { cleanupTempDirs, tempDir, writeFileAt } from "../tools/helpers.js";
 
 afterEach(cleanupTempDirs);
@@ -238,6 +238,88 @@ describe("TUI /skill: 菜单与路由（D5/D11）", () => {
     } finally {
       finish({ outcome: "completed" });
       await run;
+      await store.dispose();
+    }
+  });
+
+  it("/ 菜单：命令在前、skill 排序追加在后；占位项保留；前缀语义；新增 skill 立即可补全", async () => {
+    const skillsRoot = tempDir("shana-skills-");
+    fs.mkdirSync(path.join(skillsRoot, "review"));
+    fs.mkdirSync(path.join(skillsRoot, "commit-helper"));
+    const store = new TuiStore(skillController({}), parseSettings({}), { skillsRoot });
+    try {
+      store.setDraft("/");
+      expect(store.commandOptions().map((option) => option.name)).toEqual([
+        ...COMMANDS.map((option) => option.name),
+        "/skill:commit-helper",
+        "/skill:review",
+      ]);
+      const skillOption = store.commandOptions().find((option) => option.name === "/skill:review");
+      expect(skillOption).toMatchObject({ description: "显式调用 skill", enabled: true });
+      // /s 与 /skill（无冒号）列出占位项 + 全部 skill；/review 不匹配（前缀语义，非裸名匹配）。
+      store.setDraft("/s");
+      expect(store.commandOptions().map((option) => option.name)).toEqual([
+        "/skill:",
+        "/skill:commit-helper",
+        "/skill:review",
+      ]);
+      store.setDraft("/skill");
+      expect(store.commandOptions().map((option) => option.name)).toEqual([
+        "/skill:",
+        "/skill:commit-helper",
+        "/skill:review",
+      ]);
+      store.setDraft("/review");
+      expect(store.commandOptions()).toEqual([]);
+      // 无缓存：idle 期间新增 skill 目录，下一次 / 菜单立即含新项。
+      fs.mkdirSync(path.join(skillsRoot, "deploy"));
+      store.setDraft("/");
+      expect(store.commandOptions().map((option) => option.name)).toContain("/skill:deploy");
+    } finally {
+      await store.dispose();
+    }
+  });
+
+  it("运行中 / 菜单的 skill 项 disabled，静态命令门控不变", async () => {
+    let finish!: (value: { outcome: "completed" }) => void;
+    const skillsRoot = tempDir("shana-skills-");
+    fs.mkdirSync(path.join(skillsRoot, "review"));
+    const core = skillController({
+      execute: async () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    });
+    const store = new TuiStore(core, parseSettings({}), { skillsRoot });
+    store.setDraft("plain");
+    const run = store.submit();
+    try {
+      await vi.waitFor(() => expect(core.getSnapshot().status.kind).toBe("running"));
+      store.setDraft("/");
+      const options = store.commandOptions();
+      const skills = options.filter((option) => option.name.startsWith("/skill:"));
+      expect(skills.map((option) => option.name)).toEqual(["/skill:", "/skill:review"]);
+      expect(skills.every((option) => !option.enabled)).toBe(true);
+      expect(options.find((option) => option.name === "/cancel")?.enabled).toBe(true);
+      expect(options.find((option) => option.name === "/exit")?.enabled).toBe(true);
+    } finally {
+      finish({ outcome: "completed" });
+      await run;
+      await store.dispose();
+    }
+  });
+
+  it("缺 skills 目录：/ 菜单与静态命令表完全一致", async () => {
+    const skillsRoot = tempDir("shana-skills-");
+    const store = new TuiStore(skillController({}), parseSettings({}), {
+      skillsRoot: path.join(skillsRoot, "missing"),
+    });
+    try {
+      store.setDraft("/");
+      expect(store.commandOptions().map((option) => option.name)).toEqual(
+        COMMANDS.map((option) => option.name),
+      );
+    } finally {
       await store.dispose();
     }
   });
