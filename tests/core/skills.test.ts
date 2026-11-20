@@ -189,7 +189,7 @@ describe("renderSkillMessage — §2.1 权威格式", () => {
       `<skill name="review" location="${skill.location}">\n` +
         "This skill was explicitly invoked by the user. Follow its instructions for the request below.\n" +
         "The `SKILL.md` instructions are already included below. No need to reload `SKILL.md`.\n" +
-        `References are relative to ${dir}.\n` +
+        `References are relative to \`${dir}\`.\n` +
         "\n# Review\n\nbody\n</skill>\n\nfix  it\nnow",
     );
   });
@@ -209,7 +209,7 @@ describe("renderSkillMessage — §2.1 权威格式", () => {
     expect(
       text.startsWith('<skill name="a&amp;&lt;&gt;&quot;" location="/s &amp;&lt;&gt;&quot; dir/SKILL.md">'),
     ).toBe(true);
-    expect(text).toContain("References are relative to /s &amp;&lt;&gt;&quot; dir.");
+    expect(text).toContain("References are relative to `/s &amp;&lt;&gt;&quot; dir`.");
   });
 
   it("content 中 </skill> 转义防提前闭合，其余正文不动", () => {
