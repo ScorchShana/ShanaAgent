@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import fs from "node:fs/promises";
 import { stripVTControlCharacters } from "node:util";
 import { TuiApp } from "../../src/tui/app.js";
@@ -8,6 +8,10 @@ import { parseSettings } from "../../src/llm/settings-store.js";
 import { TuiAltScreen, Text, getKeybindings, type Component } from "../../src/tui/framework/index.js";
 import { makeModelSnapshot } from "../sessions/helpers.js";
 import { VirtualTerminal } from "./framework/virtual-terminal.js";
+import { cleanupTempDirs, tempDir, writeFileAt } from "../tools/helpers.js";
+
+// / 菜单会按需读 skills 目录：setup 注入临时目录，杜绝菜单内容随真实 home 漂移。
+afterEach(cleanupTempDirs);
 
 it.each(["\r", "\x1b[13u", "\x1b[13;1u"])("fills /quit on the first Enter and exits on the second %j", async (enter) => {
   const test = setup();
@@ -89,7 +93,7 @@ it("keeps approval keyboard focus when the Editor is clicked", async () => {
 it("cleans the application timer when layout initialization throws", async () => {
   vi.useFakeTimers();
   const core = new SessionController({ driver: { execute: async () => ({ outcome: "completed" }) } });
-  const store = new TuiStore(core, parseSettings({}));
+  const store = new TuiStore(core, parseSettings({}), { skillsRoot: tempDir("shana-app-skills-") });
   const tui = new TuiAltScreen(new VirtualTerminal());
   const failure = new Error("layout initialization failed");
   vi.spyOn(tui, "setLayoutRoot").mockImplementation(() => { throw failure; });
@@ -158,7 +162,8 @@ function setup(approval = false, command = "echo approved", toolName = "bash") {
     } });
     return { outcome: "completed" };
   } } });
-  const store = new TuiStore(core, parseSettings({}));
+  const skillsRoot = tempDir("shana-app-skills-");
+  const store = new TuiStore(core, parseSettings({}), { skillsRoot });
   if(approval) vi.spyOn(store,"items").mockImplementation(()=> {
     const pending = core.getSnapshot().pendingApproval;
     return pending ? [{id:"fixture-tool",role:"tool",text:toolName,pendingApprovalId:pending.id,
@@ -174,6 +179,7 @@ function setup(approval = false, command = "echo approved", toolName = "bash") {
     terminal,
     tui,
     app,
+    skillsRoot,
     async close() {
       app.dispose();
       await store.dispose();
@@ -223,6 +229,25 @@ it("fills the selected completion without executing it", async () => {
     await test.close();
   }
 });
+it("fills a skill completion from the / menu without executing it", async () => {
+  const test = setup();
+  try {
+    writeFileAt(test.skillsRoot, "review/SKILL.md", "# Review\n\ncheck the diff\n");
+    test.terminal.sendInput("/");
+    await vi.waitFor(() => expect(test.app.editor.capturesViewportInput).toBe(true));
+    // 下移到 /skill:review：次数按菜单中的实际位置派生（命令在前、skill 追加在后）。
+    const downs = test.store.commandOptions().findIndex((option) => option.name === "/skill:review");
+    expect(downs).toBeGreaterThan(0);
+    for (let i = 0; i < downs; i++) test.terminal.sendInput("\x1b[B");
+    test.terminal.sendInput("\r");
+    expect(test.app.editor.getText()).toBe("/skill:review");
+    expect(test.store.getSnapshot().draft).toBe("/skill:review");
+    expect(test.app.editor.capturesViewportInput).toBe(false);
+    expect(test.store.getSnapshot().notice).toBeNull();
+    expect(test.core.getSnapshot().status.kind).toBe("idle");
+  } finally { await test.close(); }
+});
+
 it("uses native Tab completion and Escape without cancelling a Run", async () => {
   const test = setup();
   const cancel = vi.spyOn(test.store, "cancel");
@@ -498,7 +523,7 @@ it("keeps a newer approval and its selected action when an effort save finishes"
   });
   vi.spyOn(core, "setReasoningEffort").mockImplementation(() => new Promise(resolve => { releaseSave = resolve; }));
   const decision = vi.spyOn(core, "resolveApproval");
-  const store = new TuiStore(core, parseSettings({}));
+  const store = new TuiStore(core, parseSettings({}), { skillsRoot: tempDir("shana-app-skills-") });
   const terminal = new VirtualTerminal();
   const tui = new TuiAltScreen(terminal);
   const app = new TuiApp(store, tui);
@@ -636,7 +661,7 @@ describe("审批 UX：到达自动展开，结束自动折叠，按决议追踪�
         },
       },
     });
-    const store = new TuiStore(core, parseSettings({}));
+    const store = new TuiStore(core, parseSettings({}), { skillsRoot: tempDir("shana-app-skills-") });
     vi.spyOn(store, "items").mockImplementation(() => {
       const pending = core.getSnapshot().pendingApproval;
       const items = [
