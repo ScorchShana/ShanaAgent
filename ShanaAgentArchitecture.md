@@ -150,7 +150,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - 框架优先：内置 shana-tui 位于 `src/tui/framework/`（来源与许可见同目录 SOURCE.md）。
 - 交互不变量：TUI 不是唯一安全门，Controller 仍校验状态/权限；审批为非遮挡面板、键盘焦点归审批；快照 + 订阅原子提供；高频流式聚合渲染，TUI 慢不影响 Core 推进；展示层不改写存储、SDK 消息与模型回放；TUI 意外退出请求取消并收尾，不让 Agent 无人管理继续执行。
 - 布局、键位、配色、折叠、鼠标等展示交互细节以代码（`src/tui/`）为准。
-- Skill 调用展示：蓝色 skill 卡片（标题 `skill:<name>`，默认折叠、点击展开快照 Markdown 正文）置于请求气泡之前；气泡只显示请求原文（空请求不渲染气泡）；`/skill:` 补全菜单按需读 skills 目录、无缓存。
+- Skill 调用展示：蓝色 skill 卡片（标题 `skill:<name>`，默认折叠、点击展开快照 Markdown 正文）置于请求气泡之前；气泡只显示请求原文（空请求不渲染气泡）；`/` 与 `/skill:` 补全菜单均按需读 skills 目录、无缓存，`/` 菜单命令在前、`/skill:<name>` 项按前缀匹配追加在后（无占位项，`/skill:` 语法提示保留在未知命令提示中）。
 
 ## 10. 工程目录
 

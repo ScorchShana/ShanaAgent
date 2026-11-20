@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { SessionController, type CompactionDriver } from "../../src/core/session-controller.js";
 import type { CompactionOutcome } from "../../src/sessions/compaction-store.js";
 import { parseSettings } from "../../src/llm/settings-store.js";
@@ -12,6 +12,10 @@ import {
 import { UnknownSideEffectsError } from "../../src/sessions/recovery.js";
 import type { SessionRecord } from "../../src/sessions/records.js";
 import { makeAssistantMessage } from "../sessions/helpers.js";
+import { cleanupTempDirs, tempDir } from "../tools/helpers.js";
+
+// / 菜单会按需读 skills 目录：注入空临时目录，杜绝断言随真实 home 漂移。
+afterEach(cleanupTempDirs);
 
 it("isolates result and Diff expansion and resets only the collapsed tool preview", async () => {
   const store = new TuiStore(controller(async () => ({ outcome: "completed" })), parseSettings({}));
@@ -125,6 +129,7 @@ describe("TuiStore", () => {
       parseSettings({}),
       {
         onExit,
+        skillsRoot: tempDir("shana-store-skills-"),
       },
     );
     store.setDraft("/q");
@@ -1418,7 +1423,7 @@ function compactionFixture(execute: CompactionDriver["execute"]) {
 }
 
 async function loadedStore(core: SessionController): Promise<TuiStore> {
-  const store = new TuiStore(core, parseSettings({}));
+  const store = new TuiStore(core, parseSettings({}), { skillsRoot: tempDir("shana-store-skills-") });
   await store.refreshHistory();
   return store;
 }
@@ -1960,7 +1965,7 @@ it("offers autodecision completion and rejects invalid arguments without a Run",
   const core = controller(async () => {
     throw new Error("must not run");
   });
-  const store = new TuiStore(core, parseSettings({}));
+  const store = new TuiStore(core, parseSettings({}), { skillsRoot: tempDir("shana-store-skills-") });
   try {
     store.setDraft("/auto");
     expect(store.commandOptions().map((option) => option.name)).toContain("/autodecision");
