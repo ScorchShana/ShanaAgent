@@ -14,6 +14,7 @@ import {
   type StoredAssistantMessage,
   type ToolResultRecord,
   type UserPromptRecord,
+  type SkillSnapshot,
 } from "../sessions/records.js";
 import {
   findLatestCheckpoint,
@@ -21,6 +22,7 @@ import {
   type ResponseExclusionReason,
 } from "../sessions/recovery.js";
 import { estimateImageTokens } from "../tools/image-header.js";
+import { renderSkillMessage, splitSkillCommand } from "./skills.js";
 
 // invalid_turn：协议损坏（非法 call 身份、多余/错配结果），正常落盘路径不会产生，防御性排除。
 export type TurnExclusionReason =
@@ -59,6 +61,7 @@ export interface EffectiveContextPlan {
   checkpoint: CheckpointRecord | null;
   coveredUpTo: number;
   runs: RunPlan[];
+  nextPromptFollowsCancellation: boolean;
 }
 
 export interface TokenEstimateOptions {
@@ -189,17 +192,22 @@ function classifyTurn(
 export function planEffectiveContext(records: readonly SessionRecord[]): EffectiveContextPlan {
   const checkpoint = findLatestCheckpoint(records);
   const coveredUpTo = checkpoint?.coveredUpTo ?? 0;
-  const toolResults = records.filter((record): record is ToolResultRecord => record.type === "tool_result");
+  const toolResults = new Map<number, ToolResultRecord[]>();
   const outcomes = new Map<string, SessionRunOutcome>();
-  for (const record of records)
+  for (const record of records) {
     if (record.type === "run_finished") outcomes.set(record.runId, record.outcome);
+    if (record.type === "tool_result") {
+      const owned = toolResults.get(record.assistantRecordSeq);
+      if (owned) owned.push(record);
+      else toolResults.set(record.assistantRecordSeq, [record]);
+    }
+  }
   const runs: RunPlan[] = [];
   const runIds = new Map<RunPlan, string | undefined>();
   let current: RunPlan | null = null;
   let blockedReason: TurnExclusionReason | null = null;
 
   for (const record of records) {
-    if (record.recordSeq <= coveredUpTo) continue;
 
     if (record.type === "user_prompt") {
       current = { prompt: record, promptIncluded: false, cancelled: false, failed: false, followsCancelledZeroTurn: false, turns: [], excludedTurns: [] };
@@ -224,7 +232,7 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
       continue;
     }
 
-    const classification = classifyTurn(record, toolResults);
+    const classification = classifyTurn(record, toolResults.get(record.recordSeq) ?? []);
     if (classification.kind === "eligible") {
       current.turns.push(classification.turn);
     } else {
@@ -244,13 +252,28 @@ export function planEffectiveContext(records: readonly SessionRecord[]): Effecti
     const outcome = runId === undefined ? undefined : outcomes.get(runId);
     run.cancelled = outcome === "cancelled";
     run.failed = outcome === "failed";
-    run.promptIncluded = run.prompt !== null;
     const previous = runs[index - 1];
     run.followsCancelledZeroTurn =
       previous !== undefined && previous.cancelled && previous.turns.length === 0;
   }
 
-  return { checkpoint, coveredUpTo, runs };
+  const last = runs.at(-1);
+  const nextPromptFollowsCancellation = last?.cancelled === true && last.turns.length === 0;
+  // Resolve interruption prefixes before projecting the checkpoint tail.
+  for (const run of runs) {
+    run.turns = run.turns.filter((turn) => turn.assistant.recordSeq > coveredUpTo);
+    run.excludedTurns = run.excludedTurns.filter((turn) => turn.assistant.recordSeq > coveredUpTo);
+    if (run.prompt !== null && run.prompt.recordSeq <= coveredUpTo && run.turns.length === 0) {
+      run.prompt = null;
+    }
+    run.promptIncluded = run.prompt !== null;
+  }
+  return {
+    checkpoint,
+    coveredUpTo,
+    runs: runs.filter((run) => run.promptIncluded || run.turns.length > 0 || run.excludedTurns.length > 0),
+    nextPromptFollowsCancellation,
+  };
 }
 
 export interface AgentsMdDeps {
@@ -306,6 +329,8 @@ export interface BuildContextInput {
   records: readonly SessionRecord[];
   // 仅在开始新请求时追加；从已含当前 Prompt 的记录重建时省略，避免重复。
   currentPrompt?: string;
+  // 与 currentPrompt 并列的 skill 快照，仅 Run 起点传入；重建路径由记录自带快照驱动。
+  currentSkill?: SkillSnapshot;
   workspacePath: string;
   systemPrompt?: string;
   // 仅提供环境正文；<environment> 区块由 buildContext 包裹。
@@ -324,10 +349,18 @@ export interface BuiltContext {
   warnings: ContextBuildWarning[];
 }
 
+// user_prompt 的唯一渲染内核：skill 展开 + 中断前缀。重建 / currentPrompt / 压缩估算共用，
+// 保证所有消费点逐字一致（锚定前缀同一性依赖此确定性）。前缀恒在最前，skill 块与请求相邻。
+function renderPromptText(text: string, skill: SkillSnapshot | undefined, prefixed: boolean): string {
+  const command = skill ? splitSkillCommand(text) : null;
+  const body = skill && command ? renderSkillMessage(skill, command.request) : text;
+  return prefixed ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + body : body;
+}
+
 function promptMessage(record: UserPromptRecord, prefixed = false): UserMessage {
   return {
     role: "user",
-    content: prefixed ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + record.text : record.text,
+    content: renderPromptText(record.text, record.skill, prefixed),
     timestamp: Date.parse(record.ts),
   };
 }
@@ -454,35 +487,24 @@ function renderAgentsMd(load: AgentsMdLoad, warnings: ContextBuildWarning[]): st
   return `<project_instructions>\n${load.content}${closingNewline}</project_instructions>`;
 }
 
+export function replayContextMessages(plan: EffectiveContextPlan, imageInput: boolean): StoredContext["messages"] {
+  const messages = plan.checkpoint === null ? [] : [summaryMessage(plan.checkpoint)];
+  return [...messages, ...plan.runs.flatMap((run) => runMessages(run, imageInput))];
+}
+
 export async function buildContext(input: BuildContextInput): Promise<BuiltContext> {
   const plan = planEffectiveContext(input.records);
   const agentsMd = input.agentsMd ?? (await loadRootAgentsMd(input.workspacePath));
   const warnings: ContextBuildWarning[] = [];
-  const messages: StoredContext["messages"] = [];
-
-  if (plan.checkpoint !== null) {
-    messages.push(summaryMessage(plan.checkpoint));
-  }
-  for (const run of plan.runs) {
-    if (run.promptIncluded && run.prompt !== null) {
-      messages.push(promptMessage(run.prompt, run.followsCancelledZeroTurn));
-      messages.push(...zeroTurnAnnotations(run));
-    }
-    for (const turn of run.turns) {
-      messages.push(...turnMessages(turn, input.imageInput ?? true));
-    }
-  }
+  const messages = replayContextMessages(plan, input.imageInput ?? true);
   if (input.currentPrompt !== undefined) {
     const now = input.now ?? (() => new Date());
     // 与重建路径同一规则（新 Prompt 的 Run 尚未在记录里，取末尾 Run 判定）：
     // 锚定 sameSentMessage 逐条比较，两条路径必须逐字一致。
-    const previous = plan.runs.at(-1);
-    const prefixed = previous !== undefined && previous.cancelled && previous.turns.length === 0;
+    const prefixed = plan.nextPromptFollowsCancellation;
     messages.push({
       role: "user",
-      content: prefixed
-        ? PREVIOUS_REQUEST_INTERRUPTED_PREFIX + input.currentPrompt
-        : input.currentPrompt,
+      content: renderPromptText(input.currentPrompt, input.currentSkill, prefixed),
       timestamp: now().getTime(),
     });
   }
@@ -514,19 +536,16 @@ export interface CompactionSelection {
   messages: StoredContext["messages"];
   coveredUpTo: number;
   previousSummary: string | null;
+  retainedMessages: StoredContext["messages"];
 }
 
 export interface PlanCompactionOptions {
-  keepLatestTurn: boolean;
+  trigger: "start" | "continuation" | "manual" | "overflow";
+  currentRunId?: string;
   retainedContextBudget: number;
   tokenEstimate: TokenEstimateOptions;
   // 与正式请求同构：预算估算和摘要输入消息都按当前模型能力渲染 image 块。
   imageInput?: boolean;
-}
-
-interface PlannedTurn {
-  run: RunPlan;
-  turn: EligibleTurn;
 }
 
 function turnBoundary(turn: EligibleTurn): number {
@@ -535,23 +554,13 @@ function turnBoundary(turn: EligibleTurn): number {
   return boundary;
 }
 
-function estimateTurnTokens(
-  turn: EligibleTurn,
-  tokenEstimate: TokenEstimateOptions,
-  imageInput = true,
-): number {
-  let total = estimateMessageTokens(turn.assistant.message, tokenEstimate);
-  for (const result of turn.results) {
-    total += estimateMessageTokens(toolResultMessage(result, imageInput), tokenEstimate);
-  }
-  // 合成占位与标注同样发送给 Provider，计入预算才不会高估可保留尾部。
-  for (const call of turn.missingCalls) {
-    total += estimateMessageTokens(syntheticUnknownResultMessage(call, turn.assistant.ts), tokenEstimate);
-  }
-  if (turn.assistant.message.stopReason === "aborted")
-    total += estimateTokens(INTERRUPTED_RESPONSE_ANNOTATION, tokenEstimate);
-  if (turn.hasUnknown) total += estimateTokens(UNKNOWN_RESULT_ANNOTATION, tokenEstimate);
-  return total;
+function runPromptMessages(run: RunPlan): StoredContext["messages"] {
+  if (!run.promptIncluded || run.prompt === null) return [];
+  return [promptMessage(run.prompt, run.followsCancelledZeroTurn), ...zeroTurnAnnotations(run)];
+}
+
+function runMessages(run: RunPlan, imageInput: boolean): StoredContext["messages"] {
+  return [...runPromptMessages(run), ...run.turns.flatMap((turn) => turnMessages(turn, imageInput))];
 }
 
 // 提交前预校验候选覆盖边界；非法边界会让 /resume 直接失败。
@@ -578,64 +587,69 @@ export function planCompaction(
 ): CompactionSelection | { status: "noop" } {
   const plan = planEffectiveContext(records);
   const imageInput = options.imageInput ?? true;
-  const planned: PlannedTurn[] = [];
-  for (const run of plan.runs) {
-    for (const turn of run.turns) planned.push({ run, turn });
+  const { runs } = plan;
+  const active = options.currentRunId === undefined
+    ? undefined
+    : runs.find((run) => run.prompt?.runId === options.currentRunId);
+  const latestRun = runs.findLast((run) => run.turns.length > 0);
+  // Overflow on the first request keeps the preceding Turn alongside the new prompt.
+  let target = latestRun;
+  if (options.trigger === "start") target = active;
+  if (options.trigger === "continuation") target = active ?? latestRun;
+  if (options.trigger === "overflow") target = latestRun ?? active;
+  const targetIndex = target === undefined ? runs.length : runs.indexOf(target);
+  const finishes = new Map<string, number>();
+  for (const record of records) {
+    if (record.type === "run_finished") finishes.set(record.runId, record.recordSeq);
   }
-  if (planned.length === 0) return { status: "noop" };
-
-  let tailStart = planned.length;
-  if (options.keepLatestTurn) {
-    // Prompt 只有在所属 Run 没有 Turn 被覆盖时才留在重建后的 Context 里；
-    // 保留预算按此归属计入，否则会高估尾部成本而少保留 Turn。
-    const firstTurnOfRun = new Map<RunPlan, number>();
-    for (const [index, entry] of planned.entries()) {
-      if (!firstTurnOfRun.has(entry.run)) firstTurnOfRun.set(entry.run, index);
-    }
-    const promptTokens = (run: RunPlan) =>
-      run.prompt === null
-        ? 0
-        : estimateTokens(run.prompt.text, options.tokenEstimate) +
-          (run.followsCancelledZeroTurn
-            ? estimateTokens(PREVIOUS_REQUEST_INTERRUPTED_PREFIX, options.tokenEstimate)
-            : 0);
-
-    const latestIndex = planned.length - 1;
-    const latest = planned[latestIndex]!;
-    tailStart = latestIndex;
-    let retained = estimateTurnTokens(latest.turn, options.tokenEstimate, imageInput);
-    if (firstTurnOfRun.get(latest.run) === latestIndex) retained += promptTokens(latest.run);
-    for (let index = latestIndex - 1; index >= 0; index -= 1) {
-      const candidate = planned[index]!;
-      let cost = estimateTurnTokens(candidate.turn, options.tokenEstimate, imageInput);
-      if (firstTurnOfRun.get(candidate.run) === index) cost += promptTokens(candidate.run);
-      if (retained + cost > options.retainedContextBudget) break;
-      retained += cost;
-      tailStart = index;
+  let coveredUpTo = plan.coveredUpTo;
+  for (const run of runs.slice(0, targetIndex)) {
+    const last = run.turns.at(-1);
+    if (last !== undefined) coveredUpTo = turnBoundary(last);
+    else if (run.promptIncluded && run.prompt?.runId !== undefined) {
+      const finish = finishes.get(run.prompt.runId);
+      if (finish !== undefined) coveredUpTo = finish;
     }
   }
-  // 最新 Turn 之前没有可压缩 Turn：noop，不算失败。
-  if (tailStart === 0) return { status: "noop" };
 
-  const covered = planned.slice(0, tailStart);
-  const coveredSeqs = new Set(covered.map(({ turn }) => turn.assistant.recordSeq));
-  const coveredUpTo = turnBoundary(covered[covered.length - 1]!.turn);
-  const messages: StoredContext["messages"] = [];
-  for (const run of plan.runs) {
-    const turns = run.turns.filter((turn) => coveredSeqs.has(turn.assistant.recordSeq));
-    // 零 Turn Run 的 Prompt 恒进上下文；落在覆盖范围内时同样进摘要输入，否则压缩会静默丢掉它。
-    const promptCovered = run.prompt !== null && run.prompt.recordSeq <= coveredUpTo;
-    if (turns.length === 0 && !promptCovered) continue;
-    if (promptCovered && run.prompt !== null) {
-      messages.push(promptMessage(run.prompt, run.followsCancelledZeroTurn));
-      messages.push(...zeroTurnAnnotations(run));
+  if (target !== undefined && target.turns.length > 0 && options.trigger !== "start") {
+    const trailing = runs.slice(targetIndex + 1).flatMap((run) => runMessages(run, imageInput));
+    const latest = target.turns.length - 1;
+    let cost = estimateContextTokens({
+      messages: [...runPromptMessages(target), ...turnMessages(target.turns[latest]!, imageInput), ...trailing],
+    }, options.tokenEstimate);
+    let firstRetained = latest;
+    while (firstRetained > 0) {
+      const messages = turnMessages(target.turns[firstRetained - 1]!, imageInput);
+      cost += estimateContextTokens({ messages }, options.tokenEstimate);
+      if (cost > options.retainedContextBudget) break;
+      firstRetained--;
     }
-    for (const turn of turns) {
-      messages.push(...turnMessages(turn, imageInput));
+    // Explicit compaction and overflow remediation need to advance the checkpoint.
+    const forceProgress = options.trigger === "manual" || options.trigger === "overflow";
+    if (forceProgress && firstRetained === 0 && coveredUpTo === plan.coveredUpTo && latest > 0) {
+      firstRetained = 1;
     }
+    if (firstRetained > 0) coveredUpTo = turnBoundary(target.turns[firstRetained - 1]!);
   }
+
+  if (coveredUpTo <= plan.coveredUpTo) return { status: "noop" };
   assertCandidateCheckpointValid(records, coveredUpTo);
-  return { messages, coveredUpTo, previousSummary: plan.checkpoint?.summary ?? null };
+  const messages: StoredContext["messages"] = [];
+  const retainedMessages: StoredContext["messages"] = [];
+  for (const run of runs) {
+    const prompt = runPromptMessages(run);
+    const coveredPrompt = run.prompt !== null && run.prompt.recordSeq <= coveredUpTo;
+    if (coveredPrompt) messages.push(...prompt);
+    if (!coveredPrompt || run.turns.some((turn) => turn.assistant.recordSeq > coveredUpTo)) {
+      retainedMessages.push(...prompt);
+    }
+    for (const turn of run.turns) {
+      const destination = turn.assistant.recordSeq <= coveredUpTo ? messages : retainedMessages;
+      destination.push(...turnMessages(turn, imageInput));
+    }
+  }
+  return { messages, retainedMessages, coveredUpTo, previousSummary: plan.checkpoint?.summary ?? null };
 }
 
 const COMPACTION_TRIM_LADDER = [1, 1 / 4, 1 / 10] as const;

@@ -146,7 +146,7 @@ function harness(
     settings: parseSettings({}),
     signal: new AbortController().signal,
     retainedContextBudget: 1000,
-    keepLatestTurn: false,
+    trigger: "start",
     modelService: {
       streamTurn: async (request) => {
         requests.push(request);
@@ -238,7 +238,8 @@ describe("主路径请求形态", () => {
 
   it("已有 Checkpoint 时旧摘要作为头部 user 消息原样保留，不重复注入", async () => {
     const records = [...makeRecords(), makeCheckpointRecord(6, "old summary", 3)];
-    const h = harness({ records, context: makeContext(records) });
+    const fresh = await buildContext({ records, workspacePath: tempDir() });
+    const h = harness({ records, context: { ...makeContext(records), messages: fresh.context.messages } });
     const outcome = await compactHistory(h.options);
     expect(outcome).toMatchObject({ status: "completed", coveredUpTo: 5 });
     const request = h.requests[0]!;
@@ -375,9 +376,10 @@ describe("Checkpoint 与恢复", () => {
   });
 
   it("保留尾部时 Checkpoint recordSeq 大于尾部 Turn，重建按 coveredUpTo 取尾部", async () => {
-    const h = harness({ keepLatestTurn: true, retainedContextBudget: 1 });
+    const h = harness({ trigger: "continuation", retainedContextBudget: 1 });
     const outcome = await compactHistory(h.options);
     expect(outcome).toMatchObject({ status: "completed", coveredUpTo: 3 });
+    expect(h.requests[0]!.context.messages.slice(0, -1)).toEqual(h.options.context.messages.slice(0, 3));
     const checkpoint: SessionRecord = {
       ...(h.appended[0] as Extract<NewSessionRecord, { type: "checkpoint" }>),
       recordSeq: 100,
@@ -390,10 +392,11 @@ describe("Checkpoint 与恢复", () => {
       workspacePath: tempDir(),
       systemPrompt: "system prompt",
     });
-    expect(rebuilt.context.messages).toHaveLength(3);
+    expect(rebuilt.context.messages).toHaveLength(4);
+    expect(rebuilt.context.messages[1]).toMatchObject({ role: "user", content: "first goal" });
     const tailAssistant = h.records[3] as Extract<SessionRecord, { type: "assistant_message" }>;
-    expect(rebuilt.context.messages[1]).toBe(tailAssistant.message);
-    expect(rebuilt.context.messages[2]).toMatchObject({ role: "toolResult", toolCallId: "c2" });
+    expect(rebuilt.context.messages[2]).toBe(tailAssistant.message);
+    expect(rebuilt.context.messages[3]).toMatchObject({ role: "toolResult", toolCallId: "c2" });
   });
 
   it("未持有 Session 锁时写入被拒绝", async () => {
@@ -460,6 +463,19 @@ describe("取消", () => {
 });
 
 describe("预算与回退路径", () => {
+  it("完整上下文放不下摘要指令时，只要覆盖前缀放得下就走主路径", async () => {
+    const records = makeRecords();
+    (records[2] as ToolResultRecord).content = "a".repeat(16000);
+    (records[4] as ToolResultRecord).content = "b".repeat(16000);
+    const context = makeContext(records);
+    const h = harness({
+      records, context, trigger: "continuation", currentRunId: "run-1",
+      retainedContextBudget: 1, model: makeModel({ contextWindow: 15000 }),
+    });
+    expect(await compactHistory(h.options)).toMatchObject({ path: "primary", coveredUpTo: 3 });
+    expect(h.requests[0]!.context.messages.slice(0, -1)).toEqual(context.messages.slice(0, 3));
+  });
+
   it("下界已 >= C 时不调用模型直接失败", async () => {
     const h = harness({ model: makeModel({ contextWindow: 100 }) });
     await expect(compactHistory(h.options)).rejects.toThrow("超出上下文窗口");
@@ -491,7 +507,7 @@ describe("预算与回退路径", () => {
   function fallbackWindow(records: SessionRecord[]): number {
     const settings = parseSettings({});
     const selection = planCompaction(records, {
-      keepLatestTurn: false,
+      trigger: "start",
       retainedContextBudget: 0,
       tokenEstimate: settings.tokenEstimate,
     });
@@ -566,7 +582,8 @@ describe("预算与回退路径", () => {
   it("回退请求中 previousSummary 作为头部 user 消息只出现一次，且不进入 System Prompt", async () => {
     const records = [...makeRecords(), makeCheckpointRecord(6, "old summary", 3)];
     (records[4] as ToolResultRecord).content = "x".repeat(100000);
-    const context = makeContext(records);
+    const fresh = await buildContext({ records, workspacePath: tempDir() });
+    const context = { ...makeContext(records), messages: fresh.context.messages };
     const h = harness({
       records,
       context,
@@ -578,7 +595,7 @@ describe("预算与回退路径", () => {
     expect(request.context.systemPrompt).toBe(context.systemPrompt);
     expect(request.context.systemPrompt).not.toContain("old summary");
     const messages = request.context.messages;
-    expect(messages.map((message) => message.role)).toEqual(["user", "assistant", "toolResult", "user"]);
+    expect(messages.map((message) => message.role)).toEqual(["user", "user", "assistant", "toolResult", "user"]);
     expect(messages[0]!.content).toBe(wrapConversationSummary("old summary"));
     expect(JSON.stringify(messages).split("old summary")).toHaveLength(2);
   });
@@ -597,7 +614,7 @@ describe("预算与回退路径", () => {
   });
 
   it("最新 Turn 之前无可压缩 Turn 时返回 noop，不算失败", async () => {
-    const h = harness({ keepLatestTurn: true, retainedContextBudget: 1000 });
+    const h = harness({ trigger: "continuation", retainedContextBudget: 1000 });
     h.options.records = h.records.slice(0, 3);
     h.options.context = makeContext(h.options.records);
     expect(await compactHistory(h.options)).toEqual({ status: "noop", coveredUpTo: null, path: "primary" });
@@ -732,7 +749,7 @@ describe("含图历史双模态压缩", () => {
       records,
       context: makeImageContext(records, true),
       model: makeModel({ input: ["text", "image"] }),
-      keepLatestTurn: true,
+      trigger: "continuation",
       retainedContextBudget: 100,
     });
     // 最新 Turn 是小文本；含图 Turn 2765 tokens 超预算 → 被覆盖。
@@ -740,7 +757,7 @@ describe("含图历史双模态压缩", () => {
     const text = harness({
       records,
       context: makeImageContext(records, false),
-      keepLatestTurn: true,
+      trigger: "continuation",
       retainedContextBudget: 100,
     });
     expect(await compactHistory(text.options)).toEqual({ status: "noop", coveredUpTo: null, path: "primary" });

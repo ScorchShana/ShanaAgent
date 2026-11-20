@@ -1,6 +1,9 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { BusEvent, RunFinishedEvent } from "../../src/core/events.js";
 import type { CompactionOutcome } from "../../src/sessions/compaction-store.js";
+import type { SkillSnapshot } from "../../src/sessions/records.js";
+import { SkillLoadError } from "../../src/core/skills.js";
+import { cleanupTempDirs, tempDir, writeFileAt } from "../tools/helpers.js";
 import {
   SessionController,
   type AgentLoopDriver,
@@ -25,6 +28,7 @@ function makeController(
     hooks?: ConstructorParameters<typeof SessionController>[0]["hooks"];
     compactor?: ConstructorParameters<typeof SessionController>[0]["compactor"];
     commands?: ConstructorParameters<typeof SessionController>[0]["commands"];
+    skillsRoot?: string;
   } = {},
 ) {
   const events: BusEvent[] = [];
@@ -33,6 +37,7 @@ function makeController(
     hooks: extras.hooks,
     compactor: extras.compactor,
     commands: extras.commands,
+    skillsRoot: extras.skillsRoot,
   });
   controller.eventBus.subscribe((event) => events.push(event));
   const snapshots = controller.getSnapshot.bind(controller);
@@ -1149,5 +1154,95 @@ describe("压后估算 contextEstimateTokens", () => {
     await controller.compact();
     await controller.resumeSession({ workspaceId: "ws", sessionId: "other" });
     expect(snapshots().session.contextEstimateTokens).toBeNull();
+  });
+});
+
+describe("skill 显式调用（/skill:name）", () => {
+  afterEach(cleanupTempDirs);
+
+  function skillsRootWith(name: string, content: string): string {
+    const root = tempDir("shana-skills-");
+    writeFileAt(root, `${name}/SKILL.md`, content);
+    return root;
+  }
+
+  it("成功：快照经 persistRunStart 传导，text 恒存完整原文，run.finished 恰一次", async () => {
+    const root = skillsRootWith("review", "---\ndescription: d\n---\n# Review\n\nbody");
+    const persisted: Array<{ runId: string; prompt: string; skill?: SkillSnapshot }> = [];
+    const { controller, events } = makeController(idleDriver, {
+      skillsRoot: root,
+      hooks: {
+        persistRunStart: async (runId, prompt, skill) => {
+          persisted.push({ runId, prompt, skill });
+        },
+      },
+    });
+    await expect(controller.submitPrompt("/skill:review fix the bug")).resolves.toBe("completed");
+    expect(persisted).toHaveLength(1);
+    expect(persisted[0]!.prompt).toBe("/skill:review fix the bug");
+    expect(persisted[0]!.skill).toMatchObject({ name: "review", content: "# Review\n\nbody" });
+    expect(persisted[0]!.skill!.location).toContain("SKILL.md");
+    expect(finishedEvents(events)).toHaveLength(1);
+  });
+
+  it("普通 Prompt：persistRunStart 不携带快照（原路径零改动）", async () => {
+    const persisted: Array<{ skill?: SkillSnapshot }> = [];
+    const { controller } = makeController(idleDriver, {
+      hooks: {
+        persistRunStart: async (_runId, _prompt, skill) => {
+          persisted.push({ skill });
+        },
+      },
+    });
+    await controller.submitPrompt("plain prompt");
+    expect(persisted[0]!.skill).toBeUndefined();
+  });
+
+  it("加载失败同步抛 SkillLoadError：无事件、无 persistRunStart、状态 idle、可重提", async () => {
+    const root = skillsRootWith("review", "body");
+    const persisted: string[] = [];
+    const { controller, events, snapshots } = makeController(idleDriver, {
+      skillsRoot: root,
+      hooks: { persistRunStart: async (runId) => void persisted.push(runId) },
+    });
+    expect(() => controller.submitPrompt("/skill:ghost fix")).toThrow(SkillLoadError);
+    try {
+      controller.submitPrompt("/skill:ghost fix");
+    } catch (error) {
+      expect((error as SkillLoadError).code).toBe("not_found");
+      expect((error as SkillLoadError).skillName).toBe("ghost");
+    }
+    expect(events).toHaveLength(0);
+    expect(persisted).toHaveLength(0);
+    expect(snapshots().status).toEqual({ kind: "idle" });
+    // 失败不污染状态：同一 controller 可继续正常提交。
+    await expect(controller.submitPrompt("/skill:review ok")).resolves.toBe("completed");
+    expect(finishedEvents(events)).toHaveLength(1);
+  });
+
+  it("非法 name 同步抛 invalid_name；空 name 同样拒绝", () => {
+    const root = skillsRootWith("review", "body");
+    const { controller, events } = makeController(idleDriver, { skillsRoot: root });
+    for (const text of ["/skill:Bad x", "/skill:", "/skill:../evil"]) {
+      try {
+        controller.submitPrompt(text);
+        throw new Error(`expected SkillLoadError for ${text}`);
+      } catch (error) {
+        expect(error).toBeInstanceOf(SkillLoadError);
+        expect((error as SkillLoadError).code).toBe("invalid_name");
+      }
+    }
+    expect(events).toHaveLength(0);
+    expect(controller.getSnapshot().status).toEqual({ kind: "idle" });
+  });
+
+  it("运行中提交 /skill: 仍受 Busy 门控（加载不绕过占有检查）", async () => {
+    const root = skillsRootWith("review", "body");
+    const gate = deferred<LoopEnd>();
+    const { controller } = makeController({ execute: () => gate.promise }, { skillsRoot: root });
+    const first = controller.submitPrompt("/skill:review one");
+    expect(() => controller.submitPrompt("/skill:review two")).toThrow(BusyError);
+    gate.resolve({ outcome: "completed" });
+    await first;
   });
 });

@@ -133,3 +133,81 @@ describe("V4 path-policy — 内外部判定", () => {
     expect(() => policy.resolve("a\0b")).toThrow(PathPolicyError);
   });
 });
+
+describe("skills 只读区（insideSkills）", () => {
+  function makeRoots(): { ws: string; skills: string } {
+    return { ws: tempDir("shana-ws-"), skills: tempDir("shana-skills-") };
+  }
+
+  it("skills 区内文件 insideSkills=true 且 insideWorkspace=false；区内文件反之", () => {
+    const { ws, skills } = makeRoots();
+    writeFileAt(ws, "a.txt", "x");
+    const skillFile = writeFileAt(skills, "review/SKILL.md", "body");
+    const policy = createPathPolicy(ws, process.platform, skills);
+    expect(policy.skillsRoot).toBe(fs.realpathSync.native(skills));
+
+    const inside = policy.resolve(skillFile);
+    expect(inside.insideSkills).toBe(true);
+    expect(inside.insideWorkspace).toBe(false);
+    const workspace = policy.resolve("a.txt");
+    expect(workspace.insideSkills).toBe(false);
+    expect(workspace.insideWorkspace).toBe(true);
+  });
+
+  it("同前缀兄弟目录与 ~/.shana 其他子目录不算 skills 区", () => {
+    const parent = tempDir("shana-home-");
+    const ws = path.join(parent, "ws");
+    fs.mkdirSync(ws);
+    const skills = path.join(parent, ".shana", "skills");
+    fs.mkdirSync(skills, { recursive: true });
+    const sibling = writeFileAt(parent, ".shana/skills-other/x.txt", "x");
+    const sessions = writeFileAt(parent, ".shana/sessions/s.jsonl", "{}");
+    const logs = writeFileAt(parent, ".shana/logs/d.log", "x");
+    const policy = createPathPolicy(ws, process.platform, skills);
+    for (const file of [sibling, sessions, logs]) {
+      expect(policy.resolve(file).insideSkills).toBe(false);
+    }
+    expect(policy.resolve(writeFileAt(skills, "review/SKILL.md", "x")).insideSkills).toBe(true);
+  });
+
+  it("目录链接逃逸到 skills 区外不豁免", () => {
+    if (!DIR_LINKS) return;
+    const { ws, skills } = makeRoots();
+    const outside = tempDir("shana-out-");
+    writeFileAt(outside, "secret.txt", "secret");
+    createDirLink(outside, path.join(skills, "escape"));
+    const policy = createPathPolicy(ws, process.platform, skills);
+    const resolved = policy.resolve(path.join(skills, "escape", "secret.txt"));
+    expect(resolved.insideSkills).toBe(false);
+    expect(resolved.insideWorkspace).toBe(false);
+  });
+
+  it("skills 根本身是链接时以真实路径为边界；缺根回退绝对路径不炸", () => {
+    const { ws } = makeRoots();
+    const missing = path.join(tempDir("shana-missing-"), "skills");
+    const policy = createPathPolicy(ws, process.platform, missing);
+    expect(policy.skillsRoot).toBe(path.resolve(missing));
+    const file = writeFileAt(missing, "review/SKILL.md", "x");
+    expect(policy.resolve(file).insideSkills).toBe(true);
+
+    if (!DIR_LINKS) return;
+    const real = tempDir("shana-skills-real-");
+    writeFileAt(real, "review/SKILL.md", "x");
+    const linkRoot = path.join(tempDir("shana-skills-link-"), "skills");
+    createDirLink(real, linkRoot);
+    const linked = createPathPolicy(ws, process.platform, linkRoot);
+    expect(linked.skillsRoot).toBe(fs.realpathSync.native(real));
+    expect(linked.resolve(path.join(linkRoot, "review", "SKILL.md")).insideSkills).toBe(true);
+  });
+
+  it("悬空符号链接不算 skills 区", () => {
+    if (!FILE_SYMLINKS) return;
+    const { ws, skills } = makeRoots();
+    const missingTarget = path.join(tempDir("shana-missing-"), "ghost.md");
+    fs.symlinkSync(missingTarget, path.join(skills, "dangling.md"), "file");
+    const policy = createPathPolicy(ws, process.platform, skills);
+    const resolved = policy.resolve(path.join(skills, "dangling.md"));
+    expect(resolved.danglingSymlink).toBe(true);
+    expect(resolved.insideSkills).toBe(false);
+  });
+});

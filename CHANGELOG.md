@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## 0.4.0 — 2026-11-20
+
+- **修复**：自动压缩和手动 `/compact` 按 Run 选择保留范围。新请求开始前单独保留本次输入；执行途中和手动压缩优先保留最近的有效 Run，预算不足时保留所属用户输入和最近连续 Turn。摘要主路径仅发送截至覆盖边界的原始消息前缀。恢复旧 checkpoint 时会补回跨边界 Turn 的用户输入，沿用现有 Session 字段。旧版程序可能无法恢复采用零 Turn Run 结束记录作为边界的新 checkpoint。
+
+- **新增**：Skill 显式调用 `/skill:<name> [请求]`。提交时同步加载 `~/.shana/skills/<name>/SKILL.md` 快照（剥 frontmatter、UTF-8 严格解码、realpath 防 symlink 逃逸），失败在 Run 开始前报错——不创建 Session/Run、状态保持空闲、草稿保留可改后重提。模型侧渲染为 `<skill name location>` + 引导语 + 快照正文 + `</skill>` + 空行 + 请求原文（空请求允许）；中断前缀叠加在最前；正式请求/压缩摘要输入/锚定重建共用同一渲染内核，逐字同构。System Prompt 零改动；压缩摘要保留执行中 skill 的指令要点。
+- **新增**：`~/.shana/skills` 只读豁免区——read/glob/grep/view_image 恒允许、无需审批或决策；write/edit/bash 不豁免，skills 写入仍属区外逐次人工审批且会话授权不能豁免。四工具描述同步例外句（首次升级后工具 Schema 变化触发一次锚定回退，属预期）。
+- **新增**：TUI skill 卡片——蓝色标题 `skill:<name>` 默认折叠、点击展开快照 Markdown 正文，置于请求气泡之前；气泡只显示请求原文（空请求不渲染气泡）；resume/重启回放由记录快照派生。`/skill:` 补全菜单按需读目录（无缓存，运行期间新增 skill 立即可补全），两次 Enter 确认；会话标题与列表预览剥命令前缀（空请求回退 `skill:<name>`）。
+- **破坏性变更**：Session 格式升级 v4 → v5（meta 与首条记录均 `version: 5`；`user_prompt` 新增可选 `skill` 快照字段，`text` 恒存含命令的完整原文）。v2/v3/v4 Session 不再可读（文件保留不删除，列表跳过），不迁移、不降级。**勿混跑新旧版本**：旧版二进制无法读取 v5 Session。
+
 ## 0.2.6 — 2026-11-19
 
 - 新增：kitty 协议终端下 view_image 的 jpeg/webp 真图显示。sharp 后台异步转码为 PNG：渲染期同步查表，未命中先显示文本回退行，就绪后自动重渲染出真图；EXIF 方向自动旋转，长边超过 2048px 只缩不放（显示最高 14 行，远超所需），动图 webp 取首帧。转码为纯显示层缓存：Session 记录保留原图 base64，不落盘、格式零变更，resume 后按需重转码。iTerm2 与无协议终端行为不变。新增依赖 sharp（native prebuild，Windows x64 / Linux x64）。

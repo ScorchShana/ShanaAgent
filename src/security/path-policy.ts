@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 export class PathPolicyError extends Error {
@@ -11,11 +12,15 @@ export class PathPolicyError extends Error {
   }
 }
 
+// skills 只读区根：精确限定 skills/ 子目录，~/.shana 其余（sessions/logs/model.json）无任何放行。
+export const DEFAULT_SKILLS_ROOT = path.join(os.homedir(), ".shana", "skills");
+
 export interface ResolvedToolPath {
   requested: string;
   absolutePath: string;
   realPath: string;
   insideWorkspace: boolean;
+  insideSkills: boolean;
   exists: boolean;
   isSymlink: boolean;
   danglingSymlink: boolean;
@@ -23,6 +28,7 @@ export interface ResolvedToolPath {
 
 export interface PathPolicy {
   workspaceRoot: string;
+  skillsRoot: string;
   platform: NodeJS.Platform;
   resolve(rawPath: string): ResolvedToolPath;
   isInside(candidateRealPath: string): boolean;
@@ -92,8 +98,8 @@ function resolveMissingPath(
   }
 }
 
-function canonicalWorkspaceRoot(rawWorkspaceRoot: string, platform: NodeJS.Platform): string {
-  const absolute = path.resolve(rawWorkspaceRoot);
+function canonicalRoot(rawRoot: string, platform: NodeJS.Platform): string {
+  const absolute = path.resolve(rawRoot);
   try {
     return canonicalRealPath(absolute, platform);
   } catch {
@@ -104,8 +110,10 @@ function canonicalWorkspaceRoot(rawWorkspaceRoot: string, platform: NodeJS.Platf
 export function createPathPolicy(
   rawWorkspaceRoot: string,
   platform: NodeJS.Platform = process.platform,
+  rawSkillsRoot: string = DEFAULT_SKILLS_ROOT,
 ): PathPolicy {
-  const workspaceRoot = canonicalWorkspaceRoot(rawWorkspaceRoot, platform);
+  const workspaceRoot = canonicalRoot(rawWorkspaceRoot, platform);
+  const skillsRoot = canonicalRoot(rawSkillsRoot, platform);
 
   function inside(candidate: string): boolean {
     return !candidate.includes("\0") && isPathInside(workspaceRoot, candidate, platform);
@@ -160,13 +168,15 @@ export function createPathPolicy(
       absolutePath,
       realPath,
       insideWorkspace: !danglingSymlink && inside(realPath),
+      insideSkills:
+        !danglingSymlink && !realPath.includes("\0") && isPathInside(skillsRoot, realPath, platform),
       exists,
       isSymlink,
       danglingSymlink,
     };
   }
 
-  return { workspaceRoot, platform, resolve, isInside: inside };
+  return { workspaceRoot, skillsRoot, platform, resolve, isInside: inside };
 }
 
 export class PathTargetChangedError extends PathPolicyError {

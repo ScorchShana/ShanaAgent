@@ -142,6 +142,19 @@ function assertCheckpointValid(records: readonly SessionRecord[], checkpoint: Ch
     if (!blocked) eligible.add(record.recordSeq);
   }
 
+  if (boundary.type === "run_finished") {
+    const prompt = records.findLast(
+      (record) => record.type === "user_prompt" && record.recordSeq < coveredUpTo,
+    );
+    if (
+      prompt?.type === "user_prompt" && prompt.runId === boundary.runId &&
+      !assistants.some((record) => record.runId === boundary.runId && eligible.has(record.recordSeq)) &&
+      !records.some((record) => record.recordSeq > coveredUpTo &&
+        (record.type === "assistant_message" || record.type === "tool_result") && record.runId === boundary.runId)
+    ) return;
+    throw new CheckpointInvalidError(checkpoint, "边界必须属于已结束且无可回放 Turn 的 Run");
+  }
+
   if (boundary.type === "tool_result") {
     const owner = assistants[assistants.length - 1];
     if (owner === undefined) {

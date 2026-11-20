@@ -1,7 +1,9 @@
 import type { ReasoningEffort } from "../llm/model-config-store.js";
 import type { CompactionOutcome } from "../sessions/compaction-store.js";
+import type { SkillSnapshot } from "../sessions/records.js";
 import type { SessionRef, SessionHistory } from "../sessions/session-store.js";
 import { EventBus, type EventListener } from "./event-bus.js";
+import { loadSkill, splitSkillCommand } from "./skills.js";
 import type { CompactionFinishedEvent, FormalEvent } from "./events.js";
 import {
   BusyError,
@@ -76,7 +78,7 @@ export interface ControllerHooks {
   captureRunInput?(): void;
   closeSession?(): Promise<void>;
   assertCanStartRun?(): void;
-  persistRunStart?(runId: string, prompt: string): Promise<void>;
+  persistRunStart?(runId: string, prompt: string, skill?: SkillSnapshot): Promise<void>;
   persistToolCompleted?(toolCallId: string): Promise<void>;
   persistRunFinished?(info: { runId: string; outcome: RunOutcome; elapsedMs: number }): Promise<void>;
 }
@@ -89,12 +91,15 @@ export interface SessionControllerOptions {
   compactor?: CompactionDriver;
   hooks?: ControllerHooks;
   createId?: (prefix: string) => string;
+  // skills 根可注入（测试用临时目录）；缺省 ~/.shana/skills。
+  skillsRoot?: string;
 }
 
 interface RunContext {
   startedAt: number;
   elapsedMs: number | null;
   prompt: string;
+  skill: SkillSnapshot | null;
   id: string;
   abortController: AbortController;
   cancellationAccepted: boolean;
@@ -118,6 +123,7 @@ export class SessionController {
   private readonly compactor: CompactionDriver | undefined;
   private readonly hooks: ControllerHooks;
   private readonly createId: (prefix: string) => string;
+  private readonly skillsRoot: string | undefined;
 
   private readonly commands: ControllerCommands;
   private commandPending = false;
@@ -148,6 +154,7 @@ export class SessionController {
     this.commands = options.commands ?? {};
     this.compactor = options.compactor;
     this.hooks = options.hooks ?? {};
+    this.skillsRoot = options.skillsRoot;
     const counters = new Map<string, number>();
     this.createId =
       options.createId ??
@@ -166,8 +173,13 @@ export class SessionController {
     if (this.closing) throw new InvalidStateError("Session is closed");
     if (this.commandPending) throw new BusyError("Session operation in progress");
     this.hooks.assertCanStartRun?.();
+    // skill 加载在 beginRun 之前同步完成：失败抛 SkillLoadError，不创建 Session/Run/事件，
+    // 状态保持 idle（与 InvalidStateError/BusyError 同一先例）。
+    const command = splitSkillCommand(text);
+    const skill = command ? loadSkill(command.name, this.skillsRoot) : null;
     const run = this.beginRun("submitPrompt");
     run.prompt = text;
+    run.skill = skill;
     return this.driveRun(run);
   }
 
@@ -414,6 +426,7 @@ export class SessionController {
       startedAt: this.now(),
       elapsedMs: null,
       prompt: "",
+      skill: null,
       id: this.createId("run"),
       abortController: new AbortController(),
       cancellationAccepted: false,
@@ -441,7 +454,7 @@ export class SessionController {
       }
       this.bus.publish({ type: "run.started", runId: run.id } satisfies FormalEvent);
       try {
-        await this.hooks.persistRunStart?.(run.id, run.prompt);
+        await this.hooks.persistRunStart?.(run.id, run.prompt, run.skill ?? undefined);
       } catch (error) {
         return this.finalizeRun(run, "failed", { persisted: false, error });
       }

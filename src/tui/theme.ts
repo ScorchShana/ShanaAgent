@@ -29,6 +29,8 @@ export const theme = {
 export const background = (color: string) => (text: string) =>
   styleText(text, { bg: parseColor(color) }, getTerminalColorMode());
 export const userBackground = background("#202C40");
+// skill 快照卡片：蓝色系深底，与用户气泡/工具卡片同族但可区分。
+export const skillBackground = background("#1E2A4A");
 export function toolBackground(status: string) {
   return background(
     status === "success"

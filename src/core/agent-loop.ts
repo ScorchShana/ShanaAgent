@@ -25,6 +25,7 @@ import {
   type SessionMeta,
   type SessionRecord,
   type StoredAssistantMessage,
+  type UserPromptRecord,
 } from "../sessions/records.js";
 import type { SessionRef, SessionStore, SessionLoadWarning } from "../sessions/session-store.js";
 import { createToolExecutor, type ToolExecutorOptions, type ToolExecutionResult } from "../tools/executor.js";
@@ -48,6 +49,7 @@ import {
   type RunHandle,
   type LoopEnd,
 } from "./session-controller.js";
+import { splitSkillCommand } from "./skills.js";
 
 export interface AgentSessionOptions {
   store: SessionStore;
@@ -58,6 +60,8 @@ export interface AgentSessionOptions {
   workspaceId: string;
   ref?: SessionRef;
   workspaceRoot: string;
+  // skills 根可注入（测试用临时目录）；缺省 ~/.shana/skills。
+  skillsRoot?: string;
   getModel(): ResolvedModel;
   getSettings(): Settings;
   modelService: Pick<ModelService, "streamTurn">;
@@ -109,6 +113,15 @@ function computeBaselineTokens(
   );
 }
 
+function retainedContextBudget(context: StoredContext, model: ResolvedModel, settings: Settings): number {
+  const fixedTokens = estimateContextTokens({ ...context, messages: [] }, settings.tokenEstimate);
+  return Math.min(
+    model.contextWindow - CONTEXT_SAFETY_MARGIN_TOKENS - settings.compactionSummaryTargetTokens - fixedTokens,
+    Math.floor(model.contextWindow * settings.compactionRetainedContextRatio),
+    settings.compactionRetainedContextMaxTokens,
+  );
+}
+
 // usage 只有出自本 Run 模型的真实响应才是可信测量；身份不符（如代理改写模型）时
 // tokenizer 可能不同，实测值不得用于锚定。
 function sameModelIdentity(message: StoredAssistantMessage, model: ResolvedModel): boolean {
@@ -139,6 +152,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   const initial = options.ref ? await options.store.openSession(options.ref) : null;
   let ref: SessionRef | null = options.ref ? { ...options.ref } : null;
   let records = initial?.records ?? [];
+  let openedAtSeq = records.at(-1)?.recordSeq ?? 0;
   let sessionMeta: SessionMeta | null = initial?.meta ?? null;
   let sessionWarnings: SessionLoadWarning[] = initial?.warnings ?? [];
   let autoDecisionEnabled = sessionMeta?.autoDecisionEnabled ?? true;
@@ -230,13 +244,20 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let recordsFresh = true;
   let recordsEpoch = 0;
   let resyncPromise: Promise<void> | null = null;
+  // 标题/预览只显示请求原文（剥 /skill:name 命令前缀），记录恒存完整原文；
+  // 空请求回退 skill:<name>，避免标题/预览空白。
+  const displayPromptText = (record: UserPromptRecord): string => {
+    const command = splitSkillCommand(record.text);
+    if (!command) return record.text;
+    return command.request.trim() ? command.request : `skill:${command.name}`;
+  };
   const titleOf = (history: readonly SessionRecord[]): string => {
     const prompt = history.find((record) => record.type === "user_prompt" && record.text.trim());
     return prompt?.type === "user_prompt"
-      ? prompt.text
+      ? (displayPromptText(prompt)
           .split(/\r?\n/)
-          .find((line) => line.trim())!
-          .trim()
+          .find((line) => line.trim())
+          ?.trim() ?? "未命名会话")
       : "未命名会话";
   };
   let sessionTitle = ref ? titleOf(records) : null;
@@ -515,6 +536,13 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         reason = "prefix_build_failed";
         break;
       }
+      // 旧 checkpoint 未标记回放策略，跨进程载入的实测可能没有包含补回的 Prompt。
+      if (record.recordSeq <= openedAtSeq && prefix.plan.runs.some(
+        (run) => run.prompt && run.prompt.recordSeq <= prefix.plan.coveredUpTo,
+      )) {
+        reason = "restored_prompt";
+        break;
+      }
       const count = prefix.context.messages.length;
       if (
         prefix.context.systemPrompt !== context.systemPrompt ||
@@ -538,7 +566,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   const compactForRun = async (
     handle: RunHandle,
     signal: AbortSignal,
-    keepLatestTurn: boolean,
+    trigger: "start" | "continuation" | "overflow",
   ): Promise<CompactionOutcome> => {
     handle.reportPhase("compacting");
     handle.notifyCompactionStarted();
@@ -546,26 +574,15 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     let outcome: CompactionOutcome;
     try {
       if (!recordsFresh) await resyncRecords();
-      // 尾部保留预算不含 Prompt：planCompaction 的 walk-back 已按 Run 归属计入。
-      const fixedTokens = estimateContextTokens({ ...built.context, messages: [] }, tokenEstimate);
-      const feasibilityBudget =
-        runModel.contextWindow -
-        CONTEXT_SAFETY_MARGIN_TOKENS -
-        runSettings.compactionSummaryTargetTokens -
-        fixedTokens;
-      // cap 只收紧 keepLatestTurn=true 的 (B)/溢出补救；keepLatestTurn=false 时下游忽略预算。
-      const retainedCap = Math.min(
-        Math.floor(runModel.contextWindow * runSettings.compactionRetainedContextRatio),
-        runSettings.compactionRetainedContextMaxTokens,
-      );
       outcome = await compactHistory({
         records,
         context: built.context,
         model: runModel,
         settings: runSettings,
         signal,
-        retainedContextBudget: Math.min(feasibilityBudget, retainedCap),
-        keepLatestTurn,
+        retainedContextBudget: retainedContextBudget(built.context, runModel, runSettings),
+        trigger,
+        currentRunId: handle.runId,
         modelService: options.modelService,
         appendRecord: append,
       });
@@ -683,7 +700,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           ) {
             let compactionCancelled = false;
             try {
-              const outcome = await compactForRun(handle, signal, turn > 1);
+              const outcome = await compactForRun(handle, signal, turn > 1 ? "continuation" : "start");
               compactionCancelled = outcome.status === "cancelled";
             } catch (error) {
               autoCompactionFailedThisRun = true;
@@ -734,7 +751,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             handle.finishAttempt("failed");
             let outcome: CompactionOutcome;
             try {
-              outcome = await compactForRun(handle, signal, true);
+              outcome = await compactForRun(handle, signal, "overflow");
             } catch (remediationError) {
               throw new Error("Context length exceeded. Use /compact or start a new Session.", {
                 cause: remediationError,
@@ -908,6 +925,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   ): void => {
     ref = nextRef;
     records = nextRecords;
+    openedAtSeq = nextRecords.at(-1)?.recordSeq ?? 0;
     sessionMeta = nextMeta;
     autoDecisionEnabled = nextMeta?.autoDecisionEnabled ?? true;
     metadataFresh = true;
@@ -949,8 +967,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         model,
         settings,
         signal,
-        retainedContextBudget: 0,
-        keepLatestTurn: false,
+        retainedContextBudget: retainedContextBudget(context, model, settings),
+        trigger: "manual",
         focus,
         modelService: options.modelService,
         appendRecord: append,
@@ -982,6 +1000,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   const controller = new SessionController({
     driver,
     compactor,
+    skillsRoot: options.skillsRoot,
     commands: {
       getAutoDecisionStatus: async () => {
         if (ref) {
@@ -1049,7 +1068,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           const runCount = Math.max(started.size, prompted.size + promptsWithoutRunId);
           entries.push({
             title: titleOf(history.records),
-            preview: prompts.at(-1)?.text ?? "",
+            preview: prompts.at(-1) ? displayPromptText(prompts.at(-1)!) : "",
             lastActiveAt: history.records.at(-1)?.ts ?? meta.createdAt,
             occupied: await options.store.isSessionOccupied({ workspaceId, sessionId: meta.sessionId }),
             ...meta,
@@ -1134,12 +1153,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         if (shellBlocked) throw new Error("Shell termination is not confirmed. Cannot start a new Run.");
         gate.assertCanStartRun();
       },
-      persistRunStart: async (runId, prompt) => {
+      persistRunStart: async (runId, prompt, skill) => {
         if (!recordsFresh) await resyncRecords();
         const prior = records.slice();
         const snapshot = createModelSnapshot(runModel);
         const initialRecords: NewSessionRecord[] = [
-          { type: "user_prompt", runId, text: prompt },
+          { type: "user_prompt", runId, text: prompt, ...(skill ? { skill } : {}) },
           {
             type: "run_started",
             runId,
@@ -1174,6 +1193,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         built = await buildContext({
           records: prior,
           currentPrompt: prompt,
+          currentSkill: skill,
           workspacePath: options.workspaceRoot,
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,

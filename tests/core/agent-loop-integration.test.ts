@@ -1130,7 +1130,7 @@ async function compactionFixture(overrides: Partial<AgentSessionOptions> = {}) {
     runId: "old",
     message: makeAssistantMessage([{ id: "c1", name: "read", arguments: { path: "a" } }]),
   });
-  await store.appendRecord(ref, {
+  const firstResult = await store.appendRecord(ref, {
     type: "tool_result",
     runId: "old",
     assistantRecordSeq: a1.recordSeq,
@@ -1144,7 +1144,7 @@ async function compactionFixture(overrides: Partial<AgentSessionOptions> = {}) {
     runId: "old",
     message: makeAssistantMessage([{ id: "c2", name: "read", arguments: { path: "b" } }]),
   });
-  const r2 = await store.appendRecord(ref, {
+  await store.appendRecord(ref, {
     type: "tool_result",
     runId: "old",
     assistantRecordSeq: a2.recordSeq,
@@ -1169,7 +1169,7 @@ async function compactionFixture(overrides: Partial<AgentSessionOptions> = {}) {
     },
     ...overrides,
   });
-  return { ...session, store, ref, requests, lastSeq: r2.recordSeq };
+  return { ...session, store, ref, requests, boundary: firstResult.recordSeq };
 }
 
 it("manual compact without an open Session fails without creating one", async () => {
@@ -1191,10 +1191,10 @@ it("manual compact without an open Session fails without creating one", async ()
   expect(session.controller.getSnapshot().status).toEqual({ kind: "idle" });
 });
 
-it("manual compact covers all eligible turns without retaining a tail", async () => {
+it("manual compact retains the prompt and latest Turn when only one Run exists", async () => {
   const f = await compactionFixture();
   const outcome = await f.controller.compact();
-  expect(outcome).toMatchObject({ status: "completed", coveredUpTo: f.lastSeq, path: "primary" });
+  expect(outcome).toMatchObject({ status: "completed", coveredUpTo: f.boundary, path: "primary" });
   // 压后估算写入快照，供状态栏在实测过期时立即更新。
   expect(f.controller.getSnapshot().session.contextEstimateTokens).toBeGreaterThan(0);
   expect(f.requests).toHaveLength(1);
@@ -1206,7 +1206,7 @@ it("manual compact covers all eligible turns without retaining a tail", async ()
   const records = (await f.store.loadSession(f.ref)).records;
   const checkpoints = records.filter((r) => r.type === "checkpoint");
   expect(checkpoints).toHaveLength(1);
-  expect(checkpoints[0]).toMatchObject({ summary: "SUMMARY", coveredUpTo: f.lastSeq });
+  expect(checkpoints[0]).toMatchObject({ summary: "SUMMARY", coveredUpTo: f.boundary });
   expect(records.filter((r) => r.type === "user_prompt")).toHaveLength(1);
   expect(f.controller.getSnapshot().status).toEqual({ kind: "idle" });
 });
@@ -1274,11 +1274,12 @@ it("manual compact after a Run reuses the frozen system prompt and tool schemas 
     },
   });
   expect(await f.controller.submitPrompt("work")).toBe("completed");
+  expect(await f.controller.submitPrompt("follow up")).toBe("completed");
   fs.writeFileSync(path.join(f.workspaceRoot, "AGENTS.md"), "changed rules after the Run");
   await expect(f.controller.compact()).resolves.toMatchObject({ status: "completed" });
-  expect(requests).toHaveLength(2);
-  expect(requests[1]!.context.systemPrompt).toBe(requests[0]!.context.systemPrompt);
-  expect(JSON.stringify(requests[1]!.context.tools)).toBe(JSON.stringify(requests[0]!.context.tools));
+  expect(requests).toHaveLength(3);
+  expect(requests[2]!.context.systemPrompt).toBe(requests[0]!.context.systemPrompt);
+  expect(JSON.stringify(requests[2]!.context.tools)).toBe(JSON.stringify(requests[0]!.context.tools));
 });
 
 it("manual compact after resume without a new Run reloads the Session snapshot", async () => {
@@ -1294,12 +1295,13 @@ it("manual compact after resume without a new Run reloads the Session snapshot",
     },
   });
   expect(await f.controller.submitPrompt("work")).toBe("completed");
+  expect(await f.controller.submitPrompt("follow up")).toBe("completed");
   fs.writeFileSync(path.join(f.workspaceRoot, "AGENTS.md"), "fresh rules for compaction");
   await f.controller.newSession();
   await f.controller.resumeSession(f.ref);
   await expect(f.controller.compact()).resolves.toMatchObject({ status: "completed" });
-  expect(requests).toHaveLength(2);
-  expect(requests[1]!.context.systemPrompt).toContain("fresh rules for compaction");
+  expect(requests).toHaveLength(3);
+  expect(requests[2]!.context.systemPrompt).toContain("fresh rules for compaction");
 });
 
 type AgentWarning = Parameters<NonNullable<AgentSessionOptions["onWarning"]>>[0];
@@ -1441,11 +1443,11 @@ it("auto compacts at Run start (A) keeping the primary request prefix byte-ident
   expect(await f.controller.submitPrompt("test")).toBe("completed");
   expect(f.requests).toHaveLength(2);
   expect(f.requests[0]!.maxTokens).toBeUndefined();
-  expect(f.requests[0]!.context.messages).toHaveLength(7);
+  expect(f.requests[0]!.context.messages).toHaveLength(6);
   const instruction = f.requests[0]!.context.messages.at(-1)!;
   expect(instruction.role).toBe("user");
   expect((instruction as { content: string }).content).toContain("4096");
-  expect(f.requests[0]!.context.messages.at(-2)).toMatchObject({ role: "user", content: "test" });
+  expect(f.requests[0]!.context.messages.at(-2)?.role).toBe("toolResult");
   expect(f.requests[0]!.context.systemPrompt).toBe(f.requests[1]!.context.systemPrompt);
   expect(JSON.stringify(f.requests[0]!.context.tools)).toBe(JSON.stringify(f.requests[1]!.context.tools));
   expect(f.requests[1]!.context.messages).toHaveLength(2);
@@ -1554,7 +1556,7 @@ it("auto compaction at (B) retains the latest Turn verbatim and covers older Tur
   );
   expect(await f.controller.submitPrompt("test")).toBe("completed");
   expect(f.requests).toHaveLength(3);
-  expect(f.requests[1]!.context.tools).toEqual([]);
+  expect(f.requests[1]!.context.tools).toEqual(f.requests[0]!.context.tools);
   expect(f.requests[1]!.context.systemPrompt).toBe(f.requests[0]!.context.systemPrompt);
   expect(f.requests[2]!.context.messages[0]).toMatchObject({
     role: "user",
@@ -1567,7 +1569,7 @@ it("auto compaction at (B) retains the latest Turn verbatim and covers older Tur
   expect(phases.indexOf("compacting")).toBeGreaterThan(phases.indexOf("executing_tool"));
   expect(finishedCompactions(f.events)[0]).toMatchObject({
     status: "completed",
-    path: "fallback",
+    path: "primary",
     coveredUpTo: lastSeq,
   });
   expect(finishedCompactions(f.events)[0]!.runId).toBeDefined();
@@ -1656,12 +1658,21 @@ it("allows multiple compactions in one Run separated by a new Turn", async () =>
 });
 
 it("treats noop as non-failure and still compacts later in the same Run", async () => {
-  const f = await autoFixture((call) => {
-    if (call === 1) return turn(makeAssistantMessage([readCall("t1")], textOfTokens(8000, "b")));
-    if (call === 2) return turn(makeAssistantMessage([readCall("t2")], textOfTokens(8000, "c")));
-    if (call === 3) return summaryTurn("SUMMARY");
-    return turn(makeAssistantMessage([], "done"));
-  });
+  let firstTurnTokens = 0;
+  const f = await autoFixture(
+    (call) => {
+      if (call === 1) return turn(makeAssistantMessage([readCall("t1")], textOfTokens(firstTurnTokens, "b")));
+      if (call === 2) return turn(makeAssistantMessage([readCall("t2")], textOfTokens(8000, "c")));
+      if (call === 3) return summaryTurn("SUMMARY");
+      return turn(makeAssistantMessage([], "done"));
+    },
+    {
+      // Turn1 须单独越过阈值，才能先触发一次无可覆盖内容的 noop。
+      seed: async (_store, _ref, fixed) => {
+        firstTurnTokens = 20000 * AUTO_SETTINGS.compactionThresholdRatio - fixed + 500;
+      },
+    },
+  );
   expect(await f.controller.submitPrompt("test")).toBe("completed");
   expect(f.requests).toHaveLength(4);
   expect(finishedCompactions(f.events).map((e) => e.status)).toEqual(["noop", "completed"]);
@@ -1808,7 +1819,7 @@ it("remediates context overflow once and resends the same Turn without consuming
   const records = (await f.store.loadSession(f.ref)).records;
   const first = records.find((r) => r.type === "tool_result" && r.toolCallId === "s1")!;
   expect(records.find((r) => r.type === "checkpoint")).toMatchObject({ coveredUpTo: first.recordSeq });
-  expect(finishedCompactions(f.events)[0]).toMatchObject({ status: "completed", path: "fallback" });
+  expect(finishedCompactions(f.events)[0]).toMatchObject({ status: "completed", path: "primary" });
 });
 
 it("fails on a second context overflow in the same Run", async () => {
@@ -1982,11 +1993,7 @@ it("retains the whole tail (noop) at (B) when the cap is loose", async () => {
     },
     {
       getModel: () => autoModel(40000),
-      // 同样的种子与窗口，但 cap 放开（继承 AUTO_SETTINGS 的 ratio=1、绝对上限极大）：尾部全部保留 -> noop。
       settings: { compactionThresholdRatio: 0.3 },
-      seed: async (store, ref) => {
-        await seedOldRun(store, ref, [1000, 1000]);
-      },
     },
   );
   expect(await f.controller.submitPrompt("test")).toBe("completed");

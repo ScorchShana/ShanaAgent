@@ -21,7 +21,13 @@ export type PermissionDenyReason = "no_approver" | "denied_by_user" | "approver_
 export type PermissionOutcome =
   | {
       decision: "allow";
-      basis: "workspace_read" | "session_grant" | "approved_once" | "approved_for_session" | "decision_model";
+      basis:
+        | "workspace_read"
+        | "skills_read"
+        | "session_grant"
+        | "approved_once"
+        | "approved_for_session"
+        | "decision_model";
     }
   | { decision: "deny"; reason: PermissionDenyReason }
   | { decision: "cancelled" };

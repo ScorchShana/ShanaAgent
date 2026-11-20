@@ -82,16 +82,16 @@ describe("V1 记录枚举与 Schema 校验", () => {
   it("合法记录通过校验；首条记录必须且仅允许首条携带 version", () => {
     const prompt = { recordSeq: 1, ts: TS, type: "user_prompt", runId: "run-1", text: "hi" };
     expect(parseSessionRecord(prompt, { expectVersion: false }).type).toBe("user_prompt");
-    expect(parseSessionRecord({ ...prompt, version: 4 }, { expectVersion: true }).recordSeq).toBe(1);
+    expect(parseSessionRecord({ ...prompt, version: 5 }, { expectVersion: true }).recordSeq).toBe(1);
     expect(() => parseSessionRecord(prompt, { expectVersion: true })).toThrow(/缺少 "version"/);
     expect(() =>
-      parseSessionRecord({ ...prompt, recordSeq: 2, version: 4 }, { expectVersion: false }),
+      parseSessionRecord({ ...prompt, recordSeq: 2, version: 5 }, { expectVersion: false }),
     ).toThrow(/仅首条记录允许/);
   });
 
   it("非法 type / status / outcome / 未知字段被拒绝", () => {
     expect(() =>
-      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 4 }, { expectVersion: true }),
+      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 5 }, { expectVersion: true }),
     ).toThrow(RecordValidationError);
     expect(() =>
       parseSessionRecord(
@@ -325,7 +325,7 @@ it("accepts optional elapsedMs and rejects invalid audit durations", () => {
     type: "run_finished",
     recordSeq: 1,
     ts: TS,
-    version: 4,
+    version: 5,
     runId: "r",
     outcome: "completed",
     persisted: true,
@@ -346,7 +346,7 @@ describe("checkpoint usage", () => {
     type: "checkpoint",
     recordSeq: 1,
     ts: TS,
-    version: 4,
+    version: 5,
     summary: "sum",
     coveredUpTo: 3,
     model: { providerId: "p", modelId: "m" },
@@ -384,7 +384,7 @@ describe("checkpoint usage", () => {
 });
 
 describe("autoDecisionEnabled metadata", () => {
-  const meta = { version: 4, sessionId: "s1", workspaceId: "ws", createdAt: TS };
+  const meta = { version: 5, sessionId: "s1", workspaceId: "ws", createdAt: TS };
   it("preserves absence and accepts both booleans", () => {
     expect(parseSessionMeta(meta)).not.toHaveProperty("autoDecisionEnabled");
     for (const enabled of [true, false]) {
@@ -393,5 +393,47 @@ describe("autoDecisionEnabled metadata", () => {
   });
   it.each([null, 0, 1, "true", {}, []])("rejects non-boolean %j", (value) => {
     expect(() => parseSessionMeta({ ...meta, autoDecisionEnabled: value })).toThrow(RecordValidationError);
+  });
+});
+
+describe("user_prompt 可选 skill 快照形态校验", () => {
+  const skill = { name: "review", location: "/skills/review/SKILL.md", content: "# Review\n\nbody" };
+  const prompt = { recordSeq: 1, ts: TS, type: "user_prompt", runId: "run-1", text: "/skill:review hi" };
+
+  it("缺省通过；合法快照原样保留（content 允许空串）", () => {
+    expect(parseSessionRecord(prompt, { expectVersion: false })).not.toHaveProperty("skill");
+    expect(parseSessionRecord({ ...prompt, skill }, { expectVersion: false })).toEqual({
+      ...prompt,
+      skill,
+    });
+    expect(
+      parseSessionRecord({ ...prompt, skill: { ...skill, content: "" } }, { expectVersion: false }),
+    ).toMatchObject({ skill: { content: "" } });
+  });
+
+  it("Windows 绝对路径 location 同样接受（跨平台拷贝）", () => {
+    const winLocation = "C:" + "\\skills\\review\\SKILL.md";
+    expect(
+      parseSessionRecord({ ...prompt, skill: { ...skill, location: winLocation } }, { expectVersion: false }),
+    ).toMatchObject({ skill: { location: winLocation } });
+  });
+
+  it.each([
+    ["非对象", "review"],
+    ["缺 name", { location: "/s/SKILL.md", content: "x" }],
+    ["缺 location", { name: "review", content: "x" }],
+    ["缺 content", { name: "review", location: "/s/SKILL.md" }],
+    ["多余键", { ...skill, extra: 1 }],
+    ["name 大写", { ...skill, name: "Review" }],
+    ["name traversal", { ...skill, name: "../evil" }],
+    ["name 空串", { ...skill, name: "" }],
+    ["name 首字符非法", { ...skill, name: "-lead" }],
+    ["location 相对路径", { ...skill, location: "skills/review/SKILL.md" }],
+    ["location 空串", { ...skill, location: "" }],
+    ["content 非字符串", { ...skill, content: 1 }],
+  ])("拒绝非法快照：%s", (_label, value) => {
+    expect(() => parseSessionRecord({ ...prompt, skill: value }, { expectVersion: false })).toThrow(
+      RecordValidationError,
+    );
   });
 });

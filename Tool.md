@@ -13,7 +13,7 @@
 - 同批任一工具结果 unknown：保留真实结果，停止同批剩余调用并逐个记录 `not_executed`，进入 Run 收尾，不发下一 Turn、不自动重试。
 - **UTF-8 ground rule**：read/write/edit 只操作 UTF-8 文本；解码失败或含 NUL 即判二进制拒绝，不降级、不覆盖（架构 §5）。carve-out：仅 read/write/edit 受此约束，view_image 是显式二进制只读通道。
 - **路径目标复验**：审批后及读取、破坏性打开、临时文件创建、rename 等关键操作前复验真实目标；变化返回 `Path target changed. Stop and ask user.`，不自动重试。复验与操作间的竞态窗口不承诺抵御。
-- 区外路径逐次审批；write/edit 经 path-policy 把符号链接解析为真实目标后判越区。
+- 区外路径逐次审批；例外：read/glob/grep/view_image 命中 `~/.shana/skills` 只读默认放行（精确限 `skills/` 子目录，`~/.shana` 其余不放行；write/edit/bash 不豁免）。write/edit 经 path-policy 把符号链接解析为真实目标后判越区。
 - 结果路径的显示转义仅作用于展示，调用历史保留原文；模型再次调用前须还原真实路径。
 
 ## read
@@ -50,5 +50,5 @@ globby 递归路径搜索，结果 newest first，每行一个路径。不跟随
 - 扩展名白名单 `.png/.jpg/.jpeg/.webp`（大小写不敏感）+ 文件头 magic 校验（PNG/JPEG/WEBP）；mimeType 以内容为准（扩展名与实际格式不符时按真实格式报告）。不支持 `Unsupported image format. Supported: png, jpg, jpeg, webp.`；magic 不符 `File content does not match a supported image format.`。
 - 大小上限 `viewImageMaxBytes`（默认 5 MiB，范围 1024–16777216）；stat 与限量读（max+1）双重检查防竞态增长，超限 `Image exceeds the size limit (N bytes; max M bytes).`。
 - 仅成功携带 images（恰 1 项：base64 + mimeType + 宽高）；失败/取消/拒绝只有 Error 文本，不带图。成功结果 `<path>…</path>` + `(Image attached: <mime>, <w>x<h>, <size>.)`。
-- 权限同 read：区内允许、区外逐次审批/自动决策，不产生会话授权；路径目标复验同总则。只读无副作用，取消在读取前后边界检查。
+- 权限同 read：区内与 `~/.shana/skills` 只读允许、其余区外逐次审批/自动决策，不产生会话授权；路径目标复验同总则。只读无副作用，取消在读取前后边界检查。
 - 非视觉模型回放含图历史时渲染期替换为显式占位文本（记录保留、切回可逆）；TUI 内联显示仅 kitty 协议 + PNG 出真图，其余文本回退（见架构 §7/§9）。

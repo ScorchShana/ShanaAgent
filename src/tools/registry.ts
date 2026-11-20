@@ -143,7 +143,9 @@ export class ToolArgumentError extends Error {
 }
 
 export function defaultNeedsApproval(action: ToolAction): boolean {
-  if (action.type === "read") return action.paths.some((target) => !target.insideWorkspace);
+  // skills 区只读默认放行（与区内读取同档）；write/edit/bash 不豁免。
+  if (action.type === "read")
+    return action.paths.some((target) => !target.insideWorkspace && !target.insideSkills);
   return true;
 }
 
@@ -450,7 +452,7 @@ const writeTool = defineTool<WriteArguments>({
       content: {
         type: "string",
         description:
-          "Complete new file content. Empty creates or overwrites with an empty file. Maximum 400000 Unicode code points. Must contain valid Unicode without NUL.",
+          "Complete new file content. Empty creates or overwrites with an empty file. Maximum 400000 characters. Must contain valid Unicode without NUL.",
       },
     },
     required: ["path", "content"],
@@ -492,12 +494,12 @@ const editTool = defineTool<EditArguments>({
         type: "string",
         minLength: 1,
         description:
-          "Exact text to replace after newline normalization. Maximum 100000 Unicode code points before normalization. Must contain valid Unicode without NUL.",
+          "Exact text to replace after newline normalization. Maximum 100000 characters before normalization. Must contain valid Unicode without NUL.",
       },
       new_string: {
         type: "string",
         description:
-          "Replacement text; empty deletes the match. Maximum 100000 Unicode code points before normalization. Must contain valid Unicode without NUL.",
+          "Replacement text; empty deletes the match. Maximum 100000 characters before normalization. Must contain valid Unicode without NUL.",
       },
       replace_all: {
         type: "boolean",

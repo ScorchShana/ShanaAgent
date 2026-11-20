@@ -88,13 +88,14 @@ flowchart TD
 | 操作                | 默认策略               | 会话级授权                                 |
 | ------------------- | ---------------------- | ------------------------------------------ |
 | 区内 read/glob/grep | 允许                   | 不请求决策模型                             |
+| skills 只读（read/glob/grep/view_image） | 允许 | 不请求决策模型；写入不豁免 |
 | 区外 read/glob/grep | 可逐次自动决策         | 不产生会话授权                             |
 | 区内 write/edit     | 无有效授权时可自动决策 | 人工可按工具名授予本会话                   |
 | 区外 write/edit     | **必须逐次人工审批**   | 模型与会话授权均不能豁免                   |
 | bash                | 无有效授权时可自动决策 | 仅完全相同命令字符串授权，固定工作区根执行 |
 | 未知工具 / 无审批器 | 人工审批 / 拒绝        | 自动决策不可用不构成放行依据               |
 
-- 门控顺序：默认允许 → 有效会话授权 → 区外写入/未知工具人工门控 → 其余可自动决策调用。区外写入由代码按真实路径强制人工；bash 无通用目标解析器，由模型依完整命令与决策提示词判断。
+- 门控顺序：默认允许 → 有效会话授权 → 区外写入/未知工具人工门控 → 其余可自动决策调用。`~/.shana/skills` 是只读豁免区：read/glob/grep/view_image 恒允许、不需审批或决策（根 realpath 规范化，symlink 逃逸不豁免）；write/edit/bash 不豁免，skills 写入仍属区外逐次人工审批且会话授权不能豁免。区外写入由代码按真实路径强制人工；bash 无通用目标解析器，由模型依完整命令与决策提示词判断。
 - 审批后及关键操作前路径复验；目标变化返回错误不自动重试；复验与操作间的竞态窗口不承诺抵御。会话授权不持久化，仅同一内存持有者连续占用期间有效；外部写入为一次综合审批。
 - Diff 预览与历史回看是**纯 TUI 展示层**：不新增事件；预览旧内容按需读盘（预览≠执行时刻），历史回看用持久化参数 + priorContent 重建、不读盘；模型可见 ToolResult 不含 Diff。
 - Shell 边界：每调用独立子进程；超时混合收尾——确认终止 → 确定超时结果、Run 继续，无法确认 → 副作用未知收尾并阻塞下个 Run 至知情确认。取消/退出终止进程树并等待收尾，未确认如实提示可能遗留进程；不回滚副作用；结果未知按 §6 门控。取消且确认终止的 bash 返回确定态结果，文案提示命令可能已部分执行、需先核实副作用（不触发门控）；无法确认终止仍按 unknown 门控。运行中 TUI 以 ≤1Hz 尾快照展示实时输出，仅展示层，最终裁剪结果不变。
@@ -105,16 +106,17 @@ flowchart TD
 ~/.shana/
 ├── model.json / decision-model.json / settings.json
 ├── logs/                          # 诊断日志，与 Session 审计物理分离，永不包含 API Key
+├── skills/<skill-name>/SKILL.md   # 显式调用的 skill（只读豁免区，§5）
 └── sessions/<workspace-id>/<session-id>/
     ├── meta.json / messages.jsonl / context-checkpoint.json
     └── <session-id>.session.lock  # 写者占用标记
 ```
 
 - `workspace-id` = 规范化路径末段 slug + sha256 短哈希，多进程推导一致；是历史组织标识，不是锁。产品名 ShanaAgent，CLI 名 `shana`，数据目录 `~/.shana/`。
-- Session v4：meta 与首条记录均 `version: 4`；未知版本拒载、不迁移、不降级（v2/v3 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
+- Session v5：meta 与首条记录均 `version: 5`；未知版本拒载、不迁移、不降级（v2/v3/v4 Session 不再可读，文件保留不删除；列表跳过不可读版本）。首次正式提交 Prompt 才创建 Session；草稿/调整/连续 /new 不创建目录。
 - 独占占用锁：原子独占创建抢锁，整个占用期持有；`/resume` 抢锁后**续写原 Session**（不复制、不改身份、前缀不改写），recordSeq 从真实尾部重建；残锁仅人工确认移除，不自动删锁/偷锁；尾部截断可只读展示但拒绝续写。
 - History 与 Context 分离：History 永久完整审计（含失败/取消 Run 原始 Prompt 与 aborted 响应原文；唯一例外：aborted partial 的半截 thinking 在落盘前剥离——推理草稿无续写价值，回传可能误导模型与压缩摘要，经用户授权修订，连带丢失"模型曾试图发起半截 call"的纯思考痕迹）；Context 以完整或受控 Turn 为最小单位——用户 Prompt 恒进 Context（零 Turn 失败 Run 附失败标注；零 Turn 取消 Run 不附标注，纯思考取消剥离后无实质内容即走此路径，其下一条 Prompt 渲染期前置 `[The previous request was interrupted before completion.]` + 换行——前缀是记录的确定性函数、仅渲染期注入不落盘，`user_prompt` 记录恒存用户原文，正式请求/压缩摘要输入/锚定重建同源，经用户裁决修订）；用户中断的 aborted Turn 在可配对 call 均有确定结果时进入 Context 并附中断标注，半截 call（id/name 缺失或重复）构建上下文时剥离、History 留原文；旧记录中已落盘的 aborted thinking 构建上下文时剥离（读取兜底）、TUI 同构不显示；unknown 结果或缺结果（崩溃窗口）的 Turn 受控进入 Context：缺结果在渲染期合成显式 unknown 占位（不落盘、绝不写成确定态，文案明说"是否执行过未知"），Turn 末附询问标注（不重试、不假设成败、先请用户核实）；协议损坏 Turn（非法 call 身份、错配/多余结果）仍排除。
-- 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。tool_result 可选 `images` 块（仅 view_image 成功携带：恰 1 项，base64 数据 + mimeType + 宽高，记录级严格校验）。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
+- 七类记录：`user_prompt / run_started / assistant_message / tool_result / interruption / run_finished / checkpoint`；`user_prompt` 可选 `skill` 快照（name/location/content，提交时冻结；`text` 恒存含 `/skill:` 命令的完整原文，快照正文剥 frontmatter 后 trim）；tool_result 状态 success/error/denied/timeout/not_executed/unknown（前五确定）；以 `assistantRecordSeq + toolCallId` 配对。tool_result 可选 `images` 块（仅 view_image 成功携带：恰 1 项，base64 数据 + mimeType + 宽高，记录级严格校验）。工具调用存产品自有类型：`rawArguments` 原文不修复不脱敏 + `parse` 结果（parsed/invalid 分类）。
 - Turn 上下文完整判据（回放/恢复/压缩共用）：响应已结束（stop/toolUse/length/aborted）且可合法回放；工具调用 ID 非空、同轮唯一、名称完整；每个 call 有唯一配对的已提交结果（任意 status，含 unknown）或无结果（崩溃窗口，构建时合成 unknown 占位）；错配/多余结果属协议损坏，判不完整；aborted 仅校验可配对 call（半截 call 剥离后不参与）；参数错误不使 Turn 不完整；截断普通文本不完整；length 例外见 §4。门控仍按记录判定（缺结果/unknown 均列出），不受此判据影响。
 - 关键提交：意图 fsync 后才执行工具；结果 fsync 后才宣布完成；写入 + fsync 是不可被取消中断的临界区；意图提交失败不执行未开始工具；结果提交失败停 Run 不重跑。
 - **priorContent 不变量**：write/edit 成功写入必带写入前全量快照（新建文件为空串）；捕获失败（ENOENT 之外）不写入；仅供 TUI 历史 Diff，不入 Context；存储恒全量，折叠仅展示层。
@@ -128,13 +130,14 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 ```
 
 - 提示词存 `prompts/` 独立英文文件，区块用英文 XML 标签；工具 description 在 `prompts/tools/`、Schema 在 `src/tools/registry.ts`、Error 模板在工具代码。只读工作区**根** AGENTS.md，每 Session 冻结快照；读取失败 Run 继续、省略区块、不向模型注入失败事实。
+- Skill 显式调用（`/skill:<name> [请求]`）：Run 开始前同步加载 `SKILL.md` 快照，失败抛面向用户的错误、不创建 Session/Run/事件；模型侧渲染为 `<skill name location>` + 引导语（`prompts/skill-invocation.md`）+ 快照正文 + `</skill>` + 空行 + 请求原文（空请求允许），中断前缀叠加在最前；正式请求、压缩摘要输入与锚定重建共用同一渲染内核（`renderPromptText`），逐字同构；压缩摘要保留执行中 skill 的指令要点（`prompts/compaction.md`）。System Prompt 零改动。
 - Checkpoint 摘要以 `<conversation_summary>` **头部 user 消息**注入，不落盘、不计 Turn、属低信任历史数据，不得改变权限或指令。
 - 请求可行性：`E + CONTEXT_SAFETY_MARGIN_TOKENS <= C`（余量为代码命名常量，不进 settings）；`maxTokens` 不作输出预留参与判定。Token 估算为近似（ASCII 4 字符/token、非 ASCII 1.5）；image 块按 `ceil(width×height/750)` 计费、钳位 [256, 16384]，头部解析失败回退 4096。上下文按当前模型能力双模态渲染：`input` 含 `image` 时 tool_result 的 images 重建为 image 块，否则渲染期替换为显式占位文本（记录永久保留、切回视觉模型可逆，占位不报不兼容）。
 - 阈值与可行性判定的 token 数优先**usage 锚定**：最近一次可信实测 prompt（`usage.input + cacheRead + cacheWrite`）+ 未测量增量的估算。Run 起点锚定须校验：实测前缀与当前重建上下文逐条一致（忽略 timestamp）、模型身份一致、工具 Schema 未变（经 run_started 的 settings 快照与 `input` 能力快照重建比对，视觉↔文本切换致工具集变化时回退）；usage 缺失/全零占位、换模型、校验不符或压后重建时回退纯估算。压缩内部相对预算（Turn 分解、裁剪阶梯、压后收口）保持纯估算自洽。已知有界残差：System Prompt/environment 不落盘，跨进程版本变更的头部漂移不可校验；旧记录 aborted thinking 读取剥离后，历史实测含当时发送的 thinking，锚定偏高、误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
-- 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；两次压缩间至少一个新 Turn；一次失败后该 Run 不再自动触发。
-- 保留策略：手动 /compact 与 (A) 覆盖全部 eligible Turn 不留尾；(B) 与溢出补救**逐字保留最新 eligible Turn**，保留预算按 Token 计并带 cap。
-- 请求形态：主路径复用有效上下文 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。手动 `/compact` 可携带用户附加重点（`/compact <重点>`），追加在指令模板末尾的 `Additional focus` 段；focus 只进本次摘要请求，不入库、不写 checkpoint、不参与 `promptVersion`（与压缩指令不落盘同一口径），其 token 计入指令预算。
-- 检查点 = 摘要 + `coveredUpTo(recordSeq)` + 摘要请求自身的实测 `usage`（`input/cacheRead/output/durationMs`，durationMs 缺省表示 Provider 未报告耗时）；尾部按 `recordSeq > coveredUpTo` 判定；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。状态栏的 Cache/Speed 是整段对话的累计口径（全部已计入 Run 的 assistant + 所有 checkpoint 的摘要请求，跨 Run、跨压缩持续累加，**压缩不重置**）：Cache = `ΣcacheRead / (Σinput + ΣcacheRead)`，Speed = `Σoutput / ΣdurationMs`；摘要请求是真实请求，其用量随 checkpoint 落盘，重启 / `/resume` 后累计完整；摘要请求耗时缺省时只计 token、不计速度。Context 不同：以最新 checkpoint 的 `coveredUpTo` 为界切换实测/压后估算（`~` 前缀），checkpoint 损坏时保持实测。
+- 压缩只在完整稳定 Turn 边界；自动触发点 **(A)** 首次请求前、**(B)** 完整 Turn 结束后下一请求前，条件 `E >= C × 阈值`；Run 结束不检查；覆盖边界必须前进；已结束的零 Turn Run 也可提供新边界；一次失败后该 Run 不再自动触发。
+- 保留策略：(A) 覆盖当前 Run 的 Prompt 前截至最近合法边界的有效历史；崩溃留下的无 Turn、无 run_finished 的尾部 Prompt 保留至后续合法边界；(B) 优先保留当前有效 Run，超出尾部预算时保留其完整 Prompt 和最近连续 Turn，至少尝试保留最新完整 Turn。手动 /compact 对最近有可回放 Turn 的 Run 使用同一预算，并保留其后的 Prompt；若仅有该 Run 可压，允许覆盖早期 Turn。溢出补救优先推进覆盖边界。
+- 请求形态：主路径复用有效上下文开头至覆盖边界的消息 + 压缩指令（`prompts/compaction.md`），System Prompt 与工具 Schema 原样保留命中前缀缓存；装不下回退为阶梯裁剪 toolResult 文本（保头保尾，每档同时将 image 块替换为丢图占位），Prompt/可见文本/调用参数永不裁剪，回退不附工具 Schema。摘要输入的预算与渲染同当前模型能力同构。手动 `/compact` 可携带用户附加重点（`/compact <重点>`），追加在指令模板末尾的 `Additional focus` 段；focus 只进本次摘要请求，不入库、不写 checkpoint、不参与 `promptVersion`（与压缩指令不落盘同一口径），其 token 计入指令预算。
+- 检查点 = 摘要 + `coveredUpTo(recordSeq)` + 摘要请求自身的实测 `usage`（`input/cacheRead/output/durationMs`，durationMs 缺省表示 Provider 未报告耗时）；尾部按 `recordSeq > coveredUpTo` 判定，跨边界保留的 Turn 按 runId 从完整 History 补回其 Prompt；已结束且无可回放 Turn 的 Run 可用 run_finished 作边界；原始历史不变。纯缺结果 Turn（所有 call 均无结果记录）可以其 assistant_message 作边界——Run 已死且不重放，结果永不再现；已有任一结果的 Turn 边界仍须落在最后一条 tool_result。落在覆盖范围内的零 Turn Run Prompt 同样进摘要输入，不被静默丢掉；摘要必须保留未解决的 unknown 副作用事实。压缩由当前默认模型执行、不计 Turn、独立重试次数；摘要输出无硬上限（no-force），软目标 + 压后可行性收口；失败保留原 Context 并报错，不注入 Context。状态栏的 Cache/Speed 是整段对话的累计口径（全部已计入 Run 的 assistant + 所有 checkpoint 的摘要请求，跨 Run、跨压缩持续累加，**压缩不重置**）：Cache = `ΣcacheRead / (Σinput + ΣcacheRead)`，Speed = `Σoutput / ΣdurationMs`；摘要请求是真实请求，其用量随 checkpoint 落盘，重启 / `/resume` 后累计完整；摘要请求耗时缺省时只计 token、不计速度。Context 不同：以最新 checkpoint 的 `coveredUpTo` 为界切换实测/压后估算（`~` 前缀），checkpoint 损坏时保持实测。
 
 ## 8. 配置与模型管理
 
@@ -147,6 +150,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - 框架优先：内置 shana-tui 位于 `src/tui/framework/`（来源与许可见同目录 SOURCE.md）。
 - 交互不变量：TUI 不是唯一安全门，Controller 仍校验状态/权限；审批为非遮挡面板、键盘焦点归审批；快照 + 订阅原子提供；高频流式聚合渲染，TUI 慢不影响 Core 推进；展示层不改写存储、SDK 消息与模型回放；TUI 意外退出请求取消并收尾，不让 Agent 无人管理继续执行。
 - 布局、键位、配色、折叠、鼠标等展示交互细节以代码（`src/tui/`）为准。
+- Skill 调用展示：蓝色 skill 卡片（标题 `skill:<name>`，默认折叠、点击展开快照 Markdown 正文）置于请求气泡之前；气泡只显示请求原文（空请求不渲染气泡）；`/skill:` 补全菜单按需读 skills 目录、无缓存。
 
 ## 10. 工程目录
 
@@ -155,7 +159,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 ├── prompts/                      # 系统与专用提示词（英文，每词一个文件）+ tools/ 工具描述
 ├── src/
 │   ├── main.ts / bootstrap.ts / workspace.ts / diagnostics.ts
-│   ├── core/                     # session-controller / agent-loop / context-builder / event-bus / events / state
+│   ├── core/                     # session-controller / agent-loop / context-builder / event-bus / events / state / skills
 │   ├── llm/                      # model-service / provider-adapter / model-config-store / settings-store
 │   │                             # decision-service / decision-model-config-store / argument-parser / history-replay
 │   ├── tools/                    # registry / executor / prompts / read / glob / grep / write / edit / shell
@@ -164,7 +168,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 │   ├── sessions/                 # session-store / records / recovery / compaction-store
 │   └── tui/                      # app / store / theme / approval-preview / syntax-highlight
 │       ├── framework/            # 内置 shana-tui、native 与许可
-│       └── components/           # Conversation / AssistantMessage / UserMessage / SystemMessage
+│       └── components/           # Conversation / AssistantMessage / UserMessage / SystemMessage / SkillMessage
 │                                 # ToolExecution / ToolRenderers / ApprovalDialog / DiffView / StatusBar / BottomSelector
 └── tests/                        # 镜像 src/：core / llm / tools / security / sessions / tui / integration
 ```
@@ -184,7 +188,8 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - UTF-8 ground rule（view_image 为显式二进制只读 carve-out）→ §5
 - 用户 Prompt 恒进 Context（零 Turn 失败 Run 附标注；零 Turn 取消 Run 的下一条 Prompt 渲染期前置中断前缀，不落盘，经用户裁决修订）；aborted Turn 受控进入并标注；unknown/缺结果 Turn 受控进入（渲染期显式 unknown 占位 + 询问标注），门控不变；协议损坏 Turn 排除 → §6
 - 意图先于执行、结果先于完成、fsync 临界区不可中断 → I4、§6
-- Session v4 七类记录与判据不由实现擅改（tool_result 可选 images 块，仅成功单图；checkpoint 可选 usage = 摘要请求实测用量；v2/v3 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
+- Session v5 七类记录与判据不由实现擅改（user_prompt 可选 skill 快照；tool_result 可选 images 块，仅成功单图；checkpoint 可选 usage = 摘要请求实测用量；v2/v3/v4 硬切不迁移，经用户授权）；workspace-id 多进程一致 → §6
+- Skill 显式调用 `/skill:`：提交时快照、text 恒存完整原文；加载失败 Run 前同步报错不创建 Session；skills 只读豁免精确限 `~/.shana/skills`（read/glob/grep/view_image），写入不豁免；TUI skill 块默认折叠、气泡只含请求原文；标题/预览剥命令前缀（空请求回退 `skill:<name>`）→ §5、§6、§7、§9
 - Shell 超时混合收尾与知情确认 → §5、§6
 - 溢出不可重试 + 每 Run 一次压缩补救 → §4
 - 压缩 A/B 触发、最新 Turn 保留、主路径/回退裁剪、摘要头部 user 消息 → §7
