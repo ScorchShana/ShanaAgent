@@ -2,6 +2,10 @@
 
 ## 未发布
 
+- **新增**：三态审批模式 `readonly / auto / full`（每 Session 持久化，缺省 auto；Run 起点冻结，运行中切换只影响后续 Run）。readonly 拒绝一切非 read 调用（含只读命令的 bash），文案 `Denied by read-only mode.`（与用户拒绝 `User denied.` 严格区分）；auto 区内 write/edit 直接放行、区外写入逐次人工（会话授权不能豁免）、bash 经本地保守 analyzer（首命令白名单 `ls pwd echo cat head tail wc which whoami hostname uname true false` + 元字符/路径守卫）判定，判不了转人工；full 为用户显式全豁免（含区外与 skills 写入），路径复验/UTF-8/限额/取消边界不变。新增 `/mode [readonly|auto|full]` 命令（无参查询重载 meta），状态栏显示 `Mode:`（full 警示色）。bash analyzer 的区内 symlink 跟随为已声明残余风险（架构 §5）。
+- **移除**：辅助决策模型子系统整体删除（decision-service / decision-model-config-store / `prompts/decision.md` / 生命周期探测）。`~/.shana/decision-model.json` 不再读取，用户文件保留不动。会话授权收缩为仅 bash 精确命令字符串——文件工具"本会话允许"不再产生授权（auto 区内写本就免审批，区外写逐次人工不可豁免）。
+- **破坏性变更**：Session 格式升级 v5 → v6（meta `autoDecisionEnabled` 布尔替换为可选 `approvalMode` 枚举，缺省 auto）。v2–v5 Session 不再可读（文件保留不删除，列表跳过），不迁移、不降级。**勿混跑新旧版本**：旧版二进制无法读取 v6 Session。
+- **破坏性变更**：`settings.json` 移除 `decisionTimeoutMs`。严格未知键拒绝保留：旧 settings 含该键将启动失败（报"未知字段"），**迁移方法：从 settings.json 删除该键**。
 - 变更：`/` 命令菜单直接列出 `~/.shana/skills` 下的全部 `/skill:<name>` 项（命令在前、skill 按名排序追加在后，前缀匹配过滤），不必先敲 `/skill:` 才加载。按需读目录、无缓存（运行期间新增 skill 立即可补全）；删除 `/skill:` 占位项（语法提示保留在未知命令提示中）；`/skill:` 前缀行为、两次 Enter 确认与运行中禁用门控不变。
 
 ## 0.4.0 — 2026-11-20
