@@ -111,7 +111,7 @@ function stateWith(
       driver: { execute: async () => ({ outcome: "completed" }) },
       hooks: {
         getSessionView: () => ({
-          autoDecision: { enabled: true, availability: "missing" },
+          approvalMode: "auto",
           ref: { workspaceId: "ws", sessionId },
           title: null,
           model: options.model === undefined ? makeModelSnapshot() : options.model,
@@ -129,7 +129,7 @@ function stateWith(
     ...snapshot,
     core: options.status === undefined ? snapshot.core : { ...snapshot.core, status: options.status },
     history: {
-      meta: { version: 5, workspaceId: "ws", sessionId, createdAt: "now" },
+      meta: { version: 6, workspaceId: "ws", sessionId, createdAt: "now" },
       records,
       warnings: [],
       fromRecordSeq: 1,
@@ -620,7 +620,7 @@ it("truncates the single line in a narrow frame without adding rows", () => {
   const view = render(wideStatus(state, 24));
   const lines = (view.lastFrame() ?? "").split("\n");
   expect(lines).toHaveLength(2);
-  expect(lines[1]).toContain("Decision:");
+  expect(lines[1]).toContain("Mode:");
   expect(lines[1]).not.toContain("Cache:");
   view.unmount();
 });
@@ -766,7 +766,7 @@ it("always renders the speed segment even without usable data", () => {
     wideStatus(stateWith([started(1, "r1"), assistant(2, "r1", 100, 50, 1000), finished(3, "r1")])),
   );
   expect(view.lastFrame()).toContain("Speed: —");
-  expect(view.lastFrame()).not.toContain("Auto Decision");
+  expect(view.lastFrame()).not.toContain("Decision:");
   view.unmount();
 });
 it("hides the whole speed segment when the line would exceed the width", () => {
@@ -818,23 +818,19 @@ it("hides the dash segment too when the width is short", () => {
   tight.unmount();
 });
 
-it("renders a workspace line and decision line without a permanent interrupt hint", () => {
+it("renders a workspace line and mode line without a permanent interrupt hint", () => {
   const bar = new StatusBar(stateWith([]));
   const rows = bar.render(120);
   expect(rows).toHaveLength(2);
-  expect(stripAnsi(rows[1]!)).toContain("Decision: manual");
+  expect(stripAnsi(rows[1]!)).toContain("Mode: auto");
   expect(rows.join("\n")).not.toContain("Ctrl+C");
 });
 
-it.each([
-  [false, "invalid", "manual"], [true, "invalid", "manual (config error)"],
-  [true, "missing", "manual (not configured)"], [true, "unavailable", "manual (unavailable)"],
-  [true, "ready", "auto"],
-] as const)("renders decision enabled=%s availability=%s", (enabled, availability, expected) => {
+it.each(["readonly", "auto", "full"] as const)("renders mode %s", (mode) => {
   const state = stateWith([]);
-  state.core.session.autoDecision = { enabled, availability };
+  state.core.session.approvalMode = mode;
   const rows = new StatusBar(state, { workspacePath: "D:\\project", homeDirectory: "C:\\Users\\me" }).render(120);
-  expect(stripAnsi(rows[1]!)).toContain(`Decision: ${expected}`);
+  expect(stripAnsi(rows[1]!)).toContain(`Mode: ${mode}`);
   expect(stripAnsi(rows[0]!)).toBe("D:\\project");
 });
 it("shortens workspace paths at directory boundaries and respects display widths", () => {

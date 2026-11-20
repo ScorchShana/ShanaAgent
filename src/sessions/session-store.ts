@@ -7,9 +7,11 @@ import {
   parseSessionMeta,
   parseSessionRecord,
   RecordValidationError,
+  SESSION_APPROVAL_MODES,
   SESSION_FORMAT_VERSION,
   type AssistantMessageRecord,
   type NewSessionRecord,
+  type SessionApprovalMode,
   type SessionMeta,
   type SessionRecord,
   type ToolResultRecord,
@@ -24,7 +26,7 @@ export interface CreateSessionInput {
   workspaceId: string;
   sessionId?: string;
   initialRecords?: readonly NewSessionRecord[];
-  autoDecisionEnabled?: boolean;
+  approvalMode?: SessionApprovalMode;
 }
 
 interface CreateSessionWithRecordsInput extends CreateSessionInput {
@@ -130,6 +132,14 @@ export class SessionWriteError extends SessionStoreError {
     super(code, message, options);
     this.name = "SessionWriteError";
   }
+}
+
+// 入参虽已类型约束，运行时仍须拒绝越界值（与旧布尔校验同档，防 JS 调用方/反序列化注入）。
+function requireApprovalMode(mode: unknown): SessionApprovalMode {
+  if (typeof mode !== "string" || !(SESSION_APPROVAL_MODES as readonly string[]).includes(mode)) {
+    throw new SessionStoreError("invalid_argument", "approvalMode must be readonly | auto | full");
+  }
+  return mode as SessionApprovalMode;
 }
 
 interface AssistantIndexEntry {
@@ -258,7 +268,7 @@ export class SessionStore {
         sessionId,
         workspaceId: input.workspaceId,
         createdAt: createdAt.toISOString(),
-        autoDecisionEnabled: input.autoDecisionEnabled ?? true,
+        approvalMode: requireApprovalMode(input.approvalMode ?? "auto"),
       };
       await this.writeMetaAtomic(dir, meta);
       this.writers.set(this.sessionKey(ref), { nextSeq: 1, assistants: new Map() });
@@ -328,7 +338,7 @@ export class SessionStore {
         sessionId,
         workspaceId: input.workspaceId,
         createdAt: createdAt.toISOString(),
-        autoDecisionEnabled: input.autoDecisionEnabled ?? true,
+        approvalMode: requireApprovalMode(input.approvalMode ?? "auto"),
       };
       await this.writeMetaAtomic(dir, meta);
       this.writers.set(this.sessionKey(ref), {
@@ -361,17 +371,15 @@ export class SessionStore {
     });
   }
 
-  async setAutoDecisionEnabled(ref: SessionRef, enabled: boolean): Promise<SessionMeta> {
+  async setApprovalMode(ref: SessionRef, mode: SessionApprovalMode): Promise<SessionMeta> {
     this.assertRef(ref);
     const key = this.sessionKey(ref);
     const owner = this.ownership.get(key);
     if (!owner || owner.releasing) throw this.notOwned(ref);
-    if (typeof enabled !== "boolean") {
-      throw new SessionStoreError("invalid_argument", "autoDecisionEnabled must be a boolean");
-    }
+    const validated = requireApprovalMode(mode);
     return this.serialize(key, async () => {
       await this.verifyOwnership(ref, owner.ownerToken);
-      const meta = { ...(await this.readMeta(ref)), autoDecisionEnabled: enabled };
+      const meta = { ...(await this.readMeta(ref)), approvalMode: validated };
       try {
         await this.writeMetaAtomic(this.sessionDir(ref), meta);
       } catch (error) {

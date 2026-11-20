@@ -70,7 +70,7 @@ function controller(
     compactor,
     commands: {
       readHistory: async () => ({
-        meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         records: [],
         warnings: [],
         fromRecordSeq: 1,
@@ -93,7 +93,7 @@ function controller(
         models: [],
         runModel: null,
         contextBaselineTokens: null,
-        autoDecision: { enabled: true, availability: "missing" },
+        approvalMode: "auto",
       }),
     },
   });
@@ -304,7 +304,7 @@ it("suggests continuing after a failed Run with a complete Turn", async () => {
     return { outcome: "failed", error: new Error("later Turn failed") };
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -351,7 +351,7 @@ it("coalesces high frequency updates without awaiting a slow subscriber and can 
 it("does not restore a Session when its chooser or confirmation is dismissed", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "listSessions").mockResolvedValue([
-    { version: 5, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
+    { version: 6, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
   ]);
   const resume = vi.spyOn(core, "resumeSession").mockResolvedValue();
   const store = new TuiStore(core, parseSettings({}));
@@ -385,7 +385,7 @@ it("clears the previous retry suggestion when adopting a new Session", async () 
     sessionId = "new";
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId, createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId, createdAt: "now" },
     records: [],
     warnings: [],
     fromRecordSeq: 1,
@@ -412,7 +412,7 @@ it("loads the durable prompt while the first response is still pending", async (
     });
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -464,7 +464,7 @@ it("clears the temporary notice after /new resets the Session", async () => {
 it("clears the temporary notice after /resume restores another Session", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "listSessions").mockResolvedValue([
-    { version: 5, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
+    { version: 6, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 },
   ]);
   vi.spyOn(core, "resumeSession").mockResolvedValue();
   const store = new TuiStore(core, parseSettings({}));
@@ -503,7 +503,7 @@ it("permits /effort during a Run without submitting another Prompt", async () =>
 it("does not revive a dismissed history warning on subsequent refreshes", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [],
     warnings: [{ kind: "tail_truncated", line: 1, byteOffset: 1, message: "old warning" }],
     fromRecordSeq: 1,
@@ -532,7 +532,7 @@ it("retains failure audit records while omitting their detailed system error fro
     },
   ];
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records,
     warnings: [],
     fromRecordSeq: 1,
@@ -641,7 +641,7 @@ it("hands completed thinking state to history and places one duration after fail
   });
   let release!: () => void;
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -699,7 +699,7 @@ it("does not clear live expansion when initial history arrives late", async () =
   vi.spyOn(core, "readHistory").mockImplementation(async () => {
     await first;
     return {
-      meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [],
       warnings: [],
       fromRecordSeq: 1,
@@ -749,7 +749,7 @@ it("hands off the previous Run even if the next Run starts before history arrive
   vi.spyOn(core, "readHistory").mockImplementation(async () => {
     if (records.length) await historyGate;
     return {
-      meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [...records],
       warnings: [],
       fromRecordSeq: 1,
@@ -791,7 +791,7 @@ it("clears history and expansion on reset to an unmaterialized Session", async (
         models: [],
         runModel: null,
         contextBaselineTokens: null,
-        autoDecision: { enabled: true, availability: "missing" },
+        approvalMode: "auto",
       }),
     },
     commands: {
@@ -799,7 +799,7 @@ it("clears history and expansion on reset to an unmaterialized Session", async (
         ref = null;
       },
       readHistory: async () => ({
-        meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         records: [{ type: "user_prompt", recordSeq: 1, ts: "now", runId: "r", text: "old prompt" }],
         warnings: [],
         fromRecordSeq: 1,
@@ -834,7 +834,7 @@ it("does not mark the in-flight turn as excluded while its tool awaits a result"
     const runId =
       snapshot.status.kind === "running" ? snapshot.status.runId : (snapshot.lastRun?.runId ?? "r");
     return {
-      meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [{ type: "assistant_message", recordSeq: 1, ts: "now", runId, message }],
       warnings: [],
       fromRecordSeq: 1,
@@ -899,7 +899,7 @@ it("places a failed retry before its own Turn rather than after later Turn tools
     return { outcome: "completed" };
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records,
     warnings: [],
     fromRecordSeq: 1,
@@ -933,7 +933,7 @@ it("keeps cancelled partial as a persisted aborted Turn with retry failures and 
     return { outcome: "completed" };
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -986,7 +986,7 @@ it("hides thinking of a persisted aborted Turn but keeps completed Turn thinking
   const completed = makeAssistantMessage([], "final answer");
   completed.content.unshift({ type: "thinking", thinking: "kept draft" });
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       { type: "assistant_message", recordSeq: 2, ts: "now", runId: "r1", message: aborted },
@@ -1065,7 +1065,7 @@ it("shows text but hides thinking for a cancelled attempt in the settlement wind
 it("shows no annotation notice for a zero-turn cancelled Run but keeps the outcome line", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
@@ -1089,7 +1089,7 @@ it("shows no annotation notice for a zero-turn cancelled Run but keeps the outco
 it("prepends the interrupted notice before the prompt following a zero-turn cancelled Run", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "cancelled task" },
       { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "cancelled", persisted: true },
@@ -1120,7 +1120,7 @@ it("prepends the interrupted notice before the prompt following a zero-turn canc
 it("shows the failed-request annotation for a zero-turn failed Run", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       { type: "run_finished", recordSeq: 2, ts: "now", runId: "r1", outcome: "failed", persisted: true },
@@ -1143,7 +1143,7 @@ it("shows the failed-request annotation for a zero-turn failed Run", async () =>
 it("shows unknown annotations and synthetic placeholders isomorphic to the model context", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       {
@@ -1212,7 +1212,7 @@ it("does not mark the in-flight turn as synthetic unknown while the Run is runni
   });
   // 在途 Turn：assistant 已落盘、bash call 等待审批/执行，盘上无 tool_result——与崩溃窗口同形。
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId, text: "task" },
       {
@@ -1255,7 +1255,7 @@ it("does not mark the in-flight turn as synthetic unknown while the Run is runni
 it("dims tool cards of excluded turns (G2)", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [
       { type: "user_prompt", recordSeq: 1, ts: "now", runId: "r1", text: "task" },
       {
@@ -1367,7 +1367,7 @@ it("reuses history item identities when toggling a diff in a long session", asyn
   );
   const core = controller(async () => ({ outcome: "completed" }));
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -1414,7 +1414,7 @@ function compactionFixture(execute: CompactionDriver["execute"]) {
   ];
   const core = controller(async () => ({ outcome: "completed" }), { execute });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records: [...records],
     warnings: [],
     fromRecordSeq: 1,
@@ -1815,7 +1815,7 @@ it("clears transient separators when adopting a new Session", async () => {
     sessionId = "new";
   });
   vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-    meta: { version: 5, workspaceId: "ws", sessionId, createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId, createdAt: "now" },
     records: [],
     warnings: [],
     fromRecordSeq: 1,
@@ -1961,23 +1961,26 @@ describe("stream state delivery", () => {
   });
 });
 
-it("offers autodecision completion and rejects invalid arguments without a Run", async () => {
+it("offers mode completion and rejects invalid arguments without a Run", async () => {
   const core = controller(async () => {
     throw new Error("must not run");
   });
   const store = new TuiStore(core, parseSettings({}), { skillsRoot: tempDir("shana-store-skills-") });
   try {
-    store.setDraft("/auto");
-    expect(store.commandOptions().map((option) => option.name)).toContain("/autodecision");
-    store.setDraft("/autodecision maybe");
+    store.setDraft("/mo");
+    expect(store.commandOptions().map((option) => option.name)).toContain("/mode");
+    store.setDraft("/mode maybe");
     await store.submit();
-    expect(store.getSnapshot().notice?.text).toContain("/autodecision [on|off]");
+    expect(store.getSnapshot().notice?.text).toContain("/mode [readonly|auto|full]");
+    store.setDraft("/mode auto extra");
+    await store.submit();
+    expect(store.getSnapshot().notice?.text).toContain("/mode [readonly|auto|full]");
   } finally {
     await store.dispose();
   }
 });
 
-it("reports busy autodecision commands during a Run", async () => {
+it("reports busy mode commands during a Run", async () => {
   let finish!: () => void;
   const waiting = new Promise<void>((resolve) => {
     finish = resolve;
@@ -1990,7 +1993,7 @@ it("reports busy autodecision commands during a Run", async () => {
   store.setDraft("hello");
   const run = store.submit();
   try {
-    store.setDraft("/autodecision on");
+    store.setDraft("/mode full");
     await store.submit();
     expect(store.getSnapshot().notice?.error).toBe(true);
   } finally {
@@ -2000,9 +2003,8 @@ it("reports busy autodecision commands during a Run", async () => {
   }
 });
 
-it("refreshes the auto decision snapshot when a probe notice arrives", async () => {
-  let availability: "ready" | "unavailable" = "ready";
-  let message: string | undefined;
+it("refreshes the approval mode snapshot when a notice arrives", async () => {
+  let mode: "readonly" | "auto" | "full" = "auto";
   const core = new SessionController({
     driver: { execute: async () => ({ outcome: "completed" }) },
     hooks: {
@@ -2012,32 +2014,26 @@ it("refreshes the auto decision snapshot when a probe notice arrives", async () 
         models: [],
         runModel: null,
         contextBaselineTokens: null,
-        autoDecision: { enabled: true, availability, ...(message ? { message } : {}) },
+        approvalMode: mode,
       }),
     },
   });
   const store = new TuiStore(core, parseSettings({}));
   try {
-    expect(store.getSnapshot().core.session.autoDecision.availability).toBe("ready");
-    availability = "unavailable";
-    message = "决策模型名称与服务不符";
-    store.notice("自动决策已关闭：决策模型名称与服务不符");
+    expect(store.getSnapshot().core.session.approvalMode).toBe("auto");
+    mode = "full";
+    store.notice("外部提示");
     await new Promise((resolve) => setImmediate(resolve));
-    expect(store.getSnapshot().core.session.autoDecision.availability).toBe("unavailable");
+    expect(store.getSnapshot().core.session.approvalMode).toBe("full");
   } finally {
     await store.dispose();
   }
 });
 
-it("reports probe unavailable status and reason in the /autodecision query", async () => {
-  const status = {
-    enabled: true,
-    availability: "unavailable",
-    message: "决策模型名称与服务不符（配置：a，服务：b）",
-  };
+it("reports the Core-reloaded mode in the /mode query", async () => {
   const core = new SessionController({
     driver: { execute: async () => ({ outcome: "completed" }) },
-    commands: { getAutoDecisionStatus: async () => status },
+    commands: { getApprovalMode: async () => "readonly" },
     hooks: {
       getSessionView: () => ({
         ref: { workspaceId: "ws", sessionId: "s" },
@@ -2045,17 +2041,46 @@ it("reports probe unavailable status and reason in the /autodecision query", asy
         models: [],
         runModel: null,
         contextBaselineTokens: null,
-        autoDecision: status,
+        approvalMode: "auto",
       }),
     },
   });
   const store = new TuiStore(core, parseSettings({}));
   try {
-    store.setDraft("/autodecision");
+    store.setDraft("/mode");
     await store.submit();
-    const text = store.getSnapshot().notice?.text ?? "";
-    expect(text).toContain("unavailable");
-    expect(text).toContain("决策模型名称与服务不符（配置：a，服务：b）");
+    expect(store.getSnapshot().notice?.text).toBe("Mode: readonly");
+  } finally {
+    await store.dispose();
+  }
+});
+
+it("switches the mode via /mode full and reports the snapshot value", async () => {
+  let mode: "readonly" | "auto" | "full" = "auto";
+  const core = new SessionController({
+    driver: { execute: async () => ({ outcome: "completed" }) },
+    commands: {
+      setApprovalMode: async (next) => {
+        mode = next;
+      },
+    },
+    hooks: {
+      getSessionView: () => ({
+        ref: { workspaceId: "ws", sessionId: "s" },
+        model: null,
+        models: [],
+        runModel: null,
+        contextBaselineTokens: null,
+        approvalMode: mode,
+      }),
+    },
+  });
+  const store = new TuiStore(core, parseSettings({}));
+  try {
+    store.setDraft("/mode full");
+    await store.submit();
+    expect(mode).toBe("full");
+    expect(store.getSnapshot().notice?.text).toBe("Mode: full");
   } finally {
     await store.dispose();
   }
@@ -2143,7 +2168,7 @@ it("clears interrupt state when editing and disposes its timer", async () => {
 });
 it("retains the session chooser on failure and retries directly", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
-  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 5, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
+  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 6, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
   const resume = vi.spyOn(core, "resumeSession").mockRejectedValueOnce(new Error("occupied")).mockResolvedValueOnce();
   const store = new TuiStore(core, parseSettings({}));
   try {
@@ -2159,7 +2184,7 @@ it("retains the session chooser on failure and retries directly", async () => {
 
 it("closes the originating chooser after delayed resume despite navigation", async () => {
   const core = controller(async () => ({ outcome: "completed" }));
-  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 5, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
+  vi.spyOn(core, "listSessions").mockResolvedValue([{ version: 6, workspaceId: "ws", sessionId: "old", createdAt: "now", runCount: 1 }]);
   let finish!: () => void;
   vi.spyOn(core, "resumeSession").mockImplementation(() => new Promise(resolve => { finish = resolve; }));
   const store = new TuiStore(core, parseSettings({}));
@@ -2207,7 +2232,7 @@ describe("bash 实时输出展示态", () => {
       const snapshot = core.getSnapshot();
       const runId = snapshot.status.kind === "running" ? snapshot.status.runId : snapshot.lastRun!.runId;
       return {
-        meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         warnings: [],
         fromRecordSeq: 1,
         records: [

@@ -30,7 +30,7 @@ describe("V1 记录追加与读回", () => {
       sessionId: "s1",
       workspaceId: WORKSPACE_ID,
       createdAt: "2026-10-27T10:00:00.000Z",
-      autoDecisionEnabled: true,
+      approvalMode: "auto",
     });
 
     const appended = [
@@ -301,7 +301,7 @@ describe("V2 版本门", () => {
     await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
 
     const metaPath = metaPathOf(store.sessionsDir, ref);
-    const tampered = fs.readFileSync(metaPath, "utf8").replace('"version":5', '"version":99');
+    const tampered = fs.readFileSync(metaPath, "utf8").replace('"version":6', '"version":99');
     fs.writeFileSync(metaPath, tampered);
 
     const error = await store.loadSession(ref).catch((caught: unknown) => caught);
@@ -317,7 +317,7 @@ describe("V2 版本门", () => {
     await store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "hi" });
 
     const messagesPath = messagesPathOf(store.sessionsDir, ref);
-    const tampered = fs.readFileSync(messagesPath, "utf8").replace('"version":5', '"version":99');
+    const tampered = fs.readFileSync(messagesPath, "utf8").replace('"version":6', '"version":99');
     fs.writeFileSync(messagesPath, tampered);
 
     const error = await store.loadSession(ref).catch((caught: unknown) => caught);
@@ -395,19 +395,19 @@ describe("V11 查询接口", () => {
     const otherMetaPath = metaPathOf(store.sessionsDir, otherRef);
     fs.writeFileSync(
       otherMetaPath,
-      fs.readFileSync(otherMetaPath, "utf8").replace('"version":5', '"version":99'),
+      fs.readFileSync(otherMetaPath, "utf8").replace('"version":6', '"version":99'),
     );
 
     const listed = await store.listSessions(WORKSPACE_ID);
     expect(listed.map((meta) => meta.sessionId)).toEqual(["s2", "s1"]);
     expect(listed.every((meta) => meta.workspaceId === WORKSPACE_ID)).toBe(true);
 
-    // 不支持版本的 Session 跳过而非抛穿整个列表（v5 硬切后目录里可能残留 v2/v3/v4）。
+    // 不支持版本的 Session 跳过而非抛穿整个列表（v6 硬切后目录里可能残留 v2–v5）。
     expect(await store.listSessions(otherWorkspace)).toEqual([]);
     expect(await store.listSessions("nonexistent-workspace-0000")).toEqual([]);
   });
 
-  it("混版目录只列 v5；v4 Session 拒载但文件保留", async () => {
+  it("混版目录只列 v6；v5 Session 拒载但文件保留", async () => {
     const { store } = makeStore();
     await store.createSession({ workspaceId: WORKSPACE_ID, sessionId: "new" });
     const oldRef = sessionRef("old");
@@ -415,15 +415,15 @@ describe("V11 查询接口", () => {
     await store.appendRecord(oldRef, { type: "user_prompt", runId: "r", text: "legacy" });
     const oldMetaPath = metaPathOf(store.sessionsDir, oldRef);
     const oldMessagesPath = messagesPathOf(store.sessionsDir, oldRef);
-    const oldMeta = fs.readFileSync(oldMetaPath, "utf8").replace('"version":5', '"version":4');
-    const oldMessages = fs.readFileSync(oldMessagesPath, "utf8").replace('"version":5', '"version":4');
+    const oldMeta = fs.readFileSync(oldMetaPath, "utf8").replace('"version":6', '"version":5');
+    const oldMessages = fs.readFileSync(oldMessagesPath, "utf8").replace('"version":6', '"version":5');
     fs.writeFileSync(oldMetaPath, oldMeta);
     fs.writeFileSync(oldMessagesPath, oldMessages);
 
     expect((await store.listSessions(WORKSPACE_ID)).map((meta) => meta.sessionId)).toEqual(["new"]);
     const error = await store.loadSession(oldRef).catch((caught: unknown) => caught);
     expect(error).toBeInstanceOf(SessionVersionError);
-    expect((error as SessionVersionError).foundVersion).toBe(4);
+    expect((error as SessionVersionError).foundVersion).toBe(5);
     expect(fs.readFileSync(oldMetaPath, "utf8")).toBe(oldMeta);
     expect(fs.readFileSync(oldMessagesPath, "utf8")).toBe(oldMessages);
   });
@@ -756,19 +756,31 @@ it.each(["beforeLockWrite", "beforeLockSync"] as const)(
   },
 );
 
-describe("autoDecisionEnabled persistence", () => {
-  it.each([undefined, true, false])("saves %s in both creation paths", async (enabled) => {
+describe("approvalMode persistence", () => {
+  it.each([undefined, "readonly", "auto", "full"] as const)("saves %s in both creation paths", async (mode) => {
     const { store } = makeStore();
     for (const initialRecords of [undefined, []]) {
       const meta = await store.createSession({
         workspaceId: WORKSPACE_ID,
-        autoDecisionEnabled: enabled,
+        approvalMode: mode,
         initialRecords,
       });
       const ref = sessionRef(meta.sessionId);
-      expect(meta.autoDecisionEnabled).toBe(enabled ?? true);
-      expect((await store.readSessionMeta(ref)).autoDecisionEnabled).toBe(enabled ?? true);
+      expect(meta.approvalMode).toBe(mode ?? "auto");
+      expect((await store.readSessionMeta(ref)).approvalMode).toBe(mode ?? "auto");
     }
+  });
+  it("rejects invalid modes on create and update", async () => {
+    const { store } = makeStore();
+    await expect(
+      store.createSession({ workspaceId: WORKSPACE_ID, approvalMode: "on" as never }),
+    ).rejects.toMatchObject({ code: "invalid_argument" });
+    const ref = sessionRef("invalid-mode");
+    await store.createSession(ref);
+    await expect(store.setApprovalMode(ref, "on" as never)).rejects.toMatchObject({
+      code: "invalid_argument",
+    });
+    expect((await store.readSessionMeta(ref)).approvalMode).toBe("auto");
   });
   it("preserves other fields and JSONL and serializes concurrent updates", async () => {
     const { store } = makeStore();
@@ -780,10 +792,10 @@ describe("autoDecisionEnabled persistence", () => {
     fs.writeFileSync(target, JSON.stringify(prior));
     const messages = fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8");
     const [off, on] = await Promise.all([
-      store.setAutoDecisionEnabled(ref, false),
-      store.setAutoDecisionEnabled(ref, true),
+      store.setApprovalMode(ref, "readonly"),
+      store.setApprovalMode(ref, "auto"),
     ]);
-    expect(off).toEqual({ ...prior, autoDecisionEnabled: false });
+    expect(off).toEqual({ ...prior, approvalMode: "readonly" });
     expect(on).toEqual(prior);
     expect(await store.readSessionMeta(ref)).toEqual(on);
     expect(fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8")).toBe(messages);
@@ -803,13 +815,13 @@ describe("autoDecisionEnabled persistence", () => {
       const ref = sessionRef("fault");
       const prior = await store.createSession(ref);
       fail = true;
-      await expect(store.setAutoDecisionEnabled(ref, false)).rejects.toMatchObject({
+      await expect(store.setApprovalMode(ref, "readonly")).rejects.toMatchObject({
         code: "write_failed",
         cause: fault,
       });
       expect(await store.readSessionMeta(ref)).toEqual({
         ...prior,
-        autoDecisionEnabled: stage !== "afterMetaReplace",
+        approvalMode: stage !== "afterMetaReplace" ? "auto" : "readonly",
       });
       expect(
         fs
@@ -817,8 +829,8 @@ describe("autoDecisionEnabled persistence", () => {
           .filter((name) => name.endsWith(".tmp")),
       ).toEqual([]);
       fail = false;
-      await expect(store.setAutoDecisionEnabled(ref, false)).resolves.toMatchObject({
-        autoDecisionEnabled: false,
+      await expect(store.setApprovalMode(ref, "readonly")).resolves.toMatchObject({
+        approvalMode: "readonly",
       });
     },
   );
@@ -828,10 +840,10 @@ describe("autoDecisionEnabled persistence", () => {
     await store.createSession(ref);
     const other = makeStore({ sessionsDir: store.sessionsDir }).store;
     await expect(other.readSessionMeta(ref)).rejects.toMatchObject({ code: "not_owned" });
-    await expect(other.setAutoDecisionEnabled(ref, false)).rejects.toMatchObject({ code: "not_owned" });
+    await expect(other.setApprovalMode(ref, "readonly")).rejects.toMatchObject({ code: "not_owned" });
     const release = store.releaseSession(ref);
     await expect(store.readSessionMeta(ref)).rejects.toMatchObject({ code: "not_owned" });
-    await expect(store.setAutoDecisionEnabled(ref, false)).rejects.toMatchObject({ code: "not_owned" });
+    await expect(store.setApprovalMode(ref, "readonly")).rejects.toMatchObject({ code: "not_owned" });
     await release;
   });
   it("verifies the on-disk owner token for reads and updates", async () => {
@@ -845,6 +857,6 @@ describe("autoDecisionEnabled persistence", () => {
     const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
     fs.writeFileSync(lockPath, JSON.stringify({ ...lock, ownerToken: "other" }));
     await expect(store.readSessionMeta(ref)).rejects.toMatchObject({ code: "not_owned" });
-    await expect(store.setAutoDecisionEnabled(ref, false)).rejects.toMatchObject({ code: "not_owned" });
+    await expect(store.setApprovalMode(ref, "readonly")).rejects.toMatchObject({ code: "not_owned" });
   });
 });

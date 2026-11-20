@@ -15,7 +15,7 @@ export type StoredAssistantMessage = Omit<AssistantMessage, "content"> & {
   content: (Exclude<AssistantMessage["content"][number], { type: "toolCall" }> | StoredToolCall)[];
 };
 
-export const SESSION_FORMAT_VERSION = 5;
+export const SESSION_FORMAT_VERSION = 6;
 
 export const SESSION_RECORD_TYPES = [
   "user_prompt",
@@ -54,13 +54,18 @@ export function isDefiniteToolResultStatus(status: ToolResultStatus): status is 
 export const SESSION_RUN_OUTCOMES = ["completed", "cancelled", "failed", "turn_limit"] as const;
 export type SessionRunOutcome = (typeof SESSION_RUN_OUTCOMES)[number];
 
+// 与 security/permissions.ts 的 ApprovalMode 结构同一；sessions 禁止依赖 security，
+// 故在此自包含定义并校验（TS 结构类型下两处联合可互赋）。
+export const SESSION_APPROVAL_MODES = ["readonly", "auto", "full"] as const;
+export type SessionApprovalMode = (typeof SESSION_APPROVAL_MODES)[number];
+
 export interface SessionMeta {
   version: number;
   sessionId: string;
   workspaceId: string;
   createdAt: string;
   sourceSessionId?: string;
-  autoDecisionEnabled?: boolean;
+  approvalMode?: SessionApprovalMode;
 }
 
 interface RecordBase {
@@ -274,7 +279,7 @@ const META_KEYS = [
   "workspaceId",
   "createdAt",
   "sourceSessionId",
-  "autoDecisionEnabled",
+  "approvalMode",
 ] as const;
 
 export function parseSessionMeta(raw: unknown): SessionMeta {
@@ -293,8 +298,8 @@ export function parseSessionMeta(raw: unknown): SessionMeta {
   if (raw.sourceSessionId !== undefined) {
     meta.sourceSessionId = requireString(raw, "sourceSessionId", scope, { allowEmpty: false });
   }
-  if (Object.hasOwn(raw, "autoDecisionEnabled")) {
-    meta.autoDecisionEnabled = requireBoolean(raw, "autoDecisionEnabled", scope);
+  if (Object.hasOwn(raw, "approvalMode")) {
+    meta.approvalMode = requireEnum(raw, "approvalMode", SESSION_APPROVAL_MODES, scope);
   }
   return meta;
 }

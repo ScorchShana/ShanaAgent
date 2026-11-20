@@ -1,14 +1,5 @@
-import {
-  loadDecisionModelConfig,
-  type LoadedDecisionModelConfig,
-} from "./llm/decision-model-config-store.js";
 import { createToolRegistry, type ToolRegistry } from "./tools/registry.js";
-import {
-  loadPrompts,
-  loadDecisionPrompt,
-  type LoadedDecisionPrompt,
-  type PromptBundle,
-} from "./tools/prompts.js";
+import { loadPrompts, type PromptBundle } from "./tools/prompts.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -28,8 +19,6 @@ export interface BootstrapResult {
   sessionsDir: string;
   settings: Settings;
   modelConfig: LoadedModelConfig;
-  decisionConfig: LoadedDecisionModelConfig;
-  decisionPrompt: LoadedDecisionPrompt;
   workspace: WorkspaceIdentity;
   diagnostics: Diagnostics;
   prompts: PromptBundle;
@@ -59,12 +48,7 @@ export function bootstrap(options: BootstrapOptions = {}): BootstrapResult {
 
   const settings = loadSettings(path.join(shanaDir, SETTINGS_FILE_NAME));
   const modelConfig = loadModelConfig(path.join(shanaDir, "model.json"));
-  const decisionConfig = loadDecisionModelConfig(path.join(shanaDir, "decision-model.json"));
-  const decisionPrompt = loadDecisionPrompt();
-  const secrets = [
-    ...(modelConfig.status === "ok" ? modelConfig.secrets : []),
-    ...(decisionConfig.status === "ok" ? decisionConfig.secrets : []),
-  ];
+  const secrets = modelConfig.status === "ok" ? modelConfig.secrets : [];
   const redact = (text: string) => redactSecrets(text, secrets);
   const diagnostics = createDiagnostics({ logsDir, minLevel: settings.logLevel, redact });
   const toolRegistry = createToolRegistry(process.platform, settings, prompts);
@@ -76,8 +60,6 @@ export function bootstrap(options: BootstrapOptions = {}): BootstrapResult {
     sessionsDir,
     settings,
     modelConfig,
-    decisionConfig,
-    decisionPrompt,
     workspace,
     diagnostics,
     prompts,

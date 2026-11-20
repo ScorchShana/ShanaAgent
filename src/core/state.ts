@@ -1,5 +1,6 @@
 import type { RunModelSnapshot, SessionMeta } from "../sessions/records.js";
 import type { SessionRef } from "../sessions/session-store.js";
+import type { ApprovalMode } from "../security/permissions.js";
 
 export const RUN_PHASES = [
   "preparing",
@@ -53,14 +54,8 @@ export interface StreamingAttempt {
   thinking: string;
 }
 
-export interface AutoDecisionStatus {
-  enabled: boolean;
-  availability: "ready" | "missing" | "invalid" | "unavailable";
-  message?: string;
-}
-
 export interface SessionView {
-  autoDecision: AutoDecisionStatus;
+  approvalMode: ApprovalMode;
   title: string | null;
   ref: SessionRef | null;
   model: RunModelSnapshot | null;

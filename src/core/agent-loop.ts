@@ -1,7 +1,4 @@
-import { probeDecisionModel, requestDecision, type DecisionState } from "../llm/decision-service.js";
-import type { LoadedDecisionModelConfig } from "../llm/decision-model-config-store.js";
-import type { LoadedDecisionPrompt } from "../tools/prompts.js";
-import type { AutoDecisionStatus } from "./state.js";
+import type { ApprovalMode } from "../security/permissions.js";
 import type { Diagnostics } from "../diagnostics.js";
 import type { PendingShellCleanup } from "../tools/shell.js";
 import { randomUUID } from "node:crypto";
@@ -53,9 +50,6 @@ import { splitSkillCommand } from "./skills.js";
 
 export interface AgentSessionOptions {
   store: SessionStore;
-  decisionConfig?: LoadedDecisionModelConfig;
-  decisionPrompt?: LoadedDecisionPrompt;
-  decisionFetch?: typeof fetch;
   modelConfigPath?: string;
   workspaceId: string;
   ref?: SessionRef;
@@ -70,8 +64,6 @@ export interface AgentSessionOptions {
   systemPrompt?: string;
   onWarning?: (
     warning:
-      | { kind: "decision_fallback"; category: "http" | "transport" | "response" | "timeout" }
-      | { kind: "decision_probe"; category: "unavailable" | "recovered"; message?: string }
       | ContextBuildWarning
       | SessionLoadWarning
       | { kind: "temporary_file_cleanup_failed"; path: string }
@@ -155,92 +147,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let openedAtSeq = records.at(-1)?.recordSeq ?? 0;
   let sessionMeta: SessionMeta | null = initial?.meta ?? null;
   let sessionWarnings: SessionLoadWarning[] = initial?.warnings ?? [];
-  let autoDecisionEnabled = sessionMeta?.autoDecisionEnabled ?? true;
+  let approvalMode: ApprovalMode = sessionMeta?.approvalMode ?? "auto";
   let metadataFresh = true;
-  let runAutoDecisionEnabled = true;
-  let runDecisionUnavailable = false;
-  let currentIntent = "";
-  const decisionConfig: NonNullable<AgentSessionOptions["decisionConfig"]> = structuredClone(
-    options.decisionConfig ?? { status: "missing" },
-  );
-  const decisionPrompt: NonNullable<AgentSessionOptions["decisionPrompt"]> = structuredClone(
-    options.decisionPrompt ?? { status: "invalid", message: "Decision prompt unavailable" },
-  );
-  let decisionProbe: { reason: "model_mismatch" | "not_decision"; message: string } | null = null;
-  let probeGeneration = 0;
-  let probeController: AbortController | null = null;
-  let probePromise: Promise<void> | null = null;
-  const autoDecisionStatus = (): AutoDecisionStatus => {
-    const invalid =
-      decisionConfig.status === "invalid"
-        ? decisionConfig
-        : decisionPrompt.status === "invalid"
-          ? decisionPrompt
-          : null;
-    const availability = invalid
-      ? "invalid"
-      : decisionConfig.status === "missing"
-        ? "missing"
-        : decisionProbe
-          ? "unavailable"
-          : "ready";
-    const message = invalid ? invalid.message : (decisionProbe?.message ?? undefined);
-    return {
-      enabled: autoDecisionEnabled,
-      availability,
-      ...(message !== undefined ? { message } : {}),
-    };
-  };
-  const stopDecisionProbe = (): Promise<void> => {
-    probeGeneration += 1;
-    probeController?.abort();
-    probeController = null;
-    const previous = probePromise;
-    probePromise = null;
-    return previous ?? Promise.resolve();
-  };
-  const startDecisionProbe = (): void => {
-    const previous = stopDecisionProbe();
-    const generation = probeGeneration;
-    probePromise = (async () => {
-      await previous;
-      if (generation !== probeGeneration) return;
-      if (
-        !autoDecisionEnabled ||
-        decisionConfig.status !== "ok" ||
-        decisionPrompt.status !== "ok"
-      )
-        return;
-      const controller = new AbortController();
-      probeController = controller;
-      const outcome = await probeDecisionModel({
-        config: decisionConfig.config,
-        timeoutMs: parseSettings(options.getSettings()).decisionTimeoutMs,
-        signal: controller.signal,
-        fetch: options.decisionFetch,
-      });
-      if (generation !== probeGeneration) return;
-      options.diagnostics?.debug(
-        JSON.stringify({
-          event: "decision.probe",
-          kind: outcome.kind,
-          ...(outcome.kind === "inconclusive" ? { category: outcome.category } : {}),
-        }),
-      );
-      if (outcome.kind === "model_mismatch") {
-        const message = `决策模型名称与服务不符（配置：${decisionConfig.config.model}，服务：${outcome.servedModel}）`;
-        decisionProbe = { reason: "model_mismatch", message };
-        options.onWarning?.({ kind: "decision_probe", category: "unavailable", message });
-      } else if (outcome.kind === "not_decision") {
-        const message = "服务加载的模型不是决策模型";
-        decisionProbe = { reason: "not_decision", message };
-        options.onWarning?.({ kind: "decision_probe", category: "unavailable", message });
-      } else if (outcome.kind === "ok" && decisionProbe) {
-        decisionProbe = null;
-        options.onWarning?.({ kind: "decision_probe", category: "recovered" });
-      }
-    })();
-  };
   let recordsFresh = true;
   let recordsEpoch = 0;
   let resyncPromise: Promise<void> | null = null;
@@ -327,65 +235,6 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   };
   const makeManager = () =>
     new ApprovalManager({
-      onDecisionError: () => {
-        options.diagnostics?.warn(JSON.stringify({ event: "permission.decision", category: "internal" }));
-        options.onWarning?.({ kind: "decision_fallback", category: "transport" });
-      },
-      decider: async (subject, request, signal) => {
-        if (
-          !runAutoDecisionEnabled ||
-          runDecisionUnavailable ||
-          decisionConfig.status !== "ok" ||
-          decisionPrompt.status !== "ok"
-        )
-          return { kind: "ask_user" };
-        const call = currentCalls.find((entry) => entry.id === subject.toolCallId);
-        if (!activeHandle || !call || call.parse.status !== "parsed") return { kind: "ask_user" };
-        const args = call.parse.arguments;
-        if (!signal) return { kind: "ask_user" };
-        const base = {
-          user_task: activeHandle.prompt,
-          agent_intent: currentIntent,
-          project_root: options.workspaceRoot,
-        };
-        const paths = {
-          resolved_paths: [...request.paths],
-          touches_outside_workspace: request.touchesOutsideWorkspace,
-        };
-        let state: DecisionState;
-        if (call.name === "bash" && typeof args.command === "string") {
-          state = {
-            ...base,
-            tool: "bash",
-            arguments: {
-              command: args.command,
-              ...(typeof args.timeout === "number" ? { timeout: args.timeout } : {}),
-            },
-          };
-        } else if ((call.name === "write" || call.name === "edit") && typeof args.path === "string") {
-          state = { ...base, ...paths, tool: call.name, arguments: { path: args.path } };
-        } else if (call.name === "read" || call.name === "glob" || call.name === "grep") {
-          state = { ...base, ...paths, tool: call.name, arguments: { ...args } };
-        } else return { kind: "ask_user" };
-        const result = await requestDecision({
-          config: decisionConfig.config,
-          prompt: decisionPrompt.text,
-          state,
-          timeoutMs: runSettings.decisionTimeoutMs,
-          signal,
-          fetch: options.decisionFetch,
-        });
-        options.diagnostics?.debug(
-          JSON.stringify({
-            toolCallId: subject.toolCallId,
-            kind: result.kind,
-            ...(result.kind === "fallback" ? { category: result.category } : {}),
-          }),
-        );
-        if (result.kind === "fallback" && !signal?.aborted)
-          options.onWarning?.({ kind: "decision_fallback", category: result.category });
-        return result;
-      },
       approver: (request) => {
         if (!activeHandle) throw new Error("No active Run");
         const call = currentCalls.find((c) => c.id === request.toolCallId);
@@ -768,10 +617,6 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           // 完整生成的响应不因取消竞态丢弃：取消只阻止后续工具执行，已发生的生成如实落盘进上下文。
           handle.beginAttempt(turn, response.attempts);
           handle.finishAttempt("completed");
-          currentIntent = response.message.content
-            .filter((block) => block.type === "text")
-            .map((block) => block.text)
-            .join("\n");
           currentCalls = toolCallsOfMessage(response.message);
           if (!["stop", "toolUse", "length"].includes(response.message.stopReason))
             throw new Error("Incomplete model response");
@@ -927,7 +772,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     records = nextRecords;
     openedAtSeq = nextRecords.at(-1)?.recordSeq ?? 0;
     sessionMeta = nextMeta;
-    autoDecisionEnabled = nextMeta?.autoDecisionEnabled ?? true;
+    approvalMode = nextMeta?.approvalMode ?? "auto";
     metadataFresh = true;
     sessionWarnings = nextWarnings;
     sessionAgentsMd = nextAgentsMd;
@@ -938,8 +783,6 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     unknownSignature = JSON.stringify(gate.unknownResults);
     shellBlocked = false;
     manager = makeManager();
-    decisionProbe = null;
-    startDecisionProbe();
   };
   const compactor: CompactionDriver = {
     execute: async (signal, focus) => {
@@ -1002,25 +845,25 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     compactor,
     skillsRoot: options.skillsRoot,
     commands: {
-      getAutoDecisionStatus: async () => {
+      getApprovalMode: async () => {
         if (ref) {
           const meta = await options.store.readSessionMeta(ref);
           sessionMeta = meta;
-          autoDecisionEnabled = meta.autoDecisionEnabled ?? true;
+          approvalMode = meta.approvalMode ?? "auto";
           metadataFresh = true;
         }
-        return autoDecisionStatus();
+        return approvalMode;
       },
-      setAutoDecisionEnabled: async (enabled) => {
-        if (!metadataFresh) throw new Error("Query /autodecision to reload Session metadata first");
+      setApprovalMode: async (mode) => {
+        if (!metadataFresh) throw new Error("Query /mode to reload Session metadata first");
         if (ref) {
           try {
-            sessionMeta = await options.store.setAutoDecisionEnabled(ref, enabled);
+            sessionMeta = await options.store.setApprovalMode(ref, mode);
           } catch (error) {
             metadataFresh = false;
             try {
               sessionMeta = await options.store.readSessionMeta(ref);
-              autoDecisionEnabled = sessionMeta.autoDecisionEnabled ?? true;
+              approvalMode = sessionMeta.approvalMode ?? "auto";
               metadataFresh = true;
             } catch {
               // An uncertain save blocks Runs until a metadata query succeeds.
@@ -1028,9 +871,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             throw error;
           }
         }
-        autoDecisionEnabled = enabled;
-        if (enabled) startDecisionProbe();
-        else await stopDecisionProbe();
+        approvalMode = mode;
       },
       readHistory: async () => {
         if (!ref || !sessionMeta) return null;
@@ -1122,14 +963,11 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     createId: (prefix) => `${prefix}-${randomUUID()}`,
     hooks: {
       captureRunInput: () => {
-        runAutoDecisionEnabled = autoDecisionEnabled;
-        runDecisionUnavailable = decisionProbe !== null;
-        currentIntent = "";
         runModel = structuredClone(currentModel());
         runSettings = parseSettings(options.getSettings());
       },
       getSessionView: () => ({
-        autoDecision: autoDecisionStatus(),
+        approvalMode,
         ref: ref ? { ...ref } : null,
         title: sessionTitle,
         model: modelConfig?.status === "empty" ? null : displayModel(currentModel()),
@@ -1143,13 +981,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         contextBaselineTokens,
       }),
       closeSession: async () => {
-        await stopDecisionProbe();
         await closePendingShells();
         if (ref) await options.store.releaseSession(ref);
       },
       assertCanStartRun: () => {
         if (!metadataFresh)
-          throw new Error("Query /autodecision to reload Session metadata before starting a Run");
+          throw new Error("Query /mode to reload Session metadata before starting a Run");
         if (shellBlocked) throw new Error("Shell termination is not confirmed. Cannot start a new Run.");
         gate.assertCanStartRun();
       },
@@ -1173,7 +1010,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           const meta = await options.store.createSession({
             workspaceId,
             initialRecords,
-            autoDecisionEnabled,
+            approvalMode,
           });
           ref = { workspaceId, sessionId: meta.sessionId };
           sessionMeta = meta;
@@ -1210,7 +1047,6 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   });
 
   await refreshBaseline();
-  startDecisionProbe();
 
   return { controller, acknowledgeUnknownSideEffects: () => gate.acknowledge() };
 }

@@ -45,7 +45,7 @@ export function sanitizeDisplayText(text: string): string {
 }
 export const cellWidth = visibleWidth;
 export const COMMANDS = [
-  { name: "/autodecision", description: "查看或切换自动决策" },
+  { name: "/mode", description: "查看或切换审批模式" },
   { name: "/model", description: "选择模型" },
   { name: "/effort", description: "调整后续 Run 的思考强度" },
   { name: "/new", description: "回到空白会话" },
@@ -482,13 +482,13 @@ export class TuiStore {
     return [...commands, ...skills];
   }
   submit(): Promise<void> {
-    if (/^\/autodecision(?:\s|$)/.test(this.state.draft.trim()) && !this.closing && !this.state.modal) {
+    if (/^\/mode(?:\s|$)/.test(this.state.draft.trim()) && !this.closing && !this.state.modal) {
       if (
         this.controller.getSnapshot().status.kind !== "idle" ||
         this.state.core.sessionOperation ||
         this.commandRequest
       ) {
-        this.notice("/autodecision: Session operation in progress", true);
+        this.notice("/mode: Session operation in progress", true);
         return Promise.resolve();
       }
       return this.submitCommand(this.state.draft.trim());
@@ -569,20 +569,20 @@ export class TuiStore {
   }
   private submitCommand(command: string): Promise<void> {
     this.setDraft("");
-    if (/^\/autodecision(?:\s|$)/.test(command)) {
+    if (/^\/mode(?:\s|$)/.test(command)) {
       const parts = command.split(/\s+/);
-      if (parts.length > 2 || (parts[1] !== undefined && !["on", "off"].includes(parts[1]))) {
-        this.notice("用法：/autodecision [on|off]", true);
+      const mode = parts[1];
+      // 显式比较让 TS 收窄为 ApprovalMode，避免 cast。
+      if (parts.length > 2 || (mode !== undefined && mode !== "readonly" && mode !== "auto" && mode !== "full")) {
+        this.notice("用法：/mode [readonly|auto|full]", true);
         return Promise.resolve();
       }
       return this.command(async () => {
-        if (parts[1]) await this.controller.setAutoDecisionEnabled(parts[1] === "on");
-        const status = parts[1]
-          ? this.controller.getSnapshot().session.autoDecision
-          : await this.controller.getAutoDecisionStatus();
-        this.notice(
-          `Auto Decision: ${status.enabled ? "On" : "Off"} · ${status.availability}${status.message ? ` · ${status.message}` : ""}`,
-        );
+        if (mode !== undefined) await this.controller.setApprovalMode(mode);
+        const current = mode !== undefined
+          ? this.controller.getSnapshot().session.approvalMode
+          : await this.controller.getApprovalMode();
+        this.notice(`Mode: ${current}`);
       });
     }
     const compact = /^\/compact(?:\s+([\s\S]*))?$/.exec(command);
@@ -623,7 +623,7 @@ export class TuiStore {
         return Promise.resolve();
       default:
         this.notice(
-          "未知命令。可用：/model /effort /new /resume /compact /skill: /autodecision /cancel /exit",
+          "未知命令。可用：/model /effort /new /resume /compact /skill: /mode /cancel /exit",
           true,
         );
         return Promise.resolve();

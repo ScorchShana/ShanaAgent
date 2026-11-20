@@ -259,13 +259,10 @@ export class StatusBar implements Component {
   invalidate(): void {}
   render(width: number): string[] {
     const state = this.state;
-    const decision = state.core.session.autoDecision;
-    const reason = !decision.enabled ? "" : decision.availability === "invalid" ? "config error"
-      : decision.availability === "missing" ? "not configured"
-      : decision.availability === "unavailable" ? "unavailable" : "";
-    const automatic = decision.enabled && !reason;
-    const label = theme.muted("Decision: ") + (automatic ? theme.cyan("auto") : theme.muted("manual"))
-      + (reason ? (reason === "config error" ? theme.error : theme.warning)(` (${reason})`) : "");
+    const mode = state.core.session.approvalMode;
+    // full 是全豁免（含区外写入），用 warning 色做视觉提醒。
+    const label = theme.muted("Mode: ") + (mode === "readonly" ? theme.muted("readonly")
+      : mode === "auto" ? theme.cyan("auto") : theme.warning("full"));
     const metrics = this.metrics;
     const prefix = `${state.core.status.kind !== "idle" ? theme.muted("Draft · ") : ""}${label}`;
     const base = `${prefix}${theme.muted(` · ${contextSegment(metrics)}`)}`;

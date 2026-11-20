@@ -1,5 +1,4 @@
 import type { ApprovalDecision } from "../core/state.js";
-import type { DecisionOutcome } from "../llm/decision-service.js";
 import {
   emptySessionGrants,
   evaluatePermission,
@@ -26,32 +25,21 @@ export type PermissionOutcome =
         | "skills_read"
         | "session_grant"
         | "approved_once"
-        | "approved_for_session"
-        | "decision_model";
+        | "approved_for_session";
     }
   | { decision: "deny"; reason: PermissionDenyReason }
   | { decision: "cancelled" };
 
 export interface ApprovalManagerOptions {
   approver?: Approver;
-  onDecisionError?: (error: unknown) => void;
-  decider?: (
-    subject: ToolCallSubject,
-    request: ApprovalRequest,
-    signal?: AbortSignal,
-  ) => Promise<DecisionOutcome>;
 }
 
 export class ApprovalManager {
   #grants: SessionGrants = emptySessionGrants();
   readonly #approver: Approver | undefined;
-  readonly #decider: ApprovalManagerOptions["decider"];
-  readonly #onDecisionError: ApprovalManagerOptions["onDecisionError"];
 
   constructor(options: ApprovalManagerOptions = {}) {
     this.#approver = options.approver;
-    this.#decider = options.decider;
-    this.#onDecisionError = options.onDecisionError;
   }
 
   get grants(): SessionGrants {
@@ -69,24 +57,6 @@ export class ApprovalManager {
     const verdict = evaluatePermission(subject, this.#grants);
     if (verdict.outcome === "allow") {
       return { decision: "allow", basis: verdict.basis };
-    }
-    const request = verdict.request;
-    const eligible =
-      (request.access === "read" && ["read", "glob", "grep"].includes(subject.toolName)) ||
-      (request.access === "write" &&
-        !request.touchesOutsideWorkspace &&
-        ["write", "edit"].includes(subject.toolName)) ||
-      (request.access === "shell" && subject.toolName === "bash");
-    if (eligible && this.#decider) {
-      let result: DecisionOutcome;
-      try {
-        result = await this.#decider(subject, request, options.signal);
-      } catch (error) {
-        this.#onDecisionError?.(error);
-        result = { kind: "fallback", category: "transport" };
-      }
-      if (options.signal?.aborted || result.kind === "cancelled") return { decision: "cancelled" };
-      if (result.kind === "allow_once") return { decision: "allow", basis: "decision_model" };
     }
     if (options.signal?.aborted) return { decision: "cancelled" };
     const approver = this.#approver;

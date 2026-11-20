@@ -47,6 +47,8 @@ it.each(["\r", "\x1b[13u", "\x1b[13;1u"])("fills the selected model command and 
   try {
     for (const key of "/mo") test.terminal.sendInput(key);
     await vi.waitFor(() => expect(test.app.editor.capturesViewportInput).toBe(true));
+    // /mo 同时前缀匹配 /mode 与 /model（/mode 在前）：下移一次选中 /model。
+    test.terminal.sendInput("\x1b[B");
     test.terminal.sendInput(enter);
     expect(test.store.getSnapshot().draft).toBe("/model");
     expect(test.app.editor.getText()).toBe("/model");
@@ -519,7 +521,7 @@ it("keeps a newer approval and its selected action when an effort save finishes"
       };
     }) },
     hooks: { getSessionView: () => ({ title: null, ref: null, model, models: [model], runModel: null,
-      contextBaselineTokens: null, autoDecision: { enabled: false, availability: "missing" } }) },
+      contextBaselineTokens: null, approvalMode: "readonly" }) },
   });
   vi.spyOn(core, "setReasoningEffort").mockImplementation(() => new Promise(resolve => { releaseSave = resolve; }));
   const decision = vi.spyOn(core, "resolveApproval");
@@ -641,7 +643,7 @@ it("does not reserve an empty notice row when a model is configured", async () =
     vi.spyOn(test.store, "getSnapshot").mockReturnValue({ ...state, core: { ...state.core, session: { ...state.core.session, model: makeModelSnapshot() } } });
     test.app.update();
     expect(test.app.notice.render(80)).toEqual([]);
-    expect(test.app.header.render(200).join(" ")).not.toContain("Auto Decision:");
+    expect(test.app.header.render(200).join(" ")).not.toContain("Mode:");
     expect(test.app.status.render(80)).toHaveLength(2);
   } finally { await test.close(); }
 });

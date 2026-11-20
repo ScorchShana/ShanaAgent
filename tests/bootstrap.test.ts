@@ -136,49 +136,15 @@ describe("启动提示词", () => {
   });
 });
 
-it("loads decision configuration at startup and redacts its key", () => {
+it("legacy decision-model.json is ignored at startup and left untouched", () => {
   const home = makeTempDir();
   const cwd = makeTempDir();
   fs.mkdirSync(path.join(home, ".shana"));
   const target = path.join(home, ".shana", "decision-model.json");
-  fs.writeFileSync(
-    target,
-    JSON.stringify({ base_url: "http://localhost:8081", apiKey: "decision-secret-12345678" }),
-  );
+  const raw = JSON.stringify({ base_url: "http://localhost:8081", apiKey: "decision-secret-12345678" });
+  fs.writeFileSync(target, raw);
   const result = bootstrap({ homeDir: home, cwd });
-  expect(result.decisionConfig.status).toBe("ok");
-  expect(result.decisionPrompt.status).toBe("ok");
-  fs.writeFileSync(target, "{}");
-  expect(result.decisionConfig.status).toBe("ok");
-  result.diagnostics.error("decision-secret-12345678");
-  const text = fs
-    .readdirSync(result.logsDir)
-    .map((name) => fs.readFileSync(path.join(result.logsDir, name), "utf8"))
-    .join("");
-  expect(text).not.toContain("decision-secret-12345678");
-  expect(text).not.toContain("5678");
-});
-
-it("decision prompt failures are isolated and controlled", async () => {
-  const { loadDecisionPrompt } = await import("../src/tools/prompts.js");
-  expect(loadDecisionPrompt().status).toBe("ok");
-  for (const content of [Buffer.from(" "), Buffer.from([0xc3, 0x28]), Buffer.from("a\0b")]) {
-    const read = vi.spyOn(fs, "readFileSync").mockReturnValueOnce(content);
-    try {
-      expect(loadDecisionPrompt()).toEqual({ status: "invalid", message: expect.any(String) });
-    } finally {
-      read.mockRestore();
-    }
-  }
-  const read = vi.spyOn(fs, "readFileSync").mockImplementationOnce(() => {
-    throw new Error("sensitive");
-  });
-  try {
-    expect(loadDecisionPrompt()).toEqual({
-      status: "invalid",
-      message: expect.not.stringContaining("sensitive"),
-    });
-  } finally {
-    read.mockRestore();
-  }
+  expect(result).not.toHaveProperty("decisionConfig");
+  expect(result).not.toHaveProperty("decisionPrompt");
+  expect(fs.readFileSync(target, "utf8")).toBe(raw);
 });

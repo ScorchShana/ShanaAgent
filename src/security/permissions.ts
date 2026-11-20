@@ -7,6 +7,10 @@ import {
 
 export type ToolAccessKind = "read" | "write" | "shell" | "unknown";
 
+// 审批模式的权威定义。sessions/records.ts 因层边界禁止依赖 security，
+// 使用结构同一的本地联合（SESSION_APPROVAL_MODES）自行校验。
+export type ApprovalMode = "readonly" | "auto" | "full";
+
 export interface SessionGrants {
   fileTools: ReadonlySet<string>;
   shellCommands: ReadonlySet<string>;

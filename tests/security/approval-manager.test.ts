@@ -23,117 +23,13 @@ import { cleanupTempDirs, makeWorkspace, readFileAt, tempDir, writeFileAt } from
 
 afterEach(cleanupTempDirs);
 
-describe("optional decision model", () => {
-  it("falls back on a rejected decider and respects cancellation on rejection", async () => {
-    const abort = new AbortController();
-    const approver = vi.fn(async () => "once" as const);
-    const manager = new ApprovalManager({
-      approver,
-      decider: async () => {
-        throw new Error("unavailable");
-      },
-    });
-    expect((await manager.requestPermission(shellSubject("echo reject"))).decision).toBe("allow");
-    expect(approver).toHaveBeenCalledOnce();
-    const cancelled = new ApprovalManager({
-      approver,
-      decider: async () => {
-        abort.abort();
-        throw new Error("cancelled");
-      },
-    });
-    expect(await cancelled.requestPermission(shellSubject("echo cancel"), { signal: abort.signal })).toEqual({
-      decision: "cancelled",
-    });
-    expect(approver).toHaveBeenCalledOnce();
-  });
-
+describe("session grants", () => {
   it("never applies a bash grant to an unknown shell tool", async () => {
     const approver = vi.fn(async () => "session" as const);
     const manager = new ApprovalManager({ approver });
     await manager.requestPermission(shellSubject("echo shared"));
     await manager.requestPermission({ ...shellSubject("echo shared"), toolName: "unknown" });
     expect(approver).toHaveBeenCalledTimes(2);
-  });
-  it("allows only the current call and does not create a session grant", async () => {
-    const root = makeWorkspace();
-    const decider = vi.fn(async () => ({ kind: "allow_once" as const }));
-    const manager = new ApprovalManager({ decider });
-    const subject = writeSubject(root, "decision.txt");
-    expect(await manager.requestPermission(subject)).toEqual({ decision: "allow", basis: "decision_model" });
-    await manager.requestPermission(subject);
-    expect(decider).toHaveBeenCalledTimes(2);
-    expect(manager.grants.fileTools.size).toBe(0);
-  });
-
-  it("never lets the model authorize outside writes or unknown tools", async () => {
-    const root = makeWorkspace();
-    const outside = tempDir();
-    const decider = vi.fn(async () => ({ kind: "allow_once" as const }));
-    const approver = vi.fn(async () => "deny" as const);
-    const manager = new ApprovalManager({ decider, approver });
-    expect(
-      (await manager.requestPermission(writeSubject(root, path.join(outside, "out.txt")))).decision,
-    ).toBe("deny");
-    await manager.requestPermission({
-      toolCallId: "x",
-      toolName: "unknown",
-      action: { type: "shell", command: "unknown" },
-    });
-    expect(decider).not.toHaveBeenCalled();
-    expect(approver).toHaveBeenCalledTimes(2);
-  });
-
-  it("handles cancellation after decision without asking a human", async () => {
-    const abort = new AbortController();
-    const approver = vi.fn(async () => "once" as const);
-    const manager = new ApprovalManager({
-      approver,
-      decider: async () => {
-        abort.abort();
-        return { kind: "allow_once" };
-      },
-    });
-    expect(await manager.requestPermission(shellSubject("echo ok"), { signal: abort.signal })).toEqual({
-      decision: "cancelled",
-    });
-    expect(approver).not.toHaveBeenCalled();
-  });
-
-  it("falls back to human approval for failed decisions", async () => {
-    const approver = vi.fn(async () => "once" as const);
-    const manager = new ApprovalManager({
-      approver,
-      decider: async () => ({ kind: "fallback", category: "timeout" }),
-    });
-    expect(await manager.requestPermission(shellSubject("echo ok"))).toEqual({
-      decision: "allow",
-      basis: "approved_once",
-    });
-    expect(approver).toHaveBeenCalledOnce();
-  });
-
-  it("decides outside reads and bash but bypasses workspace reads", async () => {
-    const root = makeWorkspace();
-    const outside = tempDir();
-    const decider = vi.fn(async () => ({ kind: "allow_once" as const }));
-    const manager = new ApprovalManager({ decider });
-    await manager.requestPermission(readSubject(root, "inside.txt"));
-    expect(decider).not.toHaveBeenCalled();
-    expect(
-      (await manager.requestPermission(readSubject(root, path.join(outside, "read.txt")))).decision,
-    ).toBe("allow");
-    expect((await manager.requestPermission(shellSubject("echo ok"))).decision).toBe("allow");
-    expect(decider).toHaveBeenCalledTimes(2);
-  });
-
-  it("does not ask the model again after a human session grant", async () => {
-    const decider = vi.fn(async () => ({ kind: "ask_user" as const }));
-    const manager = new ApprovalManager({ decider, approver: async () => "session" });
-    const subject = shellSubject("echo grant");
-    expect((await manager.requestPermission(subject)).decision).toBe("allow");
-    expect(await manager.requestPermission(subject)).toEqual({ decision: "allow", basis: "session_grant" });
-    expect(decider).toHaveBeenCalledOnce();
   });
 });
 

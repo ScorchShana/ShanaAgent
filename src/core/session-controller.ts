@@ -1,4 +1,5 @@
 import type { ReasoningEffort } from "../llm/model-config-store.js";
+import type { ApprovalMode } from "../security/permissions.js";
 import type { CompactionOutcome } from "../sessions/compaction-store.js";
 import type { SkillSnapshot } from "../sessions/records.js";
 import type { SessionRef, SessionHistory } from "../sessions/session-store.js";
@@ -20,7 +21,6 @@ import {
   type RunPhase,
   type StreamingAttempt,
   type SessionView,
-  type AutoDecisionStatus,
   type SessionListEntry,
 } from "./state.js";
 
@@ -63,8 +63,8 @@ export interface CompactionDriver {
 }
 
 export interface ControllerCommands {
-  getAutoDecisionStatus?(): Promise<AutoDecisionStatus>;
-  setAutoDecisionEnabled?(enabled: boolean): Promise<void>;
+  getApprovalMode?(): Promise<ApprovalMode>;
+  setApprovalMode?(mode: ApprovalMode): Promise<void>;
   switchModel?(providerId: string, modelId: string): Promise<void>;
   setReasoningEffort?(effort: ReasoningEffort): Promise<void>;
   newSession?(): Promise<void>;
@@ -306,14 +306,14 @@ export class SessionController {
     );
   }
 
-  getAutoDecisionStatus(): Promise<AutoDecisionStatus> {
-    return this.command("/autodecision", this.commands.getAutoDecisionStatus);
+  getApprovalMode(): Promise<ApprovalMode> {
+    return this.command("/mode", this.commands.getApprovalMode);
   }
 
-  setAutoDecisionEnabled(enabled: boolean): Promise<void> {
+  setApprovalMode(mode: ApprovalMode): Promise<void> {
     return this.command(
-      "/autodecision",
-      this.commands.setAutoDecisionEnabled && (() => this.commands.setAutoDecisionEnabled!(enabled)),
+      "/mode",
+      this.commands.setApprovalMode && (() => this.commands.setApprovalMode!(mode)),
     );
   }
 
@@ -382,7 +382,7 @@ export class SessionController {
       models: [],
       runModel: null,
       contextBaselineTokens: null,
-      autoDecision: { enabled: true, availability: "missing" as const },
+      approvalMode: "auto" as const,
     };
     return structuredClone({
       runTiming: this.getRunTiming(),
