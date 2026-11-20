@@ -72,7 +72,7 @@ it.skipIf(process.env.SHANA_REAL_COMPACTION !== "1")(
         settings: parseSettings({ compactionSummaryTargetTokens: 512 }),
         signal: new AbortController().signal,
         retainedContextBudget: 500,
-        keepLatestTurn: false,
+        trigger: "start",
         modelService: {
           streamTurn: (request) => {
             requests.push(request);

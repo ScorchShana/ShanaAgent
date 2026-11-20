@@ -8,6 +8,9 @@ import {
   estimateTokens,
   isRequestFeasible,
   planCompaction,
+  planEffectiveContext,
+  replayContextMessages,
+  type PlanCompactionOptions,
   trimCompactionMessages,
   wrapConversationSummary,
 } from "../core/context-builder.js";
@@ -35,13 +38,14 @@ export class CompactionError extends Error {
 export interface CompactHistoryOptions {
   records: readonly SessionRecord[];
   // 调用方预构建的有效上下文（含 System Prompt、工具 Schema 与当前 Prompt）；
-  // 主路径在其末尾追加指令，回退路径只复用其 System Prompt。
+  // 主路径复用实际消息直到覆盖边界，以保留前缀缓存；回退仅发送预算内的覆盖内容。
   context: StoredContext;
   model: ResolvedModel;
   settings: Settings;
   signal: AbortSignal;
   retainedContextBudget: number;
-  keepLatestTurn: boolean;
+  trigger: PlanCompactionOptions["trigger"];
+  currentRunId?: string;
   // 手动 /compact 的用户附加重点：只进本次摘要请求，不落盘、不进 promptVersion。
   focus?: string;
   modelService: Pick<ModelService, "streamTurn">;
@@ -69,7 +73,8 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
   if (signal.aborted) return cancelled("primary");
 
   const selection = planCompaction(records, {
-    keepLatestTurn: options.keepLatestTurn,
+    trigger: options.trigger,
+    ...(options.currentRunId === undefined ? {} : { currentRunId: options.currentRunId }),
     retainedContextBudget: options.retainedContextBudget,
     tokenEstimate,
     // 与调用方预构建 context 同能力渲染，预算与摘要输入才与正式请求同构。
@@ -106,14 +111,17 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
   // 思考与正文共享同一输出上限，请求输出预算须同时预留两者。
   const thinkingHeadroom =
     model.reasoning && model.thinking ? thinkingBudgetForLevel(model.reasoningEffort) : 0;
-  const estimated = estimateContextTokens(context, tokenEstimate);
-  const coveredTokens = estimateContextTokens({ messages: selection.messages }, tokenEstimate);
+  const prefixLength = selection.messages.length + Number(selection.previousSummary !== null);
+  const prefix = context.messages.slice(0, prefixLength);
+  const estimated = estimateContextTokens({ ...context, messages: prefix }, tokenEstimate);
   const previousSummaryTokens =
     selection.previousSummary === null
       ? 0
       : estimateTokens(wrapConversationSummary(selection.previousSummary), tokenEstimate);
-  const retainedTokens = estimated - coveredTokens - previousSummaryTokens;
-  // 下界已 >= C：摘要掉全部可压缩历史也装不下，不调用摘要模型（工单 §2 第 7 条）。
+  const retainedTokens = estimateContextTokens(
+    { ...context, messages: selection.retainedMessages }, tokenEstimate,
+  );
+  // 尾部也包括跨覆盖边界补回的 Run prompt。
   if (retainedTokens + summaryTarget >= contextWindow) {
     throw new CompactionError("压缩失败：保留尾部与摘要预算已超出上下文窗口。");
   }
@@ -128,7 +136,7 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
   let requestContext: StoredContext;
   if (estimated + instructionTokens + summaryTarget + thinkingHeadroom + CONTEXT_SAFETY_MARGIN_TOKENS <= contextWindow) {
     path = "primary";
-    requestContext = { ...context, messages: [...context.messages, instructionMessage] };
+    requestContext = { ...context, messages: [...prefix, instructionMessage] };
   } else {
     path = "fallback";
     const systemTokens =
@@ -190,14 +198,7 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
   if (summary.length === 0) {
     throw new CompactionError("压缩失败：摘要为空。");
   }
-  const rebuiltTokens =
-    retainedTokens + estimateTokens(wrapConversationSummary(summary), tokenEstimate);
-  if (!isRequestFeasible(rebuiltTokens, contextWindow)) {
-    throw new CompactionError("压缩失败：压缩后上下文仍超出请求预算。");
-  }
-  if (signal.aborted) return cancelled(path);
-  // 追加与 fsync 是不可取消临界区：开始后收到的取消不影响 completed。
-  await appendRecord({
+  const checkpoint: Extract<NewSessionRecord, { type: "checkpoint" }> = {
     type: "checkpoint",
     summary,
     coveredUpTo: selection.coveredUpTo,
@@ -210,6 +211,16 @@ export async function compactHistory(options: CompactHistoryOptions): Promise<Co
       output: result.usage.output,
       ...(typeof result.message.durationMs === "number" ? { durationMs: result.message.durationMs } : {}),
     },
-  });
+  };
+  const candidate = { ...checkpoint, recordSeq: (records.at(-1)?.recordSeq ?? 0) + 1, ts: now().toISOString() };
+  const replay = planEffectiveContext([...records, candidate]);
+  const rebuiltMessages = replayContextMessages(replay, model.input.includes("image"));
+  const rebuiltTokens = estimateContextTokens({ ...context, messages: rebuiltMessages }, tokenEstimate);
+  if (!isRequestFeasible(rebuiltTokens, contextWindow)) {
+    throw new CompactionError("压缩失败：压缩后上下文仍超出请求预算。");
+  }
+  if (signal.aborted) return cancelled(path);
+  // 追加与 fsync 是不可取消临界区：开始后收到的取消不影响 completed。
+  await appendRecord(checkpoint);
   return { status: "completed", coveredUpTo: selection.coveredUpTo, path };
 }

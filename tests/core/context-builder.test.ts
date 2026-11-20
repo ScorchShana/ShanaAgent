@@ -254,7 +254,7 @@ describe("V7 检查点使用", () => {
     expect(plan.checkpoint?.summary).toBe("S1");
     expect(plan.coveredUpTo).toBe(3);
     expect(plan.runs).toHaveLength(1);
-    expect(plan.runs[0]?.prompt).toBeNull();
+    expect(plan.runs[0]?.prompt).toEqual(records[0]);
     expect(plan.runs[0]?.turns.map((turn) => turn.assistant.recordSeq)).toEqual([5, 7]);
     expect(plan.runs[0]?.turns[1]?.hasUnknown).toBe(true);
     expect(plan.runs[0]?.excludedTurns).toEqual([]);
@@ -272,6 +272,7 @@ describe("V7 检查点使用", () => {
     });
     expect(built.context.messages.map((message) => message.role)).toEqual([
       "user",
+      "user",
       "assistant",
       "toolResult",
       "assistant",
@@ -279,9 +280,9 @@ describe("V7 检查点使用", () => {
       "user",
       "user",
     ]);
-    expect(built.context.messages[1]).toBe(records[4]?.message);
-    expect(built.context.messages[4]).toMatchObject({ toolCallId: "c3", isError: true });
-    expect(built.context.messages[5]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
+    expect(built.context.messages[2]).toBe(records[4]?.message);
+    expect(built.context.messages[5]).toMatchObject({ toolCallId: "c3", isError: true });
+    expect(built.context.messages[6]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
     expect(built.context.messages.some((message) => message === records[0]?.message)).toBe(false);
     expect(built.context.messages.some((message) => message === records[2]?.message)).toBe(false);
   });
@@ -362,6 +363,7 @@ describe("V7 检查点使用", () => {
       content: "<conversation_summary>\nS\n</conversation_summary>",
     });
     expect(built.context.messages.map((message) => message.role)).toEqual([
+      "user",
       "user",
       "assistant",
       "toolResult",
@@ -652,13 +654,13 @@ describe("V9 可行性判据与压缩阈值", () => {
 
 // 每个完整 Turn 的估算成本：assistant 文本 1 + rawArguments "{}" 1 + 工具结果 1。
 // 每个 Run Prompt（"first"/"second"）为 2。
-const MANUAL_COMPACTION = {
-  keepLatestTurn: false,
+const START_COMPACTION = {
+  trigger: "start" as const,
   retainedContextBudget: 0,
   tokenEstimate: ESTIMATE,
 };
 const TAIL_COMPACTION = {
-  keepLatestTurn: true,
+  trigger: "continuation" as const,
   retainedContextBudget: 0,
   tokenEstimate: ESTIMATE,
 };
@@ -686,13 +688,13 @@ function expectSelection(selection: ReturnType<typeof planCompaction>) {
 describe("V10 压缩范围选择", () => {
   it("没有完整 Turn 时返回 noop", () => {
     expect(
-      planCompaction([makeUserPromptRecord(1, "run-1", "first")], MANUAL_COMPACTION),
+      planCompaction([makeUserPromptRecord(1, "run-1", "first")], START_COMPACTION),
     ).toEqual({ status: "noop" });
   });
 
-  it("手动压缩与触发点 (A) 不保留尾部，压缩全部 eligible Turn", () => {
+  it("触发点 (A) 覆盖当前 Prompt 之前的全部 eligible Turn", () => {
     const records = twoRunRecords();
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.coveredUpTo).toBe(10);
     expect(selection.previousSummary).toBeNull();
     expect(selection.messages.map((message) => message.role)).toEqual([
@@ -714,15 +716,14 @@ describe("V10 压缩范围选择", () => {
     ).toEqual(["first", "second"]);
   });
 
-  it("只有最新 Turn 时触发点 (B) 返回 noop，手动压缩仍可选择它", () => {
+  it("只有最新 Turn 时触发点 (B) 与手动压缩都返回 noop", () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "only"),
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
       makeToolResultRecord(3, "run-1", "c1", "success"),
     ];
     expect(planCompaction(records, TAIL_COMPACTION)).toEqual({ status: "noop" });
-    const manual = expectSelection(planCompaction(records, MANUAL_COMPACTION));
-    expect(manual.coveredUpTo).toBe(3);
+    expect(planCompaction(records, { ...TAIL_COMPACTION, trigger: "manual" })).toEqual({ status: "noop" });
   });
 
   it("触发点 (B) 的最新 Turn 单独超预算仍逐字保留，只压缩更早 Turn", () => {
@@ -743,7 +744,7 @@ describe("V10 压缩范围选择", () => {
 
   it("保留预算按 Token 动态决定尾部保留的连续 Turn 数量", () => {
     const records = twoRunRecords();
-    // 保留 2 个 Turn：最新 3 + 前一个 3 = 6，加入 run-1 的 Turn 与 Prompt = 11 超预算。
+    // 当前 Run 的 prompt 与两个 Turn 都在预算内。
     const twoTurns = expectSelection(
       planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 10 }),
     );
@@ -756,16 +757,12 @@ describe("V10 压缩范围选择", () => {
       "toolResult",
     ]);
 
-    // 保留 3 个 Turn：跨 Run 边界时把 run-1 的 Prompt 计入预算。
-    const threeTurns = expectSelection(
-      planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 11 }),
+    // 预算充足时完整保留最新 Run，前一个 Run 进入摘要。
+    const wholeRun = expectSelection(
+      planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 1000 }),
     );
-    expect(threeTurns.coveredUpTo).toBe(3);
-    expect(threeTurns.messages.map((message) => message.role)).toEqual([
-      "user",
-      "assistant",
-      "toolResult",
-    ]);
+    expect(wholeRun.coveredUpTo).toBe(5);
+    expect(wholeRun.retainedMessages[0]).toMatchObject({ content: "second" });
 
     // 预算为 0 时只保留最新 Turn。
     const latestOnly = expectSelection(planCompaction(records, TAIL_COMPACTION));
@@ -797,7 +794,7 @@ describe("V10 压缩范围选择", () => {
     expect(plan.runs[0]?.excludedTurns[0]?.reason).toBe("truncated");
     expect(plan.runs[1]?.turns[0]?.hasUnknown).toBe(true);
 
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.coveredUpTo).toBe(8);
     // run-1 零 Turn 但 Prompt 恒进上下文，落在覆盖范围内时同样进摘要输入，不被静默丢掉。
     expect(selection.messages.map((message) => message.role)).toEqual([
@@ -822,7 +819,7 @@ describe("V10 压缩范围选择", () => {
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], { stopReason: "length" }),
       makeToolResultRecord(3, "run-1", "c1", "success"),
     ];
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.coveredUpTo).toBe(3);
     expect(selection.messages.map((message) => message.role)).toEqual([
       "user",
@@ -837,7 +834,7 @@ describe("V10 压缩范围选择", () => {
       makeUserPromptRecord(1, "run-1", "first"),
       makeAssistantRecord(2, "run-1", []),
     ];
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.coveredUpTo).toBe(2);
     expect(() => assertCandidateCheckpointValid(records, selection.coveredUpTo)).not.toThrow();
     expect(() => planEffectiveContext([...records, makeCheckpointRecord(3, "S", 2)])).not.toThrow();
@@ -848,10 +845,90 @@ describe("V10 压缩范围选择", () => {
     const selection = expectSelection(
       planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 11 }),
     );
-    expect(selection.coveredUpTo).toBe(3);
+    expect(selection.coveredUpTo).toBe(5);
     const prompts = selection.messages.filter((message) => message.role === "user");
     expect(prompts).toHaveLength(1);
     expect(prompts[0]).toMatchObject({ content: "first" });
+  });
+});
+
+describe("按 Run 压缩与回放", () => {
+  it("手动压缩单个多 Turn Run 保留 prompt、最新 Turn 和后续失败请求", async () => {
+    const records: SessionRecord[] = [
+      ...twoRunRecords().slice(0, 5),
+      makeUserPromptRecord(6, "run-2", "later"),
+      makeRunFinishedRecord(7, "run-2", "failed"),
+    ];
+    const selected = expectSelection(planCompaction(records, {
+      ...TAIL_COMPACTION, trigger: "manual", retainedContextBudget: 10_000,
+    }));
+    expect(selected.coveredUpTo).toBe(3);
+    expect(selected.retainedMessages.map((message) => message.role)).toEqual([
+      "user", "assistant", "toolResult", "user", "user",
+    ]);
+    const resumed = await buildContext({
+      records: [...records, makeCheckpointRecord(8, "summary", selected.coveredUpTo)],
+      workspacePath: makeWorkspace(),
+    });
+    expect(resumed.context.messages.slice(1)).toEqual(selected.retainedMessages);
+    expect(resumed.context.messages[1]).toMatchObject({ content: "first" });
+    expect(resumed.context.messages[4]).toMatchObject({ content: "later" });
+  });
+
+  it("首请求溢出时保留前一 Run 的 prompt、最新 Turn 和当前请求", () => {
+    const records = [
+      ...twoRunRecords().slice(0, 5),
+      makeUserPromptRecord(6, "active", "next"),
+    ];
+    const selected = expectSelection(planCompaction(records, {
+      ...TAIL_COMPACTION, trigger: "overflow", currentRunId: "active", retainedContextBudget: 0,
+    }));
+    expect(selected.coveredUpTo).toBe(3);
+    expect(selected.retainedMessages).toEqual([
+      expect.objectContaining({ role: "user", content: "first" }),
+      records[3]!.message,
+      expect.objectContaining({ role: "toolResult", toolCallId: "c2" }),
+      expect.objectContaining({ role: "user", content: "next" }),
+    ]);
+  });
+
+  it("同一 Run 连续压缩只摘要新前缀，仍然保留原始 prompt", async () => {
+    const records = [
+      ...twoRunRecords().slice(0, 5),
+      makeCheckpointRecord(6, "previous", 3),
+      makeAssistantRecord(7, "run-1", []),
+    ];
+    const options = { ...TAIL_COMPACTION, currentRunId: "run-1" };
+    const selected = expectSelection(planCompaction(records, options));
+    expect(selected.previousSummary).toBe("previous");
+    expect(selected.coveredUpTo).toBe(5);
+    const workspacePath = makeWorkspace();
+    const before = await buildContext({ records, workspacePath });
+    expect(selected.messages).toEqual(before.context.messages.slice(1, -1));
+    expect(selected.retainedMessages).toEqual([
+      expect.objectContaining({ role: "user", content: "first" }),
+      records[6]!.message,
+    ]);
+    const resumed = await buildContext({
+      records: [...records, makeCheckpointRecord(8, "updated", 5)], workspacePath,
+    });
+    expect(resumed.context.messages.slice(1)).toEqual(selected.retainedMessages);
+  });
+
+  it("A 覆盖已结束的零 Turn Run，重建后当前请求保留中断前缀", () => {
+    const records = [
+      makeUserPromptRecord(1, "cancelled", "before"),
+      makeRunFinishedRecord(2, "cancelled", "cancelled"),
+      makeUserPromptRecord(3, "active", "after"),
+    ];
+    const selected = expectSelection(planCompaction(records, {
+      ...START_COMPACTION, currentRunId: "active",
+    }));
+    expect(selected.coveredUpTo).toBe(2);
+    expect(selected.messages).toHaveLength(1);
+    expect(selected.retainedMessages).toEqual([
+      expect.objectContaining({ content: PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "after" }),
+    ]);
   });
 });
 
@@ -934,7 +1011,7 @@ describe("V10 候选 Checkpoint 预校验", () => {
       makeToolResultRecord(3, "run-1", "c1", "success"),
       makeUserPromptRecord(4, "run-2", "now"),
     ];
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, { ...START_COMPACTION, currentRunId: "run-2" }));
     expect(selection.coveredUpTo).toBe(3);
     records.push(makeCheckpointRecord(5, "S", 3));
 
@@ -967,7 +1044,7 @@ describe("V15 回退消息裁剪与阶梯裁剪", () => {
   }
 
   function selectionMessages(records: SessionRecord[]): StoredContext["messages"] {
-    return expectSelection(planCompaction(records, MANUAL_COMPACTION)).messages;
+    return expectSelection(planCompaction(records, START_COMPACTION)).messages;
   }
 
   function trimOf(records: SessionRecord[], options: { maxTokens?: number } = {}) {
@@ -1243,7 +1320,7 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
     const record = records[1]!;
     if (record.type === "assistant_message")
       record.message.content.unshift({ type: "thinking", thinking: "SUMMARY_DRAFT" });
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.messages.some((m) => m.role === "assistant")).toBe(true);
     expect(JSON.stringify(selection.messages)).not.toContain("SUMMARY_DRAFT");
   });
@@ -1329,7 +1406,7 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
       makeAssistantRecord(5, "run-2", [{ id: "c2", name: "bash" }]),
       // 崩溃窗口：c2 无结果记录。
     ];
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.coveredUpTo).toBe(5);
     expect(() => assertCandidateCheckpointValid(records, 5)).not.toThrow();
     expect(() => planEffectiveContext([...records, makeCheckpointRecord(6, "S", 5)])).not.toThrow();
@@ -1359,7 +1436,7 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
       makeRunFinishedRecord(5, "run-1", "cancelled"),
     ];
     const selection = planCompaction(records, {
-      keepLatestTurn: false,
+      trigger: "start" as const,
       retainedContextBudget: 0,
       tokenEstimate: { asciiCharsPerToken: 4, nonAsciiCharsPerToken: 1 },
     });
@@ -1428,7 +1505,7 @@ describe("零 Turn 取消后的渲染期中断前缀", () => {
       PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
     );
     expect(built.context.messages.at(-1)).toMatchObject({ content: "dangling" });
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(JSON.stringify(selection.messages)).not.toContain(PREVIOUS_REQUEST_INTERRUPTED_PREFIX);
   });
 
@@ -1493,7 +1570,7 @@ describe("零 Turn 取消后的渲染期中断前缀", () => {
     // 每 Turn 估算 3、Prompt "new task" 2：预算 8 恰好在不计前缀时能保留两个 Turn；
     // 前缀计入后第一个 Turn 被覆盖，其 Prompt（带前缀）进摘要输入。
     const selection = expectSelection(
-      planCompaction(records, { keepLatestTurn: true, retainedContextBudget: 8, tokenEstimate: ESTIMATE }),
+      planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 8 }),
     );
     expect(selection.coveredUpTo).toBe(5);
     expect(selection.messages.map((m) => m.role)).toEqual([
@@ -1601,7 +1678,7 @@ describe("image 双模态（view_image）", () => {
 
   it("planCompaction 双模态同构：摘要输入与正式请求按同一能力渲染", () => {
     const options = {
-      keepLatestTurn: false,
+      trigger: "start" as const,
       retainedContextBudget: 0,
       tokenEstimate: TOKEN_OPTS,
     };
@@ -1622,7 +1699,7 @@ describe("image 双模态（view_image）", () => {
       makeAssistantRecord(4, "run-1", [{ id: "c2", name: "view_image" }]),
       makeToolResultRecord(5, "run-1", "c2", "success", { toolName: "view_image", images: [image] }),
     ];
-    const options = { keepLatestTurn: true, retainedContextBudget: 200, tokenEstimate: TOKEN_OPTS };
+    const options = { trigger: "continuation" as const, retainedContextBudget: 200, tokenEstimate: TOKEN_OPTS };
     const vision = planCompaction(records, { ...options, imageInput: true });
     // 最新 Turn 含 2765 image tokens，超出 200 预算 → 只保留最新 Turn，前一 Turn 被覆盖。
     if (!("messages" in vision)) throw new Error("expected selection");
@@ -1746,7 +1823,7 @@ describe("skill 显式调用渲染同构", () => {
       makeAssistantRecord(5, "run-2", [{ id: "c2", name: "read" }]),
       makeToolResultRecord(6, "run-2", "c2", "success"),
     ];
-    const selection = expectSelection(planCompaction(records, MANUAL_COMPACTION));
+    const selection = expectSelection(planCompaction(records, START_COMPACTION));
     expect(selection.messages[0]).toMatchObject({
       content: renderSkillMessage(skill, "first"),
     });
@@ -1759,15 +1836,7 @@ describe("skill 显式调用渲染同构", () => {
       makeToolResultRecord(3, "run-1", "c1", "success"),
       makeAssistantRecord(4, "run-1", [{ id: "c2", name: "read" }]),
       makeToolResultRecord(5, "run-1", "c2", "success"),
-      makeUserPromptRecord(6, "run-2", "second"),
-      makeAssistantRecord(7, "run-2", [{ id: "c3", name: "read" }]),
-      makeToolResultRecord(8, "run-2", "c3", "success"),
-      makeAssistantRecord(9, "run-2", [{ id: "c4", name: "read" }]),
-      makeToolResultRecord(10, "run-2", "c4", "success"),
     ];
-    // 每 Turn 估算 3、run-2 Prompt 2：walk-back 保留至 run-1 首 Turn 前已计 11；
-    // 加上 run-1 首 Turn（3 + Prompt）时，裸命令文本 5 token 合计 19 恰好全保留 → noop，
-    // 展开全文 81 token 合计 95 超预算 → 首 Turn 被覆盖、其 Prompt 展开进摘要输入。
     const selection = expectSelection(
       planCompaction(records, { ...TAIL_COMPACTION, retainedContextBudget: 19 }),
     );

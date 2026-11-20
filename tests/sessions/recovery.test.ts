@@ -85,6 +85,27 @@ async function seedSource(store: SessionStore, ref: SessionRef): Promise<void> {
 }
 
 describe("resume original Session", () => {
+  it.each([false, true])("validates a run_finished checkpoint on disk (has Turn = %s)", async (hasTurn) => {
+    const { store } = makeStore();
+    const ref = sessionRef("finished-boundary");
+    await store.createSession(ref);
+    await store.appendRecord(ref, { type: "user_prompt", runId: "r", text: "request" });
+    if (hasTurn) {
+      await store.appendRecord(ref, {
+        type: "assistant_message", runId: "r", message: makeAssistantMessage([], "answer"),
+      });
+    }
+    const end = await store.appendRecord(ref, {
+      type: "run_finished", runId: "r", outcome: "cancelled", persisted: true,
+    });
+    await store.appendRecord(ref, {
+      type: "checkpoint", coveredUpTo: end.recordSeq, summary: "summary", model: { providerId: "p", modelId: "m" },
+    });
+    await store.releaseSession(ref);
+    if (hasTurn) await expect(resumeSession(store, ref)).rejects.toBeInstanceOf(CheckpointInvalidError);
+    else expect((await resumeSession(store, ref)).checkpoint?.coveredUpTo).toBe(end.recordSeq);
+  });
+
   it("keeps identity, checkpoint, audit prefix and appends from the actual tail", async () => {
     const { store, sessionsDir } = makeStore({ now: fixedNow() });
     const source = sessionRef("source");

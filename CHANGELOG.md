@@ -2,6 +2,8 @@
 
 ## 未发布
 
+- **修复**：自动压缩和手动 `/compact` 按 Run 选择保留范围。新请求开始前单独保留本次输入；执行途中和手动压缩优先保留最近的有效 Run，预算不足时保留所属用户输入和最近连续 Turn。摘要主路径仅发送截至覆盖边界的原始消息前缀。恢复旧 checkpoint 时会补回跨边界 Turn 的用户输入，沿用现有 Session 字段。旧版程序可能无法恢复采用零 Turn Run 结束记录作为边界的新 checkpoint。
+
 - **新增**：Skill 显式调用 `/skill:<name> [请求]`。提交时同步加载 `~/.shana/skills/<name>/SKILL.md` 快照（剥 frontmatter、UTF-8 严格解码、realpath 防 symlink 逃逸），失败在 Run 开始前报错——不创建 Session/Run、状态保持空闲、草稿保留可改后重提。模型侧渲染为 `<skill name location>` + 引导语 + 快照正文 + `</skill>` + 空行 + 请求原文（空请求允许）；中断前缀叠加在最前；正式请求/压缩摘要输入/锚定重建共用同一渲染内核，逐字同构。System Prompt 零改动；压缩摘要保留执行中 skill 的指令要点。
 - **新增**：`~/.shana/skills` 只读豁免区——read/glob/grep/view_image 恒允许、无需审批或决策；write/edit/bash 不豁免，skills 写入仍属区外逐次人工审批且会话授权不能豁免。四工具描述同步例外句（首次升级后工具 Schema 变化触发一次锚定回退，属预期）。
 - **新增**：TUI skill 卡片——蓝色标题 `skill:<name>` 默认折叠、点击展开快照 Markdown 正文，置于请求气泡之前；气泡只显示请求原文（空请求不渲染气泡）；resume/重启回放由记录快照派生。`/skill:` 补全菜单按需读目录（无缓存，运行期间新增 skill 立即可补全），两次 Enter 确认；会话标题与列表预览剥命令前缀（空请求回退 `skill:<name>`）。
