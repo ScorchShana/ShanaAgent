@@ -153,12 +153,17 @@ it.each(["assistant_message", "tool_result", "run_finished"] as const)(
 
 it("retains Session grants across models and drops them on real resume", async () => {
   let selected = structuredClone(model);
-  const write = () =>
-    makeAssistantMessage([{ id: "a", name: "write", arguments: { path: "a.txt", content: "written" } }]);
+  const fake = fakeShellRun();
+  // 会话授权只剩 bash 精确命令串（D10）；git 不在 analyzer 白名单，必落人工。
+  const command = "git status";
+  const bash = () => makeAssistantMessage([{ id: "a", name: "bash", arguments: { command } }]);
   const f = await fixture(
-    [write(), makeAssistantMessage([], "done"), write(), makeAssistantMessage([], "done")],
+    [bash(), makeAssistantMessage([], "done"), bash(), makeAssistantMessage([], "done")],
     40,
-    { getModel: () => selected },
+    {
+      getModel: () => selected,
+      executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree },
+    },
   );
   let approvals = 0;
   f.controller.eventBus.subscribe((e) => {
@@ -167,13 +172,19 @@ it("retains Session grants across models and drops them on real resume", async (
       f.controller.resolveApproval(e.approvalId, "session");
     }
   });
-  await f.controller.submitPrompt("first");
+  const first = f.controller.submitPrompt("first");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(1));
+  fake.child.emit("close", 0);
+  await first;
   selected = { ...selected, id: "second" };
-  await f.controller.submitPrompt("second");
+  const second = f.controller.submitPrompt("second");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(2));
+  fake.child.emit("close", 0);
+  await second;
   expect(approvals).toBe(1);
   await f.controller.exit();
   const resumed = await resumeSession(f.store, f.ref);
-  const messages = [write(), makeAssistantMessage([], "done")];
+  const messages = [bash(), makeAssistantMessage([], "done")];
   const next = await createAgentSession({
     store: f.store,
     workspaceId: f.ref.workspaceId,
@@ -181,6 +192,7 @@ it("retains Session grants across models and drops them on real resume", async (
     workspaceRoot: f.workspaceRoot,
     getModel: () => selected,
     getSettings: () => parseSettings({}),
+    executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree },
     modelService: { streamTurn: async () => turn(messages.shift()!) },
   });
   next.controller.eventBus.subscribe((e) => {
@@ -189,8 +201,12 @@ it("retains Session grants across models and drops them on real resume", async (
       next.controller.resolveApproval(e.approvalId, "once");
     }
   });
-  await next.controller.submitPrompt("third");
+  const third = next.controller.submitPrompt("third");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(3));
+  fake.child.emit("close", 0);
+  await third;
   expect(approvals).toBe(2);
+  await next.controller.exit();
 });
 
 it.each(["terminated", "unconfirmed", "throws"] as const)(
@@ -904,14 +920,14 @@ it("cancels an active unconfirmed Shell, records interruption, and includes the 
 });
 
 it("T9 new/resume commands replace Session identity and reset grants", async () => {
-  const write = () =>
-    makeAssistantMessage([{ id: "a", name: "write", arguments: { path: "data.txt", content: "x" } }]);
-  const f = await fixture([
-    write(),
-    makeAssistantMessage([], "done"),
-    write(),
-    makeAssistantMessage([], "done"),
-  ]);
+  const fake = fakeShellRun();
+  const command = "git status";
+  const bash = () => makeAssistantMessage([{ id: "a", name: "bash", arguments: { command } }]);
+  const f = await fixture(
+    [bash(), makeAssistantMessage([], "done"), bash(), makeAssistantMessage([], "done")],
+    40,
+    { executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree } },
+  );
   let approvals = 0;
   f.controller.eventBus.subscribe((e) => {
     if (e.type === "permission.requested") {
@@ -919,12 +935,18 @@ it("T9 new/resume commands replace Session identity and reset grants", async () 
       f.controller.resolveApproval(e.approvalId, "session");
     }
   });
-  await f.controller.submitPrompt("first");
+  const first = f.controller.submitPrompt("first");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(1));
+  fake.child.emit("close", 0);
+  await first;
   await f.controller.newSession();
   const fresh = f.controller.getSnapshot().session.ref!;
   expect(fresh).toBeNull();
   expect(await f.controller.readHistory()).toBeNull();
-  await f.controller.submitPrompt("second");
+  const second = f.controller.submitPrompt("second");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(2));
+  fake.child.emit("close", 0);
+  await second;
   expect(approvals).toBe(2);
   await f.controller.resumeSession(f.ref);
   const resumed = f.controller.getSnapshot().session.ref!;

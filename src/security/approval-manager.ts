@@ -1,9 +1,11 @@
 import type { ApprovalDecision } from "../core/state.js";
+import { matchFirstCommand, type BashCommandAnalyzer } from "./bash-policy.js";
 import {
   emptySessionGrants,
   evaluatePermission,
   withGrant,
   type ApprovalGrantKey,
+  type ApprovalMode,
   type ApprovalRequest,
   type SessionGrants,
   type ToolCallSubject,
@@ -15,7 +17,11 @@ import {
  */
 export type Approver = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
-export type PermissionDenyReason = "no_approver" | "denied_by_user" | "approver_error";
+export type PermissionDenyReason =
+  | "no_approver"
+  | "denied_by_user"
+  | "denied_by_policy"
+  | "approver_error";
 
 export type PermissionOutcome =
   | {
@@ -24,6 +30,9 @@ export type PermissionOutcome =
         | "workspace_read"
         | "skills_read"
         | "session_grant"
+        | "workspace_write"
+        | "bash_policy"
+        | "mode_full"
         | "approved_once"
         | "approved_for_session";
     }
@@ -32,33 +41,55 @@ export type PermissionOutcome =
 
 export interface ApprovalManagerOptions {
   approver?: Approver;
+  /** auto 模式 bash 判定 seam；缺省为首命令白名单 analyzer。 */
+  analyzeBash?: BashCommandAnalyzer;
+  /** analyzer 抛错时的诊断出口（永不兜底放行，按 ask 处理）。 */
+  onAnalyzerError?: (error: unknown) => void;
 }
 
 export class ApprovalManager {
   #grants: SessionGrants = emptySessionGrants();
   readonly #approver: Approver | undefined;
+  readonly #analyzeBash: BashCommandAnalyzer;
+  readonly #onAnalyzerError: ((error: unknown) => void) | undefined;
 
   constructor(options: ApprovalManagerOptions = {}) {
     this.#approver = options.approver;
+    this.#analyzeBash = options.analyzeBash ?? matchFirstCommand;
+    this.#onAnalyzerError = options.onAnalyzerError;
   }
 
   get grants(): SessionGrants {
-    return {
-      fileTools: new Set(this.#grants.fileTools),
-      shellCommands: new Set(this.#grants.shellCommands),
-    };
+    return { shellCommands: new Set(this.#grants.shellCommands) };
   }
 
   async requestPermission(
     subject: ToolCallSubject,
-    options: { signal?: AbortSignal } = {},
+    options: { signal?: AbortSignal; mode: ApprovalMode },
   ): Promise<PermissionOutcome> {
     if (options.signal?.aborted) return { decision: "cancelled" };
-    const verdict = evaluatePermission(subject, this.#grants);
+    const verdict = evaluatePermission(subject, this.#grants, options.mode);
+    if (verdict.outcome === "deny") {
+      return { decision: "deny", reason: verdict.reason };
+    }
     if (verdict.outcome === "allow") {
       return { decision: "allow", basis: verdict.basis };
     }
     if (options.signal?.aborted) return { decision: "cancelled" };
+
+    // auto 模式 bash：会话授权已在 evaluatePermission 命中放行，此处 analyzer 是第二道；
+    // 判不了或抛错一律落人工，绝不兜底放行。
+    if (options.mode === "auto" && verdict.request.access === "shell") {
+      let analyzed: ReturnType<BashCommandAnalyzer>;
+      try {
+        analyzed = this.#analyzeBash(verdict.request.command ?? "");
+      } catch (error) {
+        this.#onAnalyzerError?.(error);
+        analyzed = "ask";
+      }
+      if (analyzed === "allow") return { decision: "allow", basis: "bash_policy" };
+    }
+
     const approver = this.#approver;
     if (!approver) {
       return { decision: "deny", reason: "no_approver" };

@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import { createAgentSession } from "../../src/core/agent-loop.js";
+import { BusyError } from "../../src/core/state.js";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import type { StreamTurnOptions, TurnResult } from "../../src/llm/model-service.js";
 import { TurnError } from "../../src/llm/model-service.js";
@@ -110,13 +113,12 @@ describe("AgentLoop", () => {
       ]),
       makeAssistantMessage([], "done"),
     ]);
-    f.controller.eventBus.subscribe((e) => {
-      if (e.type === "permission.requested") f.controller.resolveApproval(e.approvalId, "deny");
-    });
+    // readonly 策略拒绝：区内 write 不再弹审批，直接 denied_by_policy。
+    await f.controller.setApprovalMode("readonly");
     await expect(f.controller.submitPrompt("task")).resolves.toBe("completed");
-    expect(
-      (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result").map((r) => r.status),
-    ).toEqual(["denied", "error"]);
+    const results = (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result");
+    expect(results.map((r) => r.status)).toEqual(["denied", "error"]);
+    expect(results[0]).toMatchObject({ content: "Error: Denied by read-only mode." });
     expect(f.requests[1]!.context.messages.map((m) => m.role)).toEqual([
       "user",
       "assistant",
@@ -668,6 +670,66 @@ it.each([false, true])(
     }
   },
 );
+
+it("freezes mode per Run: switches are blocked mid-Run and apply to the next Run", async () => {
+  const { store } = makeStore();
+  const root = tempDir();
+  const fake = fakeShellRun();
+  const messages = [
+    makeAssistantMessage([{ id: "s", name: "bash", arguments: { command: "echo one; echo two" } }]),
+    makeAssistantMessage([{ id: "w", name: "write", arguments: { path: "a.txt", content: "x" } }]),
+    makeAssistantMessage([], "done"),
+    makeAssistantMessage([{ id: "w2", name: "write", arguments: { path: "b.txt", content: "y" } }]),
+    makeAssistantMessage([], "done"),
+  ];
+  const { controller } = await createAgentSession({
+    store,
+    workspaceId: WORKSPACE_ID,
+    workspaceRoot: root,
+    getModel: () => model,
+    getSettings: () => parseSettings({}),
+    executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree },
+    modelService: { streamTurn: async () => turn(messages.shift()!) },
+  });
+  let approvals = 0;
+  let pendingId: string | null = null;
+  const subscription = controller.subscribe((event) => {
+    if (event.type === "permission.requested") {
+      approvals++;
+      pendingId = event.approvalId;
+    }
+  });
+  try {
+    const first = controller.submitPrompt("first");
+    await vi.waitFor(() => expect(pendingId).not.toBeNull());
+    // 活动 Run 期间切换模式被生命周期门控拒绝；本 Run 沿用起点冻结的 auto。
+    expect(() => controller.setApprovalMode("readonly")).toThrow(BusyError);
+    controller.resolveApproval(pendingId!, "once");
+    const deadline = Date.now() + 5000;
+    while (fake.spawnCalls.length === 0 && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(fake.spawnCalls).toHaveLength(1);
+    fake.child.emit("close", 0);
+    await expect(first).resolves.toBe("completed");
+    // 同一 Run 内后续区内 write 仍按冻结的 auto 直接放行。
+    expect(fs.readFileSync(path.join(root, "a.txt"), "utf8")).toBe("x");
+
+    await controller.setApprovalMode("readonly");
+    await expect(controller.submitPrompt("second")).resolves.toBe("completed");
+    expect(fs.existsSync(path.join(root, "b.txt"))).toBe(false);
+    const results = (await store.loadSession(controller.getSnapshot().session.ref!)).records.filter(
+      (r) => r.type === "tool_result",
+    );
+    expect(results.at(-1)).toMatchObject({
+      status: "denied",
+      content: "Error: Denied by read-only mode.",
+    });
+    expect(approvals).toBe(1);
+  } finally {
+    subscription.unsubscribe();
+    await controller.exit();
+  }
+});
 
 const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 it("bash 实时输出经 tool.output.delta 上总线，持久化仍为最终裁剪结果", async () => {

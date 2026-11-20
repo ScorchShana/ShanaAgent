@@ -148,6 +148,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let sessionMeta: SessionMeta | null = initial?.meta ?? null;
   let sessionWarnings: SessionLoadWarning[] = initial?.warnings ?? [];
   let approvalMode: ApprovalMode = sessionMeta?.approvalMode ?? "auto";
+  // Run 起点冻结：运行中切换模式只影响后续 Run。
+  let runApprovalMode: ApprovalMode = "auto";
   let metadataFresh = true;
   let recordsFresh = true;
   let recordsEpoch = 0;
@@ -235,6 +237,10 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   };
   const makeManager = () =>
     new ApprovalManager({
+      onAnalyzerError: (error) =>
+        options.diagnostics?.error(
+          `bash analyzer failed; falling back to manual approval: ${error instanceof Error ? error.message : String(error)}`,
+        ),
       approver: (request) => {
         if (!activeHandle) throw new Error("No active Run");
         const call = currentCalls.find((c) => c.id === request.toolCallId);
@@ -518,7 +524,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         onToolOutput: (toolCallId, snapshot) => handle.streamToolOutput(toolCallId, snapshot),
         settings: runSettings,
         imageInput: runModel.input.includes("image"),
-        permissionGate: (request) => manager.requestPermission(request, { signal }),
+        permissionGate: (request) => manager.requestPermission(request, { signal, mode: runApprovalMode }),
         onCleanupWarning: (path) => options.onWarning?.({ kind: "temporary_file_cleanup_failed", path }),
       });
       built.context.tools = executor.registry.list().map((tool) => ({
@@ -963,6 +969,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     createId: (prefix) => `${prefix}-${randomUUID()}`,
     hooks: {
       captureRunInput: () => {
+        runApprovalMode = approvalMode;
         runModel = structuredClone(currentModel());
         runSettings = parseSettings(options.getSettings());
       },
