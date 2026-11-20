@@ -185,7 +185,7 @@ describe("TUI skill 块（D8/D9/D10）", () => {
 });
 
 describe("TUI /skill: 菜单与路由（D5/D11）", () => {
-  it("菜单按需读目录：过滤字符集、排序、前缀过滤；缺目录空列表；/ 菜单含提示项", async () => {
+  it("菜单按需读目录：过滤字符集、排序、前缀过滤；缺目录空列表；/ 菜单无占位项", async () => {
     const skillsRoot = tempDir("shana-skills-");
     fs.mkdirSync(path.join(skillsRoot, "review"));
     fs.mkdirSync(path.join(skillsRoot, "commit-helper"));
@@ -206,7 +206,8 @@ describe("TUI /skill: 菜单与路由（D5/D11）", () => {
       store.setDraft("/skill:");
       expect(store.commandOptions().map((option) => option.name)).toContain("/skill:deploy");
       store.setDraft("/");
-      expect(store.commandOptions().map((option) => option.name)).toContain("/skill:");
+      expect(store.commandOptions().map((option) => option.name)).not.toContain("/skill:");
+      expect(store.commandOptions().map((option) => option.name)).toContain("/skill:review");
       const missing = new TuiStore(skillController({}), parseSettings({}), {
         skillsRoot: path.join(skillsRoot, "missing"),
       });
@@ -242,7 +243,7 @@ describe("TUI /skill: 菜单与路由（D5/D11）", () => {
     }
   });
 
-  it("/ 菜单：命令在前、skill 排序追加在后；占位项保留；前缀语义；新增 skill 立即可补全", async () => {
+  it("/ 菜单：命令在前、skill 排序追加在后；无占位项；前缀语义；新增 skill 立即可补全", async () => {
     const skillsRoot = tempDir("shana-skills-");
     fs.mkdirSync(path.join(skillsRoot, "review"));
     fs.mkdirSync(path.join(skillsRoot, "commit-helper"));
@@ -256,16 +257,14 @@ describe("TUI /skill: 菜单与路由（D5/D11）", () => {
       ]);
       const skillOption = store.commandOptions().find((option) => option.name === "/skill:review");
       expect(skillOption).toMatchObject({ description: "显式调用 skill", enabled: true });
-      // /s 与 /skill（无冒号）列出占位项 + 全部 skill；/review 不匹配（前缀语义，非裸名匹配）。
+      // /s 与 /skill（无冒号）只列具体 skill（无占位项）；/review 不匹配（前缀语义，非裸名匹配）。
       store.setDraft("/s");
       expect(store.commandOptions().map((option) => option.name)).toEqual([
-        "/skill:",
         "/skill:commit-helper",
         "/skill:review",
       ]);
       store.setDraft("/skill");
       expect(store.commandOptions().map((option) => option.name)).toEqual([
-        "/skill:",
         "/skill:commit-helper",
         "/skill:review",
       ]);
@@ -298,7 +297,7 @@ describe("TUI /skill: 菜单与路由（D5/D11）", () => {
       store.setDraft("/");
       const options = store.commandOptions();
       const skills = options.filter((option) => option.name.startsWith("/skill:"));
-      expect(skills.map((option) => option.name)).toEqual(["/skill:", "/skill:review"]);
+      expect(skills.map((option) => option.name)).toEqual(["/skill:review"]);
       expect(skills.every((option) => !option.enabled)).toBe(true);
       expect(options.find((option) => option.name === "/cancel")?.enabled).toBe(true);
       expect(options.find((option) => option.name === "/exit")?.enabled).toBe(true);
@@ -309,18 +308,30 @@ describe("TUI /skill: 菜单与路由（D5/D11）", () => {
     }
   });
 
-  it("缺 skills 目录：/ 菜单与静态命令表完全一致", async () => {
+  it("缺/空 skills 目录：/ 菜单与静态命令表完全一致；空目录新增 skill 立即可补全", async () => {
     const skillsRoot = tempDir("shana-skills-");
     const store = new TuiStore(skillController({}), parseSettings({}), {
       skillsRoot: path.join(skillsRoot, "missing"),
     });
+    const empty = new TuiStore(skillController({}), parseSettings({}), { skillsRoot });
     try {
       store.setDraft("/");
       expect(store.commandOptions().map((option) => option.name)).toEqual(
         COMMANDS.map((option) => option.name),
       );
+      // 空目录同样无 skill 痕迹（占位项已删除）；新增目录后无缓存实时出现。
+      empty.setDraft("/");
+      expect(empty.commandOptions().map((option) => option.name)).toEqual(
+        COMMANDS.map((option) => option.name),
+      );
+      fs.mkdirSync(path.join(skillsRoot, "review"));
+      expect(empty.commandOptions().map((option) => option.name)).toEqual([
+        ...COMMANDS.map((option) => option.name),
+        "/skill:review",
+      ]);
     } finally {
       await store.dispose();
+      await empty.dispose();
     }
   });
 

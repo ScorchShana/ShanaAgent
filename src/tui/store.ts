@@ -51,7 +51,6 @@ export const COMMANDS = [
   { name: "/new", description: "回到空白会话" },
   { name: "/resume", description: "选择历史会话并继续" },
   { name: "/compact", description: "压缩上下文" },
-  { name: "/skill:", description: "显式调用 skill（/skill:<name> [请求]）" },
   { name: "/cancel", description: "取消当前运行" },
   { name: "/exit", description: "退出并清理 Session" },
   { name: "/quit", description: "退出并清理 Session（同 /exit）" },
@@ -462,7 +461,7 @@ export class TuiStore {
     const skills = listSkillNames(this.options.skillsRoot)
       .map((name) => ({ name: `/skill:${name}`, description: "显式调用 skill", enabled: skillEnabled }))
       .filter((option) => option.name.startsWith(this.state.draft));
-    // /skill: 前缀只列具体 skill（占位项无意义）；其余 / 前缀命令在前、skill 追加在后。
+    // /skill: 前缀只列具体 skill；其余 / 前缀命令在前、skill 追加在后（无占位项）。
     if (this.state.draft.startsWith("/skill:")) return skills;
     const commands = COMMANDS.filter((option) => option.name.startsWith(this.state.draft)).map((option) => ({
       ...option,
