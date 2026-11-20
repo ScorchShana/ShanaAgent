@@ -108,7 +108,7 @@ describe("启动提示词", () => {
       minimum: 1,
       maximum: 1200,
     });
-    expect(result.toolRegistry.get("edit")?.description).toContain("16777216-byte");
+    expect(result.toolRegistry.get("edit")?.description).toContain("CRLF and standalone CR");
   });
 
   it("任一提示词为空或编码损坏时拒载", () => {

@@ -1656,12 +1656,21 @@ it("allows multiple compactions in one Run separated by a new Turn", async () =>
 });
 
 it("treats noop as non-failure and still compacts later in the same Run", async () => {
-  const f = await autoFixture((call) => {
-    if (call === 1) return turn(makeAssistantMessage([readCall("t1")], textOfTokens(8000, "b")));
-    if (call === 2) return turn(makeAssistantMessage([readCall("t2")], textOfTokens(8000, "c")));
-    if (call === 3) return summaryTurn("SUMMARY");
-    return turn(makeAssistantMessage([], "done"));
-  });
+  let firstTurnTokens = 0;
+  const f = await autoFixture(
+    (call) => {
+      if (call === 1) return turn(makeAssistantMessage([readCall("t1")], textOfTokens(firstTurnTokens, "b")));
+      if (call === 2) return turn(makeAssistantMessage([readCall("t2")], textOfTokens(8000, "c")));
+      if (call === 3) return summaryTurn("SUMMARY");
+      return turn(makeAssistantMessage([], "done"));
+    },
+    {
+      // Turn1 须单独越过阈值，才能先触发一次无可覆盖内容的 noop。
+      seed: async (_store, _ref, fixed) => {
+        firstTurnTokens = 20000 * AUTO_SETTINGS.compactionThresholdRatio - fixed + 500;
+      },
+    },
+  );
   expect(await f.controller.submitPrompt("test")).toBe("completed");
   expect(f.requests).toHaveLength(4);
   expect(finishedCompactions(f.events).map((e) => e.status)).toEqual(["noop", "completed"]);

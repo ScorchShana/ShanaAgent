@@ -125,10 +125,16 @@ async function seedMeasuredRun(
   store: SessionStore,
   ref: SessionRef,
   workspaceRoot: string,
-  options: { input?: number; provider?: string; model?: string; settings?: Record<string, unknown> } = {},
+  options: {
+    input?: number;
+    provider?: string;
+    model?: string;
+    settings?: Record<string, unknown>;
+    modelSnapshot?: ResolvedModel;
+  } = {},
 ) {
   await store.appendRecord(ref, { type: "user_prompt", runId: "old", text: "old task" });
-  const snapshot = createModelSnapshot(model);
+  const snapshot = createModelSnapshot(options.modelSnapshot ?? model);
   await store.appendRecord(ref, {
     type: "run_started",
     runId: "old",
@@ -299,9 +305,15 @@ it("falls back when a checkpoint rewrote history after the measured request", as
 });
 
 it("falls back when the tool schema changed since the measured request", async () => {
+  // viewImageMaxBytes 嵌入 view_image description：快照与当前 Schema 必然不同。
+  const visionModel: ResolvedModel = { ...model, input: ["text", "image"] };
   const f = await anchoringFixture(() => turn(makeAssistantMessage([], "done")), {
-    // editMaxFileBytes 嵌入工具 description：快照与当前 Schema 必然不同。
-    seed: (store, ref, root) => seedMeasuredRun(store, ref, root, { settings: { editMaxFileBytes: 12345 } }),
+    getModel: () => visionModel,
+    seed: (store, ref, root) =>
+      seedMeasuredRun(store, ref, root, {
+        modelSnapshot: visionModel,
+        settings: { viewImageMaxBytes: 12345 },
+      }),
   });
   expect(await f.controller.submitPrompt("test")).toBe("completed");
   expect(f.requests).toHaveLength(1);

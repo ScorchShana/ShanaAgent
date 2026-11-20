@@ -452,7 +452,7 @@ const writeTool = defineTool<WriteArguments>({
       content: {
         type: "string",
         description:
-          "Complete new file content. Empty creates or overwrites with an empty file. Maximum 400000 Unicode code points. Must contain valid Unicode without NUL.",
+          "Complete new file content. Empty creates or overwrites with an empty file. Maximum 400000 characters. Must contain valid Unicode without NUL.",
       },
     },
     required: ["path", "content"],
@@ -494,12 +494,12 @@ const editTool = defineTool<EditArguments>({
         type: "string",
         minLength: 1,
         description:
-          "Exact text to replace after newline normalization. Maximum 100000 Unicode code points before normalization. Must contain valid Unicode without NUL.",
+          "Exact text to replace after newline normalization. Maximum 100000 characters before normalization. Must contain valid Unicode without NUL.",
       },
       new_string: {
         type: "string",
         description:
-          "Replacement text; empty deletes the match. Maximum 100000 Unicode code points before normalization. Must contain valid Unicode without NUL.",
+          "Replacement text; empty deletes the match. Maximum 100000 characters before normalization. Must contain valid Unicode without NUL.",
       },
       replace_all: {
         type: "boolean",
