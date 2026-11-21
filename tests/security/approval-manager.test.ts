@@ -187,32 +187,52 @@ function makeHarness(workspaceRoot: string, mode: ApprovalMode = "auto"): Harnes
 }
 
 describe("三模式门控矩阵", () => {
-  it("readonly：非 read 一律策略拒绝（含只读命令的 bash），read 分支不变", async () => {
+  it("confirm 每次询问 Bash，即使存在会话授权或分析器会放行", async () => {
+    const approver = vi.fn(async (_request: ApprovalRequest) => "session" as const);
+    const analyzeBash = vi.fn().mockReturnValueOnce("ask").mockReturnValue("allow");
+    const manager = new ApprovalManager({ approver, analyzeBash });
+    const subject = shellSubject("cat README.md");
+
+    expect(await manager.requestPermission(subject, { mode: "auto" })).toMatchObject({
+      basis: "approved_for_session",
+    });
+    for (const call of [subject, subject, shellSubject("mkdir logs")]) {
+      expect(await manager.requestPermission(call, { mode: "confirm" })).toEqual({
+        decision: "allow",
+        basis: "approved_once",
+      });
+    }
+    expect(approver.mock.calls.slice(1).map(([request]) => request.grantKey)).toEqual([null, null, null]);
+    expect(analyzeBash).toHaveBeenCalledTimes(1);
+    expect(manager.grants.shellCommands).toEqual(new Set(["cat README.md"]));
+  });
+
+  it("confirm 对写入、Bash 和区外读取逐次询问，区内读取直接放行", async () => {
     const { root, parent } = nestedWorkspace();
     writeFileAt(root, "keep.txt", "original");
     fs.writeFileSync(path.join(parent, "secret.txt"), "secret");
-    const manager = new ApprovalManager();
+    const approver = vi.fn(async (_request: ApprovalRequest) => "once" as const);
+    const manager = new ApprovalManager({ approver });
 
     for (const subject of [
       writeSubject(root, "a.txt"),
       writeSubject(root, "a.txt", "edit"),
       shellSubject("ls"),
       writeSubject(root, "../out.txt"),
+      readSubject(root, "../secret.txt"),
     ]) {
-      expect(await manager.requestPermission(subject, { mode: "readonly" })).toEqual({
-        decision: "deny",
-        reason: "denied_by_policy",
+      expect(await manager.requestPermission(subject, { mode: "confirm" })).toEqual({
+        decision: "allow",
+        basis: "approved_once",
       });
     }
-    expect(await manager.requestPermission(readSubject(root, "keep.txt"), { mode: "readonly" })).toEqual({
+    expect(await manager.requestPermission(readSubject(root, "keep.txt"), { mode: "confirm" })).toEqual({
       decision: "allow",
       basis: "workspace_read",
     });
-    // 区外 read 在 readonly 仍走人工（无审批器 → no_approver），不是策略拒绝。
-    expect(
-      await manager.requestPermission(readSubject(root, "../secret.txt"), { mode: "readonly" }),
-    ).toEqual({ decision: "deny", reason: "no_approver" });
-    expect(fs.existsSync(path.join(root, "a.txt"))).toBe(false);
+    expect(approver.mock.calls.map(([request]) => request.grantKey)).toEqual([
+      null, null, null, null, null,
+    ]);
   });
 
   it("full：全部放行 mode_full（含区外写入与 bash），不触发审批器", async () => {
@@ -260,7 +280,7 @@ describe("三模式门控矩阵", () => {
   it("unknown 工具任何模式都走人工防御分支", async () => {
     const root = makeWorkspace();
     const subject = { ...writeSubject(root, "a.txt"), toolName: "mystery" };
-    for (const mode of ["readonly", "auto", "full"] as const) {
+    for (const mode of ["confirm", "auto", "full"] as const) {
       const manager = new ApprovalManager();
       expect(await manager.requestPermission(subject, { mode })).toEqual({
         decision: "deny",
@@ -274,7 +294,7 @@ describe("三模式门控矩阵", () => {
     const controller = new AbortController();
     controller.abort();
     const manager = new ApprovalManager();
-    for (const mode of ["readonly", "auto", "full"] as const) {
+    for (const mode of ["confirm", "auto", "full"] as const) {
       expect(
         await manager.requestPermission(writeSubject(root, "a.txt"), { mode, signal: controller.signal }),
       ).toEqual({ decision: "cancelled" });
@@ -331,12 +351,12 @@ describe("auto 模式 bash analyzer", () => {
     expect(crashMock.prompts).toHaveLength(1);
   });
 
-  it("analyzer 只在 auto + shell 生效：readonly/full 不调用，write 不调用", async () => {
+  it("analyzer 只在 auto + shell 生效：confirm/full 不调用，write 不调用", async () => {
     const { root } = nestedWorkspace();
     const analyzeBash = vi.fn(() => "allow" as const);
     const manager = new ApprovalManager({ analyzeBash });
 
-    await manager.requestPermission(shellSubject("ls"), { mode: "readonly" });
+    await manager.requestPermission(shellSubject("ls"), { mode: "confirm" });
     await manager.requestPermission(shellSubject("ls"), { mode: "full" });
     await manager.requestPermission(writeSubject(root, "a.txt"), { mode: "auto" });
     await manager.requestPermission(writeSubject(root, "../out.txt"), { mode: "auto" });
@@ -634,17 +654,13 @@ describe("拒绝结果为确定值", () => {
     expect(fs.existsSync(path.join(parent, "a.txt"))).toBe(false);
   });
 
-  it("readonly 策略拒绝传导为 denied，文案与用户拒绝可区分", async () => {
+  it("confirm 中批准的区内写入会执行", async () => {
     const root = makeWorkspace();
-    const executor = wireExecutor(root, new ApprovalManager(), "readonly");
+    const executor = wireExecutor(root, new ApprovalManager({ approver: async () => "once" }), "confirm");
 
-    const denied = await executor.execute(call("c1", "write", { path: "a.txt", content: "x" }));
-    expect(denied).toMatchObject({
-      status: "denied",
-      errorCategory: "permission",
-      content: "Error: Denied by read-only mode.",
-    });
-    expect(fs.existsSync(path.join(root, "a.txt"))).toBe(false);
+    const result = await executor.execute(call("c1", "write", { path: "a.txt", content: "x" }));
+    expect(result.status).toBe("success");
+    expect(readFileAt(root, "a.txt")).toBe("x");
   });
 });
 

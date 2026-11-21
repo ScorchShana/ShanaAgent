@@ -757,7 +757,77 @@ it.each(["beforeLockWrite", "beforeLockSync"] as const)(
 );
 
 describe("approvalMode persistence", () => {
-  it.each([undefined, "readonly", "auto", "full"] as const)("saves %s in both creation paths", async (mode) => {
+  it("migrates legacy readonly once when an exclusive writer opens the session", async () => {
+    const beforeMetaReplace = vi.fn();
+    const { store } = makeStore({ hooks: { beforeMetaReplace } });
+    const ref = sessionRef("legacy-mode");
+    const meta = await store.createSession(ref);
+    const target = metaPathOf(store.sessionsDir, ref);
+    const legacy = JSON.stringify({ ...meta, approvalMode: "readonly" });
+    fs.writeFileSync(target, legacy);
+    const messagesPath = messagesPathOf(store.sessionsDir, ref);
+    const messages = fs.readFileSync(messagesPath);
+    beforeMetaReplace.mockClear();
+
+    const other = makeStore({ sessionsDir: store.sessionsDir }).store;
+    expect(await other.listSessions(ref.workspaceId)).toContainEqual({ ...meta, approvalMode: "confirm" });
+    expect((await other.readHistory(ref)).meta.approvalMode).toBe("confirm");
+    await expect(other.openSession(ref)).rejects.toMatchObject({ code: "occupied" });
+    expect(fs.readFileSync(target, "utf8")).toBe(legacy);
+
+    await store.releaseSession(ref);
+    expect((await store.openSession(ref)).meta.approvalMode).toBe("confirm");
+    expect(JSON.parse(fs.readFileSync(target, "utf8"))).toEqual({ ...meta, approvalMode: "confirm" });
+    await store.releaseSession(ref);
+    expect((await store.openSession(ref)).meta.approvalMode).toBe("confirm");
+    expect(beforeMetaReplace).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(messagesPath)).toEqual(messages);
+  });
+
+  it("prevents writes while a legacy migration is pending and releases the lock on failure", async () => {
+    const migrationStarted = Promise.withResolvers<void>();
+    const finishMigration = Promise.withResolvers<void>();
+    let failMigration = false;
+    const fault = new Error("migration fault");
+    const { store } = makeStore({
+      hooks: {
+        beforeMetaReplace: async () => {
+          if (!failMigration) return;
+          migrationStarted.resolve();
+          await finishMigration.promise;
+          throw fault;
+        },
+      },
+    });
+    const ref = sessionRef("migration-fault");
+    const meta = await store.createSession(ref);
+    const target = metaPathOf(store.sessionsDir, ref);
+    const legacy = JSON.stringify({ ...meta, approvalMode: "readonly" });
+    fs.writeFileSync(target, legacy);
+    const messagesPath = messagesPathOf(store.sessionsDir, ref);
+    const messages = fs.readFileSync(messagesPath);
+    await store.releaseSession(ref);
+
+    failMigration = true;
+    const opening = store.openSession(ref);
+    await migrationStarted.promise;
+    const appending = store.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "late write" });
+    const results = Promise.allSettled([opening, appending]);
+    finishMigration.resolve();
+
+    expect(await results).toMatchObject([
+      { status: "rejected", reason: { code: "write_failed", cause: fault } },
+      { status: "rejected", reason: { code: "not_owned" } },
+    ]);
+    expect(fs.readFileSync(target, "utf8")).toBe(legacy);
+    expect(fs.readFileSync(messagesPath)).toEqual(messages);
+
+    failMigration = false;
+    expect((await store.openSession(ref)).meta.approvalMode).toBe("confirm");
+  });
+
+
+  it.each([undefined, "confirm", "auto", "full"] as const)("saves %s in both creation paths", async (mode) => {
     const { store } = makeStore();
     for (const initialRecords of [undefined, []]) {
       const meta = await store.createSession({
@@ -792,10 +862,10 @@ describe("approvalMode persistence", () => {
     fs.writeFileSync(target, JSON.stringify(prior));
     const messages = fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8");
     const [off, on] = await Promise.all([
-      store.setApprovalMode(ref, "readonly"),
+      store.setApprovalMode(ref, "confirm"),
       store.setApprovalMode(ref, "auto"),
     ]);
-    expect(off).toEqual({ ...prior, approvalMode: "readonly" });
+    expect(off).toEqual({ ...prior, approvalMode: "confirm" });
     expect(on).toEqual(prior);
     expect(await store.readSessionMeta(ref)).toEqual(on);
     expect(fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8")).toBe(messages);
@@ -815,13 +885,13 @@ describe("approvalMode persistence", () => {
       const ref = sessionRef("fault");
       const prior = await store.createSession(ref);
       fail = true;
-      await expect(store.setApprovalMode(ref, "readonly")).rejects.toMatchObject({
+      await expect(store.setApprovalMode(ref, "confirm")).rejects.toMatchObject({
         code: "write_failed",
         cause: fault,
       });
       expect(await store.readSessionMeta(ref)).toEqual({
         ...prior,
-        approvalMode: stage !== "afterMetaReplace" ? "auto" : "readonly",
+        approvalMode: stage !== "afterMetaReplace" ? "auto" : "confirm",
       });
       expect(
         fs
@@ -829,8 +899,8 @@ describe("approvalMode persistence", () => {
           .filter((name) => name.endsWith(".tmp")),
       ).toEqual([]);
       fail = false;
-      await expect(store.setApprovalMode(ref, "readonly")).resolves.toMatchObject({
-        approvalMode: "readonly",
+      await expect(store.setApprovalMode(ref, "confirm")).resolves.toMatchObject({
+        approvalMode: "confirm",
       });
     },
   );
@@ -840,10 +910,10 @@ describe("approvalMode persistence", () => {
     await store.createSession(ref);
     const other = makeStore({ sessionsDir: store.sessionsDir }).store;
     await expect(other.readSessionMeta(ref)).rejects.toMatchObject({ code: "not_owned" });
-    await expect(other.setApprovalMode(ref, "readonly")).rejects.toMatchObject({ code: "not_owned" });
+    await expect(other.setApprovalMode(ref, "confirm")).rejects.toMatchObject({ code: "not_owned" });
     const release = store.releaseSession(ref);
     await expect(store.readSessionMeta(ref)).rejects.toMatchObject({ code: "not_owned" });
-    await expect(store.setApprovalMode(ref, "readonly")).rejects.toMatchObject({ code: "not_owned" });
+    await expect(store.setApprovalMode(ref, "confirm")).rejects.toMatchObject({ code: "not_owned" });
     await release;
   });
   it("verifies the on-disk owner token for reads and updates", async () => {
@@ -857,6 +927,6 @@ describe("approvalMode persistence", () => {
     const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
     fs.writeFileSync(lockPath, JSON.stringify({ ...lock, ownerToken: "other" }));
     await expect(store.readSessionMeta(ref)).rejects.toMatchObject({ code: "not_owned" });
-    await expect(store.setApprovalMode(ref, "readonly")).rejects.toMatchObject({ code: "not_owned" });
+    await expect(store.setApprovalMode(ref, "confirm")).rejects.toMatchObject({ code: "not_owned" });
   });
 });

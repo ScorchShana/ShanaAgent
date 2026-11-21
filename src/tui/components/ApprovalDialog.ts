@@ -7,7 +7,7 @@ import {
   type SelectListTheme,
 } from "../framework/index.js";
 import type { PendingApproval } from "../../core/state.js";
-import { sanitizeDisplayText, type TuiStore } from "../store.js";
+import { approvalChoices, sanitizeDisplayText, type TuiStore } from "../store.js";
 import { wrapDisplay } from "./DiffView.js";
 export function approvalSummaryLines(approval: PendingApproval, width?: number, includeCommand = true): string[] {
   return [
@@ -28,7 +28,7 @@ export class ApprovalPanel extends VStack {
   readonly capturesViewportInput = true;
   private actions: SelectList;
   constructor(
-    _approval: PendingApproval,
+    approval: PendingApproval,
     store: TuiStore,
     theme: SelectListTheme,
     changed: () => void,
@@ -37,8 +37,8 @@ export class ApprovalPanel extends VStack {
     private hint: () => string = () => "查看待批工具 · Ctrl+L",
   ) {
     super();
-    const items = ["允许一次", "本会话允许", "拒绝"].map((label, index) => ({ label, value: String(index) }));
-    this.actions = new SelectList(items, 3, theme);
+    const items = approvalChoices(approval).map(({ label }, index) => ({ label, value: String(index) }));
+    this.actions = new SelectList(items, items.length, theme);
     const small = new SelectList(items, 1, theme);
     this.actions.onSelectionChange = (item) => {
       small.setSelectedIndex(Number(item.value));
@@ -66,7 +66,7 @@ export class ApprovalPanel extends VStack {
       ),
       { visible: () => !this.compact() },
     );
-    this.addChild(this.actions, { visible: () => !this.compact(), shrink: 0, minSize: 3 });
+    this.addChild(this.actions, { visible: () => !this.compact(), shrink: 0, minSize: items.length });
     this.addChild(small, { visible: () => this.compact(), basis: 1, shrink: 0, minSize: 1 });
   }
   handleInput(data: string) {

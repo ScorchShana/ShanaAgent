@@ -228,8 +228,5 @@ function permissionMessage(reason: PermissionDenyReason | "cancelled"): string {
       return "Cancelled by user.";
     case "denied_by_user":
       return "User denied.";
-    case "denied_by_policy":
-      // 模式策略拒绝 ≠ 用户逐次拒绝，不得归为 User denied.（D2 最短文案）。
-      return "Denied by read-only mode.";
   }
 }

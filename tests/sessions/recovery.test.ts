@@ -377,7 +377,7 @@ describe("cross-process Session ownership", () => {
 });
 
 describe("approvalMode recovery", () => {
-  it.each([undefined, "readonly", "auto", "full"] as const)(
+  it.each([undefined, "confirm", "auto", "full"] as const)(
     "restores %s without rewriting metadata",
     async (mode) => {
       const { store } = makeStore();

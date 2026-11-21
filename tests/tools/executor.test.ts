@@ -321,7 +321,6 @@ describe("V8 取消与待决审批", () => {
     const root = makeWorkspace();
     const cases: Array<[ToolPermissionDecision, string]> = [
       [{ decision: "deny", reason: "denied_by_user" }, "Error: User denied."],
-      [{ decision: "deny", reason: "denied_by_policy" }, "Error: Denied by read-only mode."],
       [{ decision: "deny", reason: "no_approver" }, "Error: Internal error. Stop and ask user."],
       [{ decision: "deny", reason: "approver_error" }, "Error: Internal error. Stop and ask user."],
     ];

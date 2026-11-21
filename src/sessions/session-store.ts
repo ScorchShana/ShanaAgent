@@ -137,7 +137,7 @@ export class SessionWriteError extends SessionStoreError {
 // 入参虽已类型约束，运行时仍须拒绝越界值（与旧布尔校验同档，防 JS 调用方/反序列化注入）。
 function requireApprovalMode(mode: unknown): SessionApprovalMode {
   if (typeof mode !== "string" || !(SESSION_APPROVAL_MODES as readonly string[]).includes(mode)) {
-    throw new SessionStoreError("invalid_argument", "approvalMode must be readonly | auto | full");
+    throw new SessionStoreError("invalid_argument", "approvalMode must be confirm | auto | full");
   }
   return mode as SessionApprovalMode;
 }
@@ -216,7 +216,7 @@ export class SessionStore {
   private readonly now: () => Date;
   private readonly hooks: SessionStoreHooks;
   private readonly sessionIdFactory: (date: Date) => string;
-  private readonly ownership = new Map<string, { ownerToken: string; releasing: boolean }>();
+  private readonly ownership = new Map<string, { ownerToken: string; opening: boolean; releasing: boolean }>();
   private readonly writers = new Map<string, WriterState>();
   private readonly appendChains = new Map<string, Promise<void>>();
 
@@ -364,10 +364,10 @@ export class SessionStore {
     this.assertRef(ref);
     const key = this.sessionKey(ref);
     const owner = this.ownership.get(key);
-    if (!owner || owner.releasing) throw this.notOwned(ref);
+    if (!owner || owner.opening || owner.releasing) throw this.notOwned(ref);
     return this.serialize(key, async () => {
       await this.verifyOwnership(ref, owner.ownerToken);
-      return this.readMeta(ref);
+      return (await this.readMeta(ref)).meta;
     });
   }
 
@@ -375,11 +375,11 @@ export class SessionStore {
     this.assertRef(ref);
     const key = this.sessionKey(ref);
     const owner = this.ownership.get(key);
-    if (!owner || owner.releasing) throw this.notOwned(ref);
+    if (!owner || owner.opening || owner.releasing) throw this.notOwned(ref);
     const validated = requireApprovalMode(mode);
     return this.serialize(key, async () => {
       await this.verifyOwnership(ref, owner.ownerToken);
-      const meta = { ...(await this.readMeta(ref)), approvalMode: validated };
+      const meta = { ...(await this.readMeta(ref)).meta, approvalMode: validated };
       try {
         await this.writeMetaAtomic(this.sessionDir(ref), meta);
       } catch (error) {
@@ -396,7 +396,7 @@ export class SessionStore {
     this.assertRef(ref);
     const key = this.sessionKey(ref);
     const owner = this.ownership.get(key);
-    if (!owner || owner.releasing) throw this.notOwned(ref);
+    if (!owner || owner.opening || owner.releasing) throw this.notOwned(ref);
     return this.serialize(key, async () => {
       await this.verifyOwnership(ref, owner.ownerToken);
       const state = await this.ensureWriter(ref, key);
@@ -457,25 +457,34 @@ export class SessionStore {
     await this.readMeta(ref);
     const key = this.sessionKey(ref);
     const loadWriter = async (): Promise<SessionLoad> => {
-      const loaded = await this.loadSession(ref);
+      const owner = this.ownership.get(key);
+      if (!owner || owner.releasing) throw this.notOwned(ref);
+      await this.verifyOwnership(ref, owner.ownerToken);
+      const { meta, legacyApprovalMode } = await this.readMeta(ref);
+      const loaded = { meta, ...(await this.readSessionRecords(ref)) };
       if (loaded.warnings.length > 0) {
         throw new SessionWriteError(`Session 末尾记录不完整，拒绝续写: ${ref.workspaceId}/${ref.sessionId}`);
+      }
+      if (legacyApprovalMode) {
+        try {
+          await this.writeMetaAtomic(this.sessionDir(ref), meta);
+        } catch (error) {
+          throw new SessionWriteError(
+            `Failed to migrate Session approval mode: ${ref.workspaceId}/${ref.sessionId} (${errorMessage(error)})`,
+            { cause: error },
+          );
+        }
       }
       this.writers.set(key, {
         nextSeq: (loaded.records.at(-1)?.recordSeq ?? 0) + 1,
         assistants: this.buildAssistantIndex(loaded.records),
       });
+      owner.opening = false;
       return loaded;
     };
-    const existing = this.ownership.get(key);
-    if (existing) {
-      if (existing.releasing) throw this.notOwned(ref);
-      return this.serialize(key, async () => {
-        await this.verifyOwnership(ref, existing.ownerToken);
-        return loadWriter();
-      });
-    }
-    await this.acquireSession(ref);
+    if (this.ownership.has(key)) return this.serialize(key, loadWriter);
+    // The lock covers migration, but writes can enter only after the writer is ready.
+    await this.acquireSession(ref, true);
     try {
       return await this.serialize(key, loadWriter);
     } catch (error) {
@@ -533,7 +542,7 @@ export class SessionStore {
     }
   }
 
-  private async acquireSession(ref: SessionRef): Promise<void> {
+  private async acquireSession(ref: SessionRef, opening = false): Promise<void> {
     const lockPath = this.lockPath(ref);
     const ownerToken = randomBytes(24).toString("hex");
     let handle: FileHandle;
@@ -606,12 +615,16 @@ export class SessionStore {
         { cause: new AggregateError(failures) },
       );
     }
-    this.ownership.set(this.sessionKey(ref), { ownerToken, releasing: false });
+    this.ownership.set(this.sessionKey(ref), { ownerToken, opening, releasing: false });
   }
 
   async loadSession(ref: SessionRef): Promise<SessionLoad> {
     this.assertRef(ref);
-    const meta = await this.readMeta(ref);
+    const { meta } = await this.readMeta(ref);
+    return { meta, ...(await this.readSessionRecords(ref)) };
+  }
+
+  private async readSessionRecords(ref: SessionRef): Promise<Pick<SessionLoad, "records" | "warnings">> {
     const recordsPath = path.join(this.sessionDir(ref), "messages.jsonl");
     let buffer: Buffer;
     try {
@@ -628,8 +641,7 @@ export class SessionStore {
         { cause: error },
       );
     }
-    const { records, warnings } = this.parseMessages(buffer, recordsPath);
-    return { meta, records, warnings };
+    return this.parseMessages(buffer, recordsPath);
   }
 
   async readHistory(ref: SessionRef, options: { fromRecordSeq?: number } = {}): Promise<SessionHistory> {
@@ -681,7 +693,7 @@ export class SessionStore {
     for (const entry of entries) {
       if (!entry.isDirectory() || !SAFE_ID.test(entry.name)) continue;
       try {
-        metas.push(await this.readMeta({ workspaceId, sessionId: entry.name }));
+        metas.push((await this.readMeta({ workspaceId, sessionId: entry.name })).meta);
       } catch (error) {
         // 只列出可打开的 Session：旧格式（如 v2）跳过而非抛穿整个列表；目录保留不删除。
         if (error instanceof SessionNotFoundError || error instanceof SessionVersionError) continue;
@@ -786,7 +798,7 @@ export class SessionStore {
     await syncDirectoryBestEffort(dir);
   }
 
-  private async readMeta(ref: SessionRef): Promise<SessionMeta> {
+  private async readMeta(ref: SessionRef): Promise<{ meta: SessionMeta; legacyApprovalMode: boolean }> {
     const metaPath = path.join(this.sessionDir(ref), "meta.json");
     let text: string;
     try {
@@ -816,6 +828,11 @@ export class SessionStore {
       );
     }
 
+    let legacyApprovalMode = false;
+    if (isPlainObject(parsed) && parsed.approvalMode === "readonly") {
+      parsed = { ...parsed, approvalMode: "confirm" };
+      legacyApprovalMode = true;
+    }
     let meta: SessionMeta;
     try {
       meta = parseSessionMeta(parsed);
@@ -829,7 +846,7 @@ export class SessionStore {
         `meta.json 的 sessionId/workspaceId 与目录不一致: ${ref.workspaceId}/${ref.sessionId}`,
       );
     }
-    return meta;
+    return { meta, legacyApprovalMode };
   }
 
   private parseMessages(

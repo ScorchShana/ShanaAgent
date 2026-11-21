@@ -28,6 +28,7 @@ export interface PendingApproval {
   id: string;
   toolCallId: string;
   toolName: string;
+  onceOnly?: boolean;
   summary?: ApprovalSummary;
 }
 

@@ -17,11 +17,7 @@ import {
  */
 export type Approver = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
-export type PermissionDenyReason =
-  | "no_approver"
-  | "denied_by_user"
-  | "denied_by_policy"
-  | "approver_error";
+export type PermissionDenyReason = "no_approver" | "denied_by_user" | "approver_error";
 
 export type PermissionOutcome =
   | {
@@ -69,9 +65,6 @@ export class ApprovalManager {
   ): Promise<PermissionOutcome> {
     if (options.signal?.aborted) return { decision: "cancelled" };
     const verdict = evaluatePermission(subject, this.#grants, options.mode);
-    if (verdict.outcome === "deny") {
-      return { decision: "deny", reason: verdict.reason };
-    }
     if (verdict.outcome === "allow") {
       return { decision: "allow", basis: verdict.basis };
     }

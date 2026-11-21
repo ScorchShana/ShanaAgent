@@ -9,7 +9,7 @@ export type ToolAccessKind = "read" | "write" | "shell" | "unknown";
 
 // 审批模式的权威定义。sessions/records.ts 因层边界禁止依赖 security，
 // 使用结构同一的本地联合（SESSION_APPROVAL_MODES）自行校验。
-export type ApprovalMode = "readonly" | "auto" | "full";
+export type ApprovalMode = "confirm" | "auto" | "full";
 
 // D10：文件工具不再有会话授权（auto 区内写直接放行，区外写逐次人工不可豁免），
 // 会话授权只剩 bash 精确命令字符串。
@@ -48,7 +48,6 @@ export type PermissionVerdict =
       outcome: "allow";
       basis: "workspace_read" | "skills_read" | "session_grant" | "workspace_write" | "mode_full";
     }
-  | { outcome: "deny"; reason: "denied_by_policy" }
   | { outcome: "ask"; request: ApprovalRequest };
 
 function readFields(action: ReadToolAction) {
@@ -58,7 +57,7 @@ function readFields(action: ReadToolAction) {
   };
 }
 
-function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
+function buildApprovalRequest(subject: ToolCallSubject, allowShellGrant = false): ApprovalRequest {
   const base = { toolCallId: subject.toolCallId, toolName: subject.toolName };
   const action = subject.action;
 
@@ -87,7 +86,7 @@ function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
       paths: [],
       touchesOutsideWorkspace: false,
       command: action.command,
-      grantKey: { kind: "shell_command", command: action.command },
+      grantKey: allowShellGrant ? { kind: "shell_command", command: action.command } : null,
     };
   }
 
@@ -100,7 +99,7 @@ export function withGrant(grants: SessionGrants, key: ApprovalGrantKey): Session
 
 /**
  * 三模式判定（纯函数；bash analyzer 在 ApprovalManager 层，不在此处）。
- * 顺序：unknown 防御 → full 放行 → readonly 非读拒绝 → read 分支 → auto 区内写放行 → bash 授权。
+ * 顺序：unknown 防御 → full 放行 → read 分支 → confirm 逐次审批 → auto 写入与 bash 授权。
  */
 export function evaluatePermission(
   subject: ToolCallSubject,
@@ -116,11 +115,6 @@ export function evaluatePermission(
   }
   // full 放行的是审批，不是安全校验：路径复验/UTF-8/限额/取消边界在 executor 层仍强制。
   if (mode === "full") return { outcome: "allow", basis: "mode_full" };
-  // readonly 判据是动态真实调用对象：bash 即使运行只读命令也整体拒绝（v1 不做命令级豁免）。
-  if (mode === "readonly" && subject.action.type !== "read") {
-    return { outcome: "deny", reason: "denied_by_policy" };
-  }
-
   if (subject.action.type === "read") {
     if (!defaultNeedsApproval(subject.action)) {
       // 含 skills 区路径的只读放行列 skills_read；纯区内仍 workspace_read。
@@ -132,6 +126,8 @@ export function evaluatePermission(
     return { outcome: "ask", request: buildApprovalRequest(subject) };
   }
 
+  if (mode === "confirm") return { outcome: "ask", request: buildApprovalRequest(subject) };
+
   if (subject.action.type === "write") {
     if (subject.action.path.insideWorkspace) return { outcome: "allow", basis: "workspace_write" };
     return { outcome: "ask", request: buildApprovalRequest(subject) };
@@ -141,7 +137,7 @@ export function evaluatePermission(
     if (grants.shellCommands.has(subject.action.command)) {
       return { outcome: "allow", basis: "session_grant" };
     }
-    return { outcome: "ask", request: buildApprovalRequest(subject) };
+    return { outcome: "ask", request: buildApprovalRequest(subject, true) };
   }
 
   return { outcome: "ask", request: buildApprovalRequest(subject) };

@@ -7,7 +7,7 @@
 - 按响应中的调用顺序逐个 `await`，不并行、不建调度队列。
 - 参数严格校验，不模糊纠正、不强制转换；非有限数值拒绝执行；参数解析与有限修复见 `src/llm/argument-parser.ts`。
 - 错误以 `Error:` 开头单行返回（bash 执行错误例外：错误首行 + Stdout/Stderr 区块）。模型可见信息只含修正调用所需内容；快照/Diff 机制、内部阶段、系统错误码、堆栈不进 Error，底层异常写 `~/.shana/logs/` 诊断日志并脱敏。
-- 拒绝分类：用户明确拒绝审批 `User denied.`；模式策略拒绝 `Denied by read-only mode.`（readonly 拒绝非 read 调用，不得归为 User denied.）；OS 权限不足 `Permission denied.`；执行前用户取消 `Cancelled by user.`。审批超时、取消与审批系统异常不得归为 User denied。
+- 拒绝分类包括用户明确拒绝审批 `User denied.`、OS 权限不足 `Permission denied.` 和执行前用户取消 `Cancelled by user.`。审批超时、取消与审批系统异常各有独立结果。
 - IO 失败无法可靠细分 `File operation failed.`；内部非预期异常 `Internal error. Stop and ask user.`（要求模型停止并询问用户，不新增门控或 Session 状态）。
 - read/glob/grep：正常裁剪返回成功；实际失败或取消只返回一条 Error，不附部分正文/路径/匹配，不误报无匹配。
 - 同批任一工具结果 unknown：保留真实结果，停止同批剩余调用并逐个记录 `not_executed`，进入 Run 收尾，不发下一 Turn、不自动重试。
@@ -16,14 +16,14 @@
 - 区外路径逐次人工审批（full 除外，见审批模式）；例外：read/glob/grep/view_image 命中 `~/.shana/skills` 只读默认放行（精确限 `skills/` 子目录，`~/.shana` 其余不放行；write/edit/bash 不豁免）。write/edit 经 path-policy 把符号链接解析为真实目标后判越区。
 - 结果路径的显示转义仅作用于展示，调用历史保留原文；模型再次调用前须还原真实路径。
 
-## 审批模式（readonly / auto / full）
+## 审批模式（confirm / auto / full）
 
 每 Session 持久化（meta `approvalMode`，缺省 auto），Run 起点冻结；`/mode` 查询或切换，运行中切换只影响后续 Run。完整矩阵与门控顺序见架构 §5，判定实现以 `src/security/permissions.ts` / `approval-manager.ts` / `bash-policy.ts` 为准。
 
-- **readonly**：非 read 调用（write/edit/bash，含只读命令的 bash）策略拒绝 `Denied by read-only mode.`；区内/skills 读放行，区外读逐次人工。
+- **confirm**：区内和 skills 豁免目录的读取直接放行，其他区外读取、所有 write/edit 和所有 bash 逐次人工审批。
 - **auto**（缺省）：区内 write/edit 直接放行；区外 write/edit 逐次人工且会话授权不能豁免；bash 会话授权（仅完全相同命令串）命中放行，否则本地保守 analyzer（首命令白名单 + 元字符/路径守卫）判定，判不了转人工。
 - **full**：用户显式全豁免（含区外写入与 skills 写入），审批全放行；路径复验、UTF-8/NUL、参数校验、限额、取消边界不变。
-- 会话授权仅 bash 精确命令字符串，不持久化；文件工具无会话授权。bash analyzer 的区内 symlink 跟随为已声明残余风险（架构 §5）。
+- auto 模式的会话授权仅匹配完全相同的 bash 命令字符串，不持久化。bash analyzer 的区内 symlink 跟随为已声明残余风险（架构 §5）。
 
 ## read
 

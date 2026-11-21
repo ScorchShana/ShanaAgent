@@ -214,6 +214,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         return activeHandle.requestApproval({
           toolCallId: request.toolCallId,
           toolName: request.toolName,
+          onceOnly: runApprovalMode === "confirm",
           summary: {
             paths: request.paths,
             touchesOutsideWorkspace: request.touchesOutsideWorkspace,
