@@ -5,7 +5,6 @@ export const DEFAULT_CTRL_C_EXIT_WINDOW_MS = 3000;
 export const DEFAULT_RUN_TIMER_REFRESH_MS = 1000;
 export const DEFAULT_STREAM_REFRESH_MS = 32;
 export const DEFAULT_MAX_RETRIES = 10;
-export const DEFAULT_DECISION_TIMEOUT_MS = 30_000;
 export const DEFAULT_MAX_TURNS = 200;
 export const DEFAULT_DIFF_FOLD_LINES = 200;
 export const DEFAULT_DIFF_FOLD_CHARS = 10_000;
@@ -39,7 +38,6 @@ export interface TokenEstimateSettings {
 
 export interface Settings {
   ctrlCExitWindowMs: number;
-  decisionTimeoutMs: number;
   promptVisibleRows: number;
   promptMaxRows: number;
   runTimerRefreshMs: number;
@@ -85,7 +83,6 @@ export function parseSettings(raw: unknown): Settings {
   for (const key of Object.keys(raw)) {
     if (
       key !== "ctrlCExitWindowMs" &&
-      key !== "decisionTimeoutMs" &&
       key !== "runTimerRefreshMs" &&
       key !== "streamRefreshMs" &&
       key !== "maxRetries" &&
@@ -189,7 +186,6 @@ export function parseSettings(raw: unknown): Settings {
   }
   for (const [key, minimum, maximum] of [
     ["ctrlCExitWindowMs", 1, 2_147_483_647],
-    ["decisionTimeoutMs", 1, 2_147_483_647],
     ["editMaxFileBytes", 1, 16_777_216],
     ["viewImageMaxBytes", 1024, 16_777_216],
     ["globTimeoutMs", 1000, 120_000],
@@ -234,7 +230,6 @@ export function parseSettings(raw: unknown): Settings {
   }
   return {
     ctrlCExitWindowMs: (raw.ctrlCExitWindowMs as number | undefined) ?? DEFAULT_CTRL_C_EXIT_WINDOW_MS,
-    decisionTimeoutMs: (raw.decisionTimeoutMs as number | undefined) ?? DEFAULT_DECISION_TIMEOUT_MS,
     promptVisibleRows,
     promptMaxRows,
     runTimerRefreshMs: (raw.runTimerRefreshMs as number | undefined) ?? DEFAULT_RUN_TIMER_REFRESH_MS,

@@ -1,7 +1,4 @@
-import { probeDecisionModel, requestDecision, type DecisionState } from "../llm/decision-service.js";
-import type { LoadedDecisionModelConfig } from "../llm/decision-model-config-store.js";
-import type { LoadedDecisionPrompt } from "../tools/prompts.js";
-import type { AutoDecisionStatus } from "./state.js";
+import type { ApprovalMode } from "../security/permissions.js";
 import type { Diagnostics } from "../diagnostics.js";
 import type { PendingShellCleanup } from "../tools/shell.js";
 import { randomUUID } from "node:crypto";
@@ -53,9 +50,6 @@ import { splitSkillCommand } from "./skills.js";
 
 export interface AgentSessionOptions {
   store: SessionStore;
-  decisionConfig?: LoadedDecisionModelConfig;
-  decisionPrompt?: LoadedDecisionPrompt;
-  decisionFetch?: typeof fetch;
   modelConfigPath?: string;
   workspaceId: string;
   ref?: SessionRef;
@@ -70,8 +64,6 @@ export interface AgentSessionOptions {
   systemPrompt?: string;
   onWarning?: (
     warning:
-      | { kind: "decision_fallback"; category: "http" | "transport" | "response" | "timeout" }
-      | { kind: "decision_probe"; category: "unavailable" | "recovered"; message?: string }
       | ContextBuildWarning
       | SessionLoadWarning
       | { kind: "temporary_file_cleanup_failed"; path: string }
@@ -98,19 +90,6 @@ function toolDefinitions(
       description: tool.description,
       parameters: tool.parameters,
     }));
-}
-
-// 与压缩预算的固定开销同源：System Prompt + environment + AGENTS.md + 工具 Schema。
-function computeBaselineTokens(
-  context: StoredContext,
-  settings: Settings,
-  platform?: NodeJS.Platform,
-  imageInput = false,
-): number {
-  return estimateContextTokens(
-    { ...context, messages: [], tools: toolDefinitions(platform, settings, imageInput) },
-    settings.tokenEstimate,
-  );
 }
 
 function retainedContextBudget(context: StoredContext, model: ResolvedModel, settings: Settings): number {
@@ -155,92 +134,10 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let openedAtSeq = records.at(-1)?.recordSeq ?? 0;
   let sessionMeta: SessionMeta | null = initial?.meta ?? null;
   let sessionWarnings: SessionLoadWarning[] = initial?.warnings ?? [];
-  let autoDecisionEnabled = sessionMeta?.autoDecisionEnabled ?? true;
+  let approvalMode: ApprovalMode = sessionMeta?.approvalMode ?? "auto";
+  // Run 起点冻结：运行中切换模式只影响后续 Run。
+  let runApprovalMode: ApprovalMode = "auto";
   let metadataFresh = true;
-  let runAutoDecisionEnabled = true;
-  let runDecisionUnavailable = false;
-  let currentIntent = "";
-  const decisionConfig: NonNullable<AgentSessionOptions["decisionConfig"]> = structuredClone(
-    options.decisionConfig ?? { status: "missing" },
-  );
-  const decisionPrompt: NonNullable<AgentSessionOptions["decisionPrompt"]> = structuredClone(
-    options.decisionPrompt ?? { status: "invalid", message: "Decision prompt unavailable" },
-  );
-  let decisionProbe: { reason: "model_mismatch" | "not_decision"; message: string } | null = null;
-  let probeGeneration = 0;
-  let probeController: AbortController | null = null;
-  let probePromise: Promise<void> | null = null;
-  const autoDecisionStatus = (): AutoDecisionStatus => {
-    const invalid =
-      decisionConfig.status === "invalid"
-        ? decisionConfig
-        : decisionPrompt.status === "invalid"
-          ? decisionPrompt
-          : null;
-    const availability = invalid
-      ? "invalid"
-      : decisionConfig.status === "missing"
-        ? "missing"
-        : decisionProbe
-          ? "unavailable"
-          : "ready";
-    const message = invalid ? invalid.message : (decisionProbe?.message ?? undefined);
-    return {
-      enabled: autoDecisionEnabled,
-      availability,
-      ...(message !== undefined ? { message } : {}),
-    };
-  };
-  const stopDecisionProbe = (): Promise<void> => {
-    probeGeneration += 1;
-    probeController?.abort();
-    probeController = null;
-    const previous = probePromise;
-    probePromise = null;
-    return previous ?? Promise.resolve();
-  };
-  const startDecisionProbe = (): void => {
-    const previous = stopDecisionProbe();
-    const generation = probeGeneration;
-    probePromise = (async () => {
-      await previous;
-      if (generation !== probeGeneration) return;
-      if (
-        !autoDecisionEnabled ||
-        decisionConfig.status !== "ok" ||
-        decisionPrompt.status !== "ok"
-      )
-        return;
-      const controller = new AbortController();
-      probeController = controller;
-      const outcome = await probeDecisionModel({
-        config: decisionConfig.config,
-        timeoutMs: parseSettings(options.getSettings()).decisionTimeoutMs,
-        signal: controller.signal,
-        fetch: options.decisionFetch,
-      });
-      if (generation !== probeGeneration) return;
-      options.diagnostics?.debug(
-        JSON.stringify({
-          event: "decision.probe",
-          kind: outcome.kind,
-          ...(outcome.kind === "inconclusive" ? { category: outcome.category } : {}),
-        }),
-      );
-      if (outcome.kind === "model_mismatch") {
-        const message = `决策模型名称与服务不符（配置：${decisionConfig.config.model}，服务：${outcome.servedModel}）`;
-        decisionProbe = { reason: "model_mismatch", message };
-        options.onWarning?.({ kind: "decision_probe", category: "unavailable", message });
-      } else if (outcome.kind === "not_decision") {
-        const message = "服务加载的模型不是决策模型";
-        decisionProbe = { reason: "not_decision", message };
-        options.onWarning?.({ kind: "decision_probe", category: "unavailable", message });
-      } else if (outcome.kind === "ok" && decisionProbe) {
-        decisionProbe = null;
-        options.onWarning?.({ kind: "decision_probe", category: "recovered" });
-      }
-    })();
-  };
   let recordsFresh = true;
   let recordsEpoch = 0;
   let resyncPromise: Promise<void> | null = null;
@@ -287,105 +184,30 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let runModel: ResolvedModel;
   let runSettings: Settings;
   let built: Awaited<ReturnType<typeof buildContext>>;
-  // 不变量：contextTokens 是下一次请求输入的最佳已知 token 数——优先"最近一次实测 prompt +
-  // 未测量增量的估算"（锚定），实测不可用时为 estimateContextTokens(built.context)。
-  // built.context 的每处变更必须同步它。
+  // 不变量：contextTokens 是当前上下文的最佳已知 token 数——优先"最近一次实测 prompt +
+  // 未测量增量的估算"（锚定），无可信实测时为全量估算（contextEstimated=true，状态栏加 ~）。
+  // 状态栏直显此值；每处上下文变更（每 Turn/取消/压缩//new//resume）必须同步维护。
   let contextTokens = 0;
-  let contextBaselineTokens: number | null = null;
+  // false = 未知（空闲态重建失败、model.json 非法等），状态栏显 "—"；Run 内恒 true。
+  let contextTokensKnown = false;
+  let contextEstimated = false;
+  const setContextTokens = (tokens: number, estimated: boolean): void => {
+    contextTokens = tokens;
+    contextEstimated = estimated;
+    contextTokensKnown = true;
+  };
+  const invalidateContextTokens = (): void => {
+    contextTokensKnown = false;
+    contextEstimated = false;
+  };
   // Session 级冻结快照：进程启动、/new、/resume 时读取，Session 内不再重读。
   let sessionAgentsMd: AgentsMdLoad = await loadRootAgentsMd(options.workspaceRoot);
-  const applyBaseline = (context: StoredContext, settings: Settings, imageInput = false): void => {
-    try {
-      contextBaselineTokens = computeBaselineTokens(
-        context,
-        settings,
-        options.executorOptions?.platform,
-        imageInput,
-      );
-    } catch {
-      contextBaselineTokens = null;
-    }
-  };
-  const refreshBaseline = async (): Promise<void> => {
-    try {
-      const baseline = await buildContext({
-        records: [],
-        workspacePath: options.workspaceRoot,
-        agentsMd: sessionAgentsMd,
-        systemPrompt: options.systemPrompt,
-        environment: options.environment,
-      });
-      // currentModel 可能因 model.json 非法抛错，由外层 catch 统一降级为无 baseline。
-      applyBaseline(
-        baseline.context,
-        parseSettings(options.getSettings()),
-        currentModel().input.includes("image"),
-      );
-    } catch {
-      contextBaselineTokens = null;
-    }
-  };
   const makeManager = () =>
     new ApprovalManager({
-      onDecisionError: () => {
-        options.diagnostics?.warn(JSON.stringify({ event: "permission.decision", category: "internal" }));
-        options.onWarning?.({ kind: "decision_fallback", category: "transport" });
-      },
-      decider: async (subject, request, signal) => {
-        if (
-          !runAutoDecisionEnabled ||
-          runDecisionUnavailable ||
-          decisionConfig.status !== "ok" ||
-          decisionPrompt.status !== "ok"
-        )
-          return { kind: "ask_user" };
-        const call = currentCalls.find((entry) => entry.id === subject.toolCallId);
-        if (!activeHandle || !call || call.parse.status !== "parsed") return { kind: "ask_user" };
-        const args = call.parse.arguments;
-        if (!signal) return { kind: "ask_user" };
-        const base = {
-          user_task: activeHandle.prompt,
-          agent_intent: currentIntent,
-          project_root: options.workspaceRoot,
-        };
-        const paths = {
-          resolved_paths: [...request.paths],
-          touches_outside_workspace: request.touchesOutsideWorkspace,
-        };
-        let state: DecisionState;
-        if (call.name === "bash" && typeof args.command === "string") {
-          state = {
-            ...base,
-            tool: "bash",
-            arguments: {
-              command: args.command,
-              ...(typeof args.timeout === "number" ? { timeout: args.timeout } : {}),
-            },
-          };
-        } else if ((call.name === "write" || call.name === "edit") && typeof args.path === "string") {
-          state = { ...base, ...paths, tool: call.name, arguments: { path: args.path } };
-        } else if (call.name === "read" || call.name === "glob" || call.name === "grep") {
-          state = { ...base, ...paths, tool: call.name, arguments: { ...args } };
-        } else return { kind: "ask_user" };
-        const result = await requestDecision({
-          config: decisionConfig.config,
-          prompt: decisionPrompt.text,
-          state,
-          timeoutMs: runSettings.decisionTimeoutMs,
-          signal,
-          fetch: options.decisionFetch,
-        });
-        options.diagnostics?.debug(
-          JSON.stringify({
-            toolCallId: subject.toolCallId,
-            kind: result.kind,
-            ...(result.kind === "fallback" ? { category: result.category } : {}),
-          }),
-        );
-        if (result.kind === "fallback" && !signal?.aborted)
-          options.onWarning?.({ kind: "decision_fallback", category: result.category });
-        return result;
-      },
+      onAnalyzerError: (error) =>
+        options.diagnostics?.error(
+          `bash analyzer failed; falling back to manual approval: ${error instanceof Error ? error.message : String(error)}`,
+        ),
       approver: (request) => {
         if (!activeHandle) throw new Error("No active Run");
         const call = currentCalls.find((c) => c.id === request.toolCallId);
@@ -490,7 +312,11 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   // 无法校验，误差以头部大小为界；工具 Schema 经 run_started 的 settings 快照校验。
   // 旧记录的 aborted thinking 读取时剥离：历史实测含当时发送的 thinking，锚定偏高，
   // 误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
-  const anchorContextTokens = async (context: StoredContext): Promise<number | null> => {
+  const anchorContextTokens = async (
+    context: StoredContext,
+    model: ResolvedModel,
+    settings: Settings,
+  ): Promise<number | null> => {
     let reason = "no_measurement";
     let anchored: number | null = null;
     for (let index = records.length - 1; index >= 0; index -= 1) {
@@ -498,7 +324,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       if (record.type !== "assistant_message") continue;
       const measured = measuredPromptTokens(record.message.usage);
       if (measured === null) continue;
-      if (!sameModelIdentity(record.message, runModel)) {
+      if (!sameModelIdentity(record.message, model)) {
         reason = "model_mismatch";
         continue;
       }
@@ -530,7 +356,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
           environment: options.environment,
-          imageInput: runModel.input.includes("image"),
+          imageInput: model.input.includes("image"),
         });
       } catch {
         reason = "prefix_build_failed";
@@ -554,7 +380,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       }
       let suffixTokens = 0;
       for (const message of context.messages.slice(count))
-        suffixTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
+        suffixTokens += estimateMessageTokens(message, settings.tokenEstimate);
       anchored = measured + suffixTokens;
       break;
     }
@@ -562,6 +388,51 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       JSON.stringify({ event: "context.anchor", anchored: anchored !== null, reason: anchored !== null ? null : reason }),
     );
     return anchored;
+  };
+  // 统一取值：锚定优先（实测 prompt + 未测后缀估算，按实测口径显示）；无可信锚点全量估算。
+  // 零占位 usage 被 measuredPromptTokens 拒绝，取消 Run 在此自然落入估算分支。
+  const computeContextTokens = async (
+    context: StoredContext,
+    model: ResolvedModel,
+    settings: Settings,
+  ): Promise<{ tokens: number; estimated: boolean }> => {
+    const anchored = await anchorContextTokens(context, model, settings);
+    if (anchored !== null) return { tokens: anchored, estimated: false };
+    return { tokens: estimateContextTokens(context, settings.tokenEstimate), estimated: true };
+  };
+  // 空闲态全量刷新：从 records 重建（含工具 Schema）后统一取值。失败返回 false 且不动现值，
+  // 由调用方决定降级（会话切换清为未知；Run 收尾/手动压缩保留活值）。
+  const refreshContextTokens = async (): Promise<boolean> => {
+    try {
+      const model = currentModel();
+      const settings = parseSettings(options.getSettings());
+      const imageInput = model.input.includes("image");
+      const rebuilt = await buildContext({
+        records,
+        workspacePath: options.workspaceRoot,
+        agentsMd: sessionAgentsMd,
+        systemPrompt: options.systemPrompt,
+        environment: options.environment,
+        imageInput,
+      });
+      const computed = await computeContextTokens(
+        {
+          ...rebuilt.context,
+          tools: toolDefinitions(options.executorOptions?.platform, settings, imageInput),
+        },
+        model,
+        settings,
+      );
+      setContextTokens(computed.tokens, computed.estimated);
+      return true;
+    } catch {
+      options.diagnostics?.debug(JSON.stringify({ event: "context.refresh", ok: false }));
+      return false;
+    }
+  };
+  const refreshContextTokensKeepingKnown = async (): Promise<void> => {
+    const kept = contextTokensKnown ? { tokens: contextTokens, estimated: contextEstimated } : null;
+    if (!(await refreshContextTokens()) && kept) setContextTokens(kept.tokens, kept.estimated);
   };
   const compactForRun = async (
     handle: RunHandle,
@@ -594,8 +465,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       handle.reportPhase("streaming");
       throw error;
     }
-    // 压后估算随 finished 事件上报供状态栏立即更新；try/finally 保证重建抛错时事件仍恰发一次。
-    let contextEstimate: number | undefined;
+    // try/finally 保证重建抛错时 finished 事件仍恰发一次。
     try {
       if (outcome.status === "completed") {
         const tools = built.context.tools;
@@ -612,18 +482,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         // 复用原数组保证与上一次正式请求逐字节一致。
         built.context.tools = tools;
         // 压后上下文未发送过、无实测可用，只能纯估算；下一次响应返回后重新锚定。
-        contextTokens = estimateContextTokens(built.context, tokenEstimate);
-        contextEstimate = contextTokens;
+        setContextTokens(estimateContextTokens(built.context, tokenEstimate), true);
       }
     } finally {
       handle.notifyCompactionFinished(
         outcome.status === "completed" && outcome.coveredUpTo !== null
-          ? {
-              status: "completed",
-              path: outcome.path,
-              coveredUpTo: outcome.coveredUpTo,
-              ...(contextEstimate !== undefined ? { contextTokens: contextEstimate } : {}),
-            }
+          ? { status: "completed", path: outcome.path, coveredUpTo: outcome.coveredUpTo }
           : { status: outcome.status },
       );
       handle.reportPhase("streaming");
@@ -669,7 +533,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         onToolOutput: (toolCallId, snapshot) => handle.streamToolOutput(toolCallId, snapshot),
         settings: runSettings,
         imageInput: runModel.input.includes("image"),
-        permissionGate: (request) => manager.requestPermission(request, { signal }),
+        permissionGate: (request) => manager.requestPermission(request, { signal, mode: runApprovalMode }),
         onCleanupWarning: (path) => options.onWarning?.({ kind: "temporary_file_cleanup_failed", path }),
       });
       built.context.tools = executor.registry.list().map((tool) => ({
@@ -677,10 +541,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         description: tool.description,
         parameters: tool.parameters,
       }));
-      contextTokens = estimateContextTokens(built.context, runSettings.tokenEstimate);
       // 估算对代码/JSON 系统性偏低会让阈值触发漂移；有可信实测时以其锚定历史大头。
-      const anchored = await anchorContextTokens(built.context);
-      if (anchored !== null) contextTokens = anchored;
+      const computed = await computeContextTokens(built.context, runModel, runSettings);
+      setContextTokens(computed.tokens, computed.estimated);
       try {
         let autoCompactionFailedThisRun = false;
         let overflowRemediedThisRun = false;
@@ -768,10 +631,6 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           // 完整生成的响应不因取消竞态丢弃：取消只阻止后续工具执行，已发生的生成如实落盘进上下文。
           handle.beginAttempt(turn, response.attempts);
           handle.finishAttempt("completed");
-          currentIntent = response.message.content
-            .filter((block) => block.type === "text")
-            .map((block) => block.text)
-            .join("\n");
           currentCalls = toolCallsOfMessage(response.message);
           if (!["stop", "toolUse", "length"].includes(response.message.stopReason))
             throw new Error("Incomplete model response");
@@ -877,10 +736,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             deltaTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
           }
           const measured = measuredPromptTokens(response.usage);
-          contextTokens =
-            measured !== null && sameModelIdentity(response.message, runModel)
-              ? measured + deltaTokens
-              : contextTokens + deltaTokens;
+          if (measured !== null && sameModelIdentity(response.message, runModel)) {
+            setContextTokens(measured + deltaTokens, false);
+          } else {
+            // 实测缺失/身份不符回退增量估算，保持原有实测/估算口径。
+            setContextTokens(contextTokens + deltaTokens, contextEstimated);
+          }
           if (turn === runSettings.maxTurns) return { outcome: "turn_limit" };
           turn += 1;
         }
@@ -927,7 +788,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     records = nextRecords;
     openedAtSeq = nextRecords.at(-1)?.recordSeq ?? 0;
     sessionMeta = nextMeta;
-    autoDecisionEnabled = nextMeta?.autoDecisionEnabled ?? true;
+    approvalMode = nextMeta?.approvalMode ?? "auto";
     metadataFresh = true;
     sessionWarnings = nextWarnings;
     sessionAgentsMd = nextAgentsMd;
@@ -938,8 +799,6 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     unknownSignature = JSON.stringify(gate.unknownResults);
     shellBlocked = false;
     manager = makeManager();
-    decisionProbe = null;
-    startDecisionProbe();
   };
   const compactor: CompactionDriver = {
     execute: async (signal, focus) => {
@@ -974,27 +833,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         appendRecord: append,
       });
       if (outcome.status !== "completed") return outcome;
-      // 压后估算仅供状态栏即时显示；重建/估算失败不影响压缩结果本身。
-      try {
-        const rebuilt = await buildContext({
-          records,
-          workspacePath: options.workspaceRoot,
-          agentsMd: sessionAgentsMd,
-          systemPrompt: options.systemPrompt,
-          environment: options.environment,
-          imageInput,
-        });
-        const estimatedContextTokens = estimateContextTokens(
-          {
-            ...rebuilt.context,
-            tools: toolDefinitions(options.executorOptions?.platform, settings, imageInput),
-          },
-          settings.tokenEstimate,
-        );
-        return { ...outcome, estimatedContextTokens };
-      } catch {
-        return outcome;
-      }
+      // 压后全量刷新（无锚点落入纯估算）；重建失败保留活值，不影响压缩结果本身。
+      await refreshContextTokensKeepingKnown();
+      return outcome;
     },
   };
   const controller = new SessionController({
@@ -1002,25 +843,25 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     compactor,
     skillsRoot: options.skillsRoot,
     commands: {
-      getAutoDecisionStatus: async () => {
+      getApprovalMode: async () => {
         if (ref) {
           const meta = await options.store.readSessionMeta(ref);
           sessionMeta = meta;
-          autoDecisionEnabled = meta.autoDecisionEnabled ?? true;
+          approvalMode = meta.approvalMode ?? "auto";
           metadataFresh = true;
         }
-        return autoDecisionStatus();
+        return approvalMode;
       },
-      setAutoDecisionEnabled: async (enabled) => {
-        if (!metadataFresh) throw new Error("Query /autodecision to reload Session metadata first");
+      setApprovalMode: async (mode) => {
+        if (!metadataFresh) throw new Error("Query /mode to reload Session metadata first");
         if (ref) {
           try {
-            sessionMeta = await options.store.setAutoDecisionEnabled(ref, enabled);
+            sessionMeta = await options.store.setApprovalMode(ref, mode);
           } catch (error) {
             metadataFresh = false;
             try {
               sessionMeta = await options.store.readSessionMeta(ref);
-              autoDecisionEnabled = sessionMeta.autoDecisionEnabled ?? true;
+              approvalMode = sessionMeta.approvalMode ?? "auto";
               metadataFresh = true;
             } catch {
               // An uncertain save blocks Runs until a metadata query succeeds.
@@ -1028,9 +869,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             throw error;
           }
         }
-        autoDecisionEnabled = enabled;
-        if (enabled) startDecisionProbe();
-        else await stopDecisionProbe();
+        approvalMode = mode;
       },
       readHistory: async () => {
         if (!ref || !sessionMeta) return null;
@@ -1083,7 +922,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         await closePendingShells();
         if (ref) await options.store.releaseSession(ref);
         adoptSession(null, [], null, [], await loadRootAgentsMd(options.workspaceRoot));
-        await refreshBaseline();
+        invalidateContextTokens();
+        await refreshContextTokens();
       },
       resumeSession: async (source) => {
         if (source.workspaceId !== workspaceId) throw new Error("Cannot resume a different workspace");
@@ -1103,7 +943,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           restored.warnings,
           await loadRootAgentsMd(options.workspaceRoot),
         );
-        await refreshBaseline();
+        invalidateContextTokens();
+        await refreshContextTokens();
       },
       switchModel: options.modelConfigPath
         ? async (providerId, modelId) => {
@@ -1122,14 +963,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
     createId: (prefix) => `${prefix}-${randomUUID()}`,
     hooks: {
       captureRunInput: () => {
-        runAutoDecisionEnabled = autoDecisionEnabled;
-        runDecisionUnavailable = decisionProbe !== null;
-        currentIntent = "";
+        runApprovalMode = approvalMode;
         runModel = structuredClone(currentModel());
         runSettings = parseSettings(options.getSettings());
       },
       getSessionView: () => ({
-        autoDecision: autoDecisionStatus(),
+        approvalMode,
         ref: ref ? { ...ref } : null,
         title: sessionTitle,
         model: modelConfig?.status === "empty" ? null : displayModel(currentModel()),
@@ -1140,16 +979,16 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             : [options.getModel()]
         ).map(displayModel),
         runModel: runModel ? displayModel(runModel) : null,
-        contextBaselineTokens,
+        contextTokens: contextTokensKnown ? contextTokens : null,
+        contextEstimated,
       }),
       closeSession: async () => {
-        await stopDecisionProbe();
         await closePendingShells();
         if (ref) await options.store.releaseSession(ref);
       },
       assertCanStartRun: () => {
         if (!metadataFresh)
-          throw new Error("Query /autodecision to reload Session metadata before starting a Run");
+          throw new Error("Query /mode to reload Session metadata before starting a Run");
         if (shellBlocked) throw new Error("Shell termination is not confirmed. Cannot start a new Run.");
         gate.assertCanStartRun();
       },
@@ -1173,7 +1012,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           const meta = await options.store.createSession({
             workspaceId,
             initialRecords,
-            autoDecisionEnabled,
+            approvalMode,
           });
           ref = { workspaceId, sessionId: meta.sessionId };
           sessionMeta = meta;
@@ -1200,17 +1039,25 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           environment: options.environment,
           imageInput: runModel.input.includes("image"),
         });
-        applyBaseline(built.context, runSettings, runModel.input.includes("image"));
+        // Run 发出即有值：覆盖"发出即取消"（尚无 assistant，状态栏不得显 0）。
+        built.context.tools = toolDefinitions(
+          options.executorOptions?.platform,
+          runSettings,
+          runModel.input.includes("image"),
+        );
+        const computed = await computeContextTokens(built.context, runModel, runSettings);
+        setContextTokens(computed.tokens, computed.estimated);
         for (const warning of built.warnings) options.onWarning?.(warning);
       },
       persistRunFinished: async ({ runId, outcome, elapsedMs }) => {
         await append({ type: "run_finished", runId, outcome, elapsedMs, persisted: true });
+        // Run 收尾（含取消）全量刷新：aborted partial 的零占位 usage 不可信，无锚点落入估算。
+        await refreshContextTokensKeepingKnown();
       },
     },
   });
 
-  await refreshBaseline();
-  startDecisionProbe();
+  await refreshContextTokens();
 
   return { controller, acknowledgeUnknownSideEffects: () => gate.acknowledge() };
 }

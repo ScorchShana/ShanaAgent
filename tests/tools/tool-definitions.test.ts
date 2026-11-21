@@ -53,10 +53,9 @@ describe("V4 六工具固定 + view_image 条件注册，定义与确认稿一�
     }
   });
 
-  it("定义快照（name/access/description/parameters）与确认稿冻结一致", () => {
+  it("定义快照（name/description/parameters）与确认稿冻结一致", () => {
     const snapshot = visionRegistry.list().map((tool) => ({
       name: tool.name,
-      access: tool.access,
       description: tool.description,
       parameters: tool.parameters,
     }));

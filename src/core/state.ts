@@ -1,5 +1,6 @@
 import type { RunModelSnapshot, SessionMeta } from "../sessions/records.js";
 import type { SessionRef } from "../sessions/session-store.js";
+import type { ApprovalMode } from "../security/permissions.js";
 
 export const RUN_PHASES = [
   "preparing",
@@ -53,20 +54,17 @@ export interface StreamingAttempt {
   thinking: string;
 }
 
-export interface AutoDecisionStatus {
-  enabled: boolean;
-  availability: "ready" | "missing" | "invalid" | "unavailable";
-  message?: string;
-}
-
 export interface SessionView {
-  autoDecision: AutoDecisionStatus;
+  approvalMode: ApprovalMode;
   title: string | null;
   ref: SessionRef | null;
   model: RunModelSnapshot | null;
   models: RunModelSnapshot[];
   runModel: RunModelSnapshot | null;
-  contextBaselineTokens: number | null;
+  // 当前上下文最佳已知 token 数（Core 维护：实测锚定优先，无实测全量估算）；null = 未知。
+  contextTokens: number | null;
+  // true = 纯估算（无可信实测锚点），状态栏加 ~ 前缀。
+  contextEstimated: boolean;
 }
 export interface SessionListEntry extends SessionMeta {
   title: string;
@@ -78,8 +76,7 @@ export interface SessionListEntry extends SessionMeta {
 
 export interface ControllerSnapshot {
   runTiming: RunTiming | null;
-  // contextEstimateTokens 由 Controller 在压缩完成时写入，不属于 Hook 提供的 SessionView。
-  session: SessionView & { contextEstimateTokens: number | null };
+  session: SessionView;
   sessionOperation: boolean;
   streamingAttempts: StreamingAttempt[];
   status: ControllerStatus;

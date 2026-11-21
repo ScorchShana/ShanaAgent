@@ -190,6 +190,7 @@ describe("AgentLoop view_image 集成", () => {
     await f.controller.submitPrompt("look");
 
     f.setModel(textModel);
+    const textRunAnchorStart = f.anchorEvents.length;
     await expect(f.controller.submitPrompt("text only")).resolves.toBe("completed");
     const textRun = f.requests.at(-1)!.context;
     expect(textRun.tools?.map((tool) => tool.name)).toEqual([
@@ -202,18 +203,28 @@ describe("AgentLoop view_image 集成", () => {
     ]);
     expect(JSON.stringify(textRun.messages)).not.toContain('"type":"image"');
     expect(JSON.stringify(textRun.messages)).toContain(IMAGE_OMITTED_TEXT);
-    // 工具集变化 → 回退纯估算，不误用视觉 Run 的实测。
-    expect(f.anchorEvents.at(-1)).toEqual({ anchored: false, reason: "tools_changed" });
+    // 工具集变化 → Run 起点（persistRunStart + driver 起点）回退纯估算，不误用视觉 Run 的实测。
+    // Run 收尾还会对本 Run 自身实测做一次合法重锚定（身份/工具一致），故只取起点两个事件。
+    expect(f.anchorEvents.slice(textRunAnchorStart, textRunAnchorStart + 2)).toEqual([
+      { anchored: false, reason: "tools_changed" },
+      { anchored: false, reason: "tools_changed" },
+    ]);
 
     f.setModel(visionModel);
+    const visionAnchorStart = f.anchorEvents.length;
     await expect(f.controller.submitPrompt("vision again")).resolves.toBe("completed");
     const visionRun = f.requests.at(-1)!.context;
     expect(visionRun.tools?.map((tool) => tool.name).at(-1)).toBe("view_image");
     // 记录永久保留：切回后 image 块恢复。
     expect(JSON.stringify(visionRun.messages)).toContain('"type":"image"');
     expect(JSON.stringify(visionRun.messages)).not.toContain(IMAGE_OMITTED_TEXT);
-    // 文本 Run 的实测前缀含占位而非 image，重建不可比 → 保守回退，下次响应重新锚定。
-    expect(f.anchorEvents.at(-1)?.anchored).toBe(false);
+    // Run 起点：文本 Run 的工具集快照与视觉工具集不符 → 保守回退；
+    // Run 收尾对本 Run 自身实测重锚定（前缀重建同构）成功。
+    expect(f.anchorEvents.slice(visionAnchorStart, visionAnchorStart + 2)).toEqual([
+      { anchored: false, reason: "tools_changed" },
+      { anchored: false, reason: "tools_changed" },
+    ]);
+    expect(f.anchorEvents.at(-1)).toEqual({ anchored: true, reason: null });
   });
 
   it("非视觉 Run 幻觉调用 view_image → Unknown tool，不落 images", async () => {

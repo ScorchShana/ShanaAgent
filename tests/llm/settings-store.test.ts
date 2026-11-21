@@ -31,7 +31,6 @@ describe("settings-store", () => {
     expect(settings).toEqual({
       maxRetries: 10,
       ctrlCExitWindowMs: 3000,
-      decisionTimeoutMs: 30000,
       maxTurns: 200,
       diffFoldLines: 200,
       diffFoldChars: 10000,
@@ -70,7 +69,6 @@ describe("settings-store", () => {
     );
     expect(loadSettings(filePath)).toEqual({
       ctrlCExitWindowMs: 3000,
-      decisionTimeoutMs: 30000,
       maxTurns: 200,
       diffFoldLines: 200,
       diffFoldChars: 10000,
@@ -320,12 +318,8 @@ describe("压缩配置", () => {
   });
 });
 
-it("decision timeout accepts only safe positive timer integers", () => {
-  expect(parseSettings({}).decisionTimeoutMs).toBe(30000);
-  for (const value of [1, 2147483647])
-    expect(parseSettings({ decisionTimeoutMs: value }).decisionTimeoutMs).toBe(value);
-  for (const value of [0, -1, 1.5, 2147483648, "30000", null])
-    expect(() => parseSettings({ decisionTimeoutMs: value })).toThrow(/decisionTimeoutMs/);
+it("rejects the removed decisionTimeoutMs key (migration: delete it from settings.json)", () => {
+  expect(() => parseSettings({ decisionTimeoutMs: 30000 })).toThrow(/未知字段 "decisionTimeoutMs"/);
 });
 
 it("validates the Ctrl+C exit window", () => {

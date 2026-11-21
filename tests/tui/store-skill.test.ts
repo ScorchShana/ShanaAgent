@@ -25,7 +25,7 @@ function skillController(options: {
     skillsRoot: options.skillsRoot,
     commands: {
       readHistory: async () => ({
-        meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+        meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
         records: [],
         warnings: [],
         fromRecordSeq: 1,
@@ -48,8 +48,8 @@ function skillController(options: {
         },
         models: [],
         runModel: null,
-        contextBaselineTokens: null,
-        autoDecision: { enabled: true, availability: "missing" },
+        contextTokens: null, contextEstimated: false,
+        approvalMode: "auto",
       }),
     },
   });
@@ -57,7 +57,7 @@ function skillController(options: {
 
 function seedHistory(core: SessionController, records: SessionRecord[]): void {
   vi.spyOn(core, "readHistory").mockResolvedValue({
-    meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+    meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
     records,
     warnings: [],
     fromRecordSeq: 1,
@@ -159,7 +159,7 @@ describe("TUI skill 块（D8/D9/D10）", () => {
       },
     });
     vi.spyOn(core, "readHistory").mockImplementation(async () => ({
-      meta: { version: 5, workspaceId: "ws", sessionId: "s", createdAt: "now" },
+      meta: { version: 6, workspaceId: "ws", sessionId: "s", createdAt: "now" },
       records: [...records],
       warnings: [],
       fromRecordSeq: 1,

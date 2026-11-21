@@ -100,11 +100,11 @@ describe("Session v5", () => {
     expect((await context(before.records)).context).toEqual((await context(copy.records)).context);
     expect(JSON.stringify((await context(copy.records)).context)).not.toContain("snapshot-only");
     expect(JSON.stringify(copy.records)).toContain("synthetic-key");
-    // v5 硬切：旧 v4 meta 拒载、不迁移、文件不修改。
+    // v6 硬切：旧 v5 meta 拒载、不迁移、文件不修改。
     const bytes = fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8");
-    fs.writeFileSync(metaPathOf(store.sessionsDir, ref), bytes.replace('"version":5', '"version":4'));
-    await expect(store.loadSession(ref)).rejects.toThrow(/版本 4/);
-    expect(fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8")).toContain('"version":4');
+    fs.writeFileSync(metaPathOf(store.sessionsDir, ref), bytes.replace('"version":6', '"version":5'));
+    await expect(store.loadSession(ref)).rejects.toThrow(/版本 5/);
+    expect(fs.readFileSync(metaPathOf(store.sessionsDir, ref), "utf8")).toContain('"version":5');
     expect(fs.readFileSync(messagesPathOf(store.sessionsDir, ref), "utf8")).toContain("synthetic-key");
   });
   it("does not admit later turns in the same run through a checkpoint after an incomplete turn", () => {

@@ -22,13 +22,3 @@ export function loadPrompts(root = new URL("../../prompts/", import.meta.url)): 
   }
   return { system, tools };
 }
-
-export type LoadedDecisionPrompt = { status: "ok"; text: string } | { status: "invalid"; message: string };
-
-export function loadDecisionPrompt(root = new URL("../../prompts/", import.meta.url)): LoadedDecisionPrompt {
-  try {
-    return { status: "ok", text: readPrompt(new URL("decision.md", root)) };
-  } catch {
-    return { status: "invalid", message: "decision.md: 提示词缺失、读取失败或内容无效" };
-  }
-}

@@ -32,7 +32,6 @@ export type ToolName = (typeof TOOL_NAMES)[number];
 export const SHELL_TOOL_NAMES = ["bash"] as const;
 export type ShellToolName = (typeof SHELL_TOOL_NAMES)[number];
 
-export type ToolAccess = "read" | "write" | "shell";
 
 export interface ToolParameterProperty {
   type: "string" | "integer" | "boolean";
@@ -128,7 +127,6 @@ export interface ToolContext {
 
 export interface RegisteredTool {
   name: ToolName;
-  access: ToolAccess;
   description: string;
   parameters: ToolParameterSchema;
 
@@ -183,7 +181,6 @@ function withPathCheck(context: ToolContext, target: ResolvedToolPath): ToolCont
 
 interface ToolDefinition<Args> {
   name: ToolName;
-  access: ToolAccess;
   description: string;
   parameters: ToolParameterSchema;
   parseArguments(raw: JsonObject): Args;
@@ -193,7 +190,6 @@ interface ToolDefinition<Args> {
 function defineTool<Args>(definition: ToolDefinition<Args>): RegisteredTool {
   return {
     name: definition.name,
-    access: definition.access,
     description: definition.description,
     parameters: definition.parameters,
 
@@ -296,7 +292,6 @@ function optionalBoolean(
 // T13: 模型可见描述、参数 Schema 与报错模板尚未定稿，以下均为引擎占位。
 const readTool = defineTool<ReadArguments>({
   name: "read",
-  access: "read",
   description: "",
   parameters: {
     type: "object",
@@ -344,7 +339,6 @@ const readTool = defineTool<ReadArguments>({
 
 const globTool = defineTool<GlobArguments>({
   name: "glob",
-  access: "read",
   description: "",
   parameters: {
     type: "object",
@@ -383,7 +377,6 @@ const globTool = defineTool<GlobArguments>({
 
 const grepTool = defineTool<GrepArguments>({
   name: "grep",
-  access: "read",
   description: "",
   parameters: {
     type: "object",
@@ -439,7 +432,6 @@ const grepTool = defineTool<GrepArguments>({
 
 const writeTool = defineTool<WriteArguments>({
   name: "write",
-  access: "write",
   description: "",
   parameters: {
     type: "object",
@@ -480,7 +472,6 @@ const writeTool = defineTool<WriteArguments>({
 
 const editTool = defineTool<EditArguments>({
   name: "edit",
-  access: "write",
   description: "",
   parameters: {
     type: "object",
@@ -530,7 +521,6 @@ const editTool = defineTool<EditArguments>({
 
 const viewImageTool = defineTool<ViewImageArguments>({
   name: "view_image",
-  access: "read",
   description: "",
   parameters: {
     type: "object",
@@ -566,7 +556,6 @@ interface ShellArguments {
 function createShellTool(shell: ShellDescriptor): RegisteredTool {
   return defineTool<ShellArguments>({
     name: shell.kind,
-    access: "shell",
     description: "",
     parameters: {
       type: "object",

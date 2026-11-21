@@ -376,23 +376,26 @@ describe("cross-process Session ownership", () => {
   );
 });
 
-describe("autoDecisionEnabled recovery", () => {
-  it.each([undefined, false, true])("restores %s without rewriting metadata", async (enabled) => {
-    const { store } = makeStore();
-    const ref = sessionRef("metadata-resume");
-    await seedSource(store, ref);
-    const target = path.join(store.sessionsDir, ref.workspaceId, ref.sessionId, "meta.json");
-    const meta = JSON.parse(fs.readFileSync(target, "utf8"));
-    delete meta.autoDecisionEnabled;
-    if (enabled !== undefined) meta.autoDecisionEnabled = enabled;
-    const raw = JSON.stringify(meta);
-    fs.writeFileSync(target, raw);
-    await store.releaseSession(ref);
-    const next = makeStore({ sessionsDir: store.sessionsDir }).store;
-    const resumed = await resumeSession(next, ref);
-    expect(resumed.meta.autoDecisionEnabled ?? true).toBe(enabled ?? true);
-    expect(Object.hasOwn(resumed.meta, "autoDecisionEnabled")).toBe(enabled !== undefined);
-    expect(fs.readFileSync(target, "utf8")).toBe(raw);
-    await next.releaseSession(ref);
-  });
+describe("approvalMode recovery", () => {
+  it.each([undefined, "readonly", "auto", "full"] as const)(
+    "restores %s without rewriting metadata",
+    async (mode) => {
+      const { store } = makeStore();
+      const ref = sessionRef("metadata-resume");
+      await seedSource(store, ref);
+      const target = path.join(store.sessionsDir, ref.workspaceId, ref.sessionId, "meta.json");
+      const meta = JSON.parse(fs.readFileSync(target, "utf8"));
+      delete meta.approvalMode;
+      if (mode !== undefined) meta.approvalMode = mode;
+      const raw = JSON.stringify(meta);
+      fs.writeFileSync(target, raw);
+      await store.releaseSession(ref);
+      const next = makeStore({ sessionsDir: store.sessionsDir }).store;
+      const resumed = await resumeSession(next, ref);
+      expect(resumed.meta.approvalMode ?? "auto").toBe(mode ?? "auto");
+      expect(Object.hasOwn(resumed.meta, "approvalMode")).toBe(mode !== undefined);
+      expect(fs.readFileSync(target, "utf8")).toBe(raw);
+      await next.releaseSession(ref);
+    },
+  );
 });

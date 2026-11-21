@@ -82,16 +82,16 @@ describe("V1 记录枚举与 Schema 校验", () => {
   it("合法记录通过校验；首条记录必须且仅允许首条携带 version", () => {
     const prompt = { recordSeq: 1, ts: TS, type: "user_prompt", runId: "run-1", text: "hi" };
     expect(parseSessionRecord(prompt, { expectVersion: false }).type).toBe("user_prompt");
-    expect(parseSessionRecord({ ...prompt, version: 5 }, { expectVersion: true }).recordSeq).toBe(1);
+    expect(parseSessionRecord({ ...prompt, version: 6 }, { expectVersion: true }).recordSeq).toBe(1);
     expect(() => parseSessionRecord(prompt, { expectVersion: true })).toThrow(/缺少 "version"/);
     expect(() =>
-      parseSessionRecord({ ...prompt, recordSeq: 2, version: 5 }, { expectVersion: false }),
+      parseSessionRecord({ ...prompt, recordSeq: 2, version: 6 }, { expectVersion: false }),
     ).toThrow(/仅首条记录允许/);
   });
 
   it("非法 type / status / outcome / 未知字段被拒绝", () => {
     expect(() =>
-      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 5 }, { expectVersion: true }),
+      parseSessionRecord({ recordSeq: 1, ts: TS, type: "bogus", version: 6 }, { expectVersion: true }),
     ).toThrow(RecordValidationError);
     expect(() =>
       parseSessionRecord(
@@ -325,7 +325,7 @@ it("accepts optional elapsedMs and rejects invalid audit durations", () => {
     type: "run_finished",
     recordSeq: 1,
     ts: TS,
-    version: 5,
+    version: 6,
     runId: "r",
     outcome: "completed",
     persisted: true,
@@ -346,7 +346,7 @@ describe("checkpoint usage", () => {
     type: "checkpoint",
     recordSeq: 1,
     ts: TS,
-    version: 5,
+    version: 6,
     summary: "sum",
     coveredUpTo: 3,
     model: { providerId: "p", modelId: "m" },
@@ -383,16 +383,19 @@ describe("checkpoint usage", () => {
   });
 });
 
-describe("autoDecisionEnabled metadata", () => {
-  const meta = { version: 5, sessionId: "s1", workspaceId: "ws", createdAt: TS };
-  it("preserves absence and accepts both booleans", () => {
-    expect(parseSessionMeta(meta)).not.toHaveProperty("autoDecisionEnabled");
-    for (const enabled of [true, false]) {
-      expect(parseSessionMeta({ ...meta, autoDecisionEnabled: enabled }).autoDecisionEnabled).toBe(enabled);
+describe("approvalMode metadata", () => {
+  const meta = { version: 6, sessionId: "s1", workspaceId: "ws", createdAt: TS };
+  it("preserves absence and accepts all three modes", () => {
+    expect(parseSessionMeta(meta)).not.toHaveProperty("approvalMode");
+    for (const mode of ["readonly", "auto", "full"] as const) {
+      expect(parseSessionMeta({ ...meta, approvalMode: mode }).approvalMode).toBe(mode);
     }
   });
-  it.each([null, 0, 1, "true", {}, []])("rejects non-boolean %j", (value) => {
-    expect(() => parseSessionMeta({ ...meta, autoDecisionEnabled: value })).toThrow(RecordValidationError);
+  it.each([null, 0, true, "on", "AUTO", "", {}, []])("rejects invalid mode %j", (value) => {
+    expect(() => parseSessionMeta({ ...meta, approvalMode: value })).toThrow(RecordValidationError);
+  });
+  it("rejects the removed autoDecisionEnabled key", () => {
+    expect(() => parseSessionMeta({ ...meta, autoDecisionEnabled: true })).toThrow(/未知字段/);
   });
 });
 

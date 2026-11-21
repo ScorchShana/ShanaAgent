@@ -153,12 +153,17 @@ it.each(["assistant_message", "tool_result", "run_finished"] as const)(
 
 it("retains Session grants across models and drops them on real resume", async () => {
   let selected = structuredClone(model);
-  const write = () =>
-    makeAssistantMessage([{ id: "a", name: "write", arguments: { path: "a.txt", content: "written" } }]);
+  const fake = fakeShellRun();
+  // 会话授权只剩 bash 精确命令串（D10）；git 不在 analyzer 白名单，必落人工。
+  const command = "git status";
+  const bash = () => makeAssistantMessage([{ id: "a", name: "bash", arguments: { command } }]);
   const f = await fixture(
-    [write(), makeAssistantMessage([], "done"), write(), makeAssistantMessage([], "done")],
+    [bash(), makeAssistantMessage([], "done"), bash(), makeAssistantMessage([], "done")],
     40,
-    { getModel: () => selected },
+    {
+      getModel: () => selected,
+      executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree },
+    },
   );
   let approvals = 0;
   f.controller.eventBus.subscribe((e) => {
@@ -167,13 +172,19 @@ it("retains Session grants across models and drops them on real resume", async (
       f.controller.resolveApproval(e.approvalId, "session");
     }
   });
-  await f.controller.submitPrompt("first");
+  const first = f.controller.submitPrompt("first");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(1));
+  fake.child.emit("close", 0);
+  await first;
   selected = { ...selected, id: "second" };
-  await f.controller.submitPrompt("second");
+  const second = f.controller.submitPrompt("second");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(2));
+  fake.child.emit("close", 0);
+  await second;
   expect(approvals).toBe(1);
   await f.controller.exit();
   const resumed = await resumeSession(f.store, f.ref);
-  const messages = [write(), makeAssistantMessage([], "done")];
+  const messages = [bash(), makeAssistantMessage([], "done")];
   const next = await createAgentSession({
     store: f.store,
     workspaceId: f.ref.workspaceId,
@@ -181,6 +192,7 @@ it("retains Session grants across models and drops them on real resume", async (
     workspaceRoot: f.workspaceRoot,
     getModel: () => selected,
     getSettings: () => parseSettings({}),
+    executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree },
     modelService: { streamTurn: async () => turn(messages.shift()!) },
   });
   next.controller.eventBus.subscribe((e) => {
@@ -189,8 +201,12 @@ it("retains Session grants across models and drops them on real resume", async (
       next.controller.resolveApproval(e.approvalId, "once");
     }
   });
-  await next.controller.submitPrompt("third");
+  const third = next.controller.submitPrompt("third");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(3));
+  fake.child.emit("close", 0);
+  await third;
   expect(approvals).toBe(2);
+  await next.controller.exit();
 });
 
 it.each(["terminated", "unconfirmed", "throws"] as const)(
@@ -563,14 +579,13 @@ it("freezes AGENTS.md for the whole Session", async () => {
   expect(requests).toBe(3);
 });
 
-it("exposes the fixed-overhead baseline before the first Run", async () => {
+it("exposes the full fixed-overhead estimate before the first Run", async () => {
   const f = await fixture([]);
   const settings = parseSettings({ maxTurns: 40 });
   const built = await buildContext({ records: [], workspacePath: f.workspaceRoot });
   const expected = estimateContextTokens(
     {
       ...built.context,
-      messages: [],
       tools: createToolRegistry(undefined, settings)
         .list()
         .map((tool) => ({
@@ -581,18 +596,38 @@ it("exposes the fixed-overhead baseline before the first Run", async () => {
     },
     settings.tokenEstimate,
   );
-  expect(f.controller.getSnapshot().session.contextBaselineTokens).toBe(expected);
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBe(expected);
+  expect(session.contextEstimated).toBe(true);
   expect(expected).toBeGreaterThan(0);
 });
 
-it("keeps the baseline stable when AGENTS.md changes within the Session", async () => {
+it("grows the context value with the conversation while AGENTS.md stays frozen within the Session", async () => {
   const f = await fixture([makeAssistantMessage([], "done")]);
-  const initial = f.controller.getSnapshot().session.contextBaselineTokens;
+  const initial = f.controller.getSnapshot().session.contextTokens;
   fs.writeFileSync(path.join(f.workspaceRoot, "AGENTS.md"), "x".repeat(4000));
   expect(await f.controller.submitPrompt("work")).toBe("completed");
-  const updated = f.controller.getSnapshot().session.contextBaselineTokens;
+  const updated = f.controller.getSnapshot().session.contextTokens;
   expect(initial).not.toBeNull();
-  expect(updated).toBe(initial);
+  expect(updated!).toBeGreaterThan(initial!);
+  // Session 级冻结快照：盘中新增的 AGENTS.md 不得进入上下文值（4000 字符 ≈ 1000 token，
+  // 远大于本轮 Prompt/响应增量，用上界钉住冻结语义）。
+  const settings = parseSettings({ maxTurns: 40 });
+  const withNewAgents = await buildContext({ records: [], workspacePath: f.workspaceRoot });
+  const headWithNewAgents = estimateContextTokens(
+    {
+      ...withNewAgents.context,
+      tools: createToolRegistry(undefined, settings)
+        .list()
+        .map((tool) => ({
+          name: tool.name,
+          description: tool.description,
+          parameters: tool.parameters,
+        })),
+    },
+    settings.tokenEstimate,
+  );
+  expect(updated!).toBeLessThan(headWithNewAgents);
 });
 
 it("reloads AGENTS.md after starting a new Session", async () => {
@@ -615,7 +650,9 @@ it("reloads AGENTS.md after starting a new Session", async () => {
   expect(prompts[1]).toContain("RULE_ONE");
   expect(prompts[1]).not.toContain("RULE_TWO");
   await f.controller.newSession();
-  expect(f.controller.getSnapshot().session.contextBaselineTokens).not.toBeNull();
+  const fresh = f.controller.getSnapshot().session;
+  expect(fresh.contextTokens).not.toBeNull();
+  expect(fresh.contextEstimated).toBe(true);
   await f.controller.submitPrompt("third");
   expect(prompts[2]).toContain("RULE_TWO");
 });
@@ -655,14 +692,110 @@ it("records the AGENTS.md reference without a hash", async () => {
   expect(started?.type === "run_started" ? started.agentsMd : {}).not.toHaveProperty("sha256");
 });
 
-it("leaves the baseline unavailable without a startup warning when estimation fails", async () => {
+it("leaves the context value unknown without a startup warning when estimation fails", async () => {
   const warnings: unknown[] = [];
   const f = await fixture([], 40, {
     systemPrompt: "",
     onWarning: (warning) => warnings.push(warning),
   });
-  expect(f.controller.getSnapshot().session.contextBaselineTokens).toBeNull();
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeNull();
+  expect(session.contextEstimated).toBe(false);
   expect(warnings).toEqual([]);
+});
+
+it("cancel before the first response keeps a positive estimated context", async () => {
+  // 回归：首个 Run 发出即取消，无 assistant 落盘但 run_finished{cancelled} 恒落盘。
+  // 收尾刷新必须给出含系统提示词与 Prompt 的全量估算，绝不归 0。
+  const f = await fixture([], 40, {
+    modelService: {
+      streamTurn: async () => {
+        f.controller.cancel();
+        throw new TurnError("cancelled", 1, "Run cancelled");
+      },
+    },
+  });
+  const before = f.controller.getSnapshot().session.contextTokens!;
+  expect(await f.controller.submitPrompt("first")).toBe("cancelled");
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeGreaterThan(before);
+  expect(session.contextEstimated).toBe(true);
+  const records = (await f.store.loadSession(f.ref)).records;
+  expect(records.some((record) => record.type === "assistant_message")).toBe(false);
+  expect(records.at(-1)).toMatchObject({ type: "run_finished", outcome: "cancelled" });
+});
+
+it("cancel mid-stream with a zero-usage partial never shows zero context", async () => {
+  // 回归：流式中途取消落盘的 aborted partial 携带零占位 usage（pi-ai 初始 partial /
+  // 时机 B 合成形态）。measuredPromptTokens 拒零 → 收尾刷新落入全量估算。
+  const partial = makeAssistantMessage([], "half answer");
+  partial.stopReason = "aborted";
+  partial.usage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  const f = await fixture([], 40, {
+    modelService: {
+      streamTurn: async () => {
+        f.controller.cancel();
+        throw new TurnError("cancelled", 1, "Run cancelled", partial);
+      },
+    },
+  });
+  expect(await f.controller.submitPrompt("first")).toBe("cancelled");
+  const records = (await f.store.loadSession(f.ref)).records;
+  const aborted = records.find((record) => record.type === "assistant_message");
+  expect(aborted).toMatchObject({ type: "assistant_message", message: { stopReason: "aborted" } });
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeGreaterThan(0);
+  expect(session.contextEstimated).toBe(true);
+});
+
+it("exposes the measured anchor per Turn when the response identity matches", async () => {
+  const measured = makeAssistantMessage([{ id: "a", name: "read", arguments: { path: "missing" } }]);
+  measured.provider = model.providerId;
+  measured.model = model.id;
+  measured.api = model.api;
+  measured.usage = { ...measured.usage, input: 5000, cacheRead: 1000, totalTokens: 6001 };
+  const stop = makeAssistantMessage([], "done");
+  stop.provider = model.providerId;
+  stop.model = model.id;
+  stop.api = model.api;
+  stop.usage = { ...stop.usage, input: 6500, cacheRead: 1000, totalTokens: 7501 };
+  const midRun: Array<{ tokens: number | null; estimated: boolean }> = [];
+  const f = await fixture([measured, stop], 40, {
+    modelService: {
+      streamTurn: async (options) => {
+        const session = f.controller.getSnapshot().session;
+        midRun.push({ tokens: session.contextTokens, estimated: session.contextEstimated });
+        return turn(options.context.messages.length > 1 ? stop : measured);
+      },
+    },
+  });
+  expect(await f.controller.submitPrompt("work")).toBe("completed");
+  // 第二个 Turn 请求发出前，第一个 Turn 的实测锚定已活值暴露（实测 prompt + 增量估算）。
+  expect(midRun).toHaveLength(2);
+  expect(midRun[1]!.tokens).toBeGreaterThanOrEqual(6000);
+  expect(midRun[1]!.estimated).toBe(false);
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeGreaterThanOrEqual(6000);
+  expect(session.contextEstimated).toBe(false);
+});
+
+it("resume exposes a full estimate of the restored history", async () => {
+  const f = await fixture([makeAssistantMessage([], "done")]);
+  await f.controller.submitPrompt("work");
+  const original = f.ref;
+  await f.controller.newSession();
+  const fresh = f.controller.getSnapshot().session.contextTokens!;
+  await f.controller.resumeSession(original);
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeGreaterThan(fresh);
+  expect(session.contextEstimated).toBe(true);
 });
 
 it("a result persistence failure leaves effects intact and requires confirmation on restore", async () => {
@@ -904,14 +1037,14 @@ it("cancels an active unconfirmed Shell, records interruption, and includes the 
 });
 
 it("T9 new/resume commands replace Session identity and reset grants", async () => {
-  const write = () =>
-    makeAssistantMessage([{ id: "a", name: "write", arguments: { path: "data.txt", content: "x" } }]);
-  const f = await fixture([
-    write(),
-    makeAssistantMessage([], "done"),
-    write(),
-    makeAssistantMessage([], "done"),
-  ]);
+  const fake = fakeShellRun();
+  const command = "git status";
+  const bash = () => makeAssistantMessage([{ id: "a", name: "bash", arguments: { command } }]);
+  const f = await fixture(
+    [bash(), makeAssistantMessage([], "done"), bash(), makeAssistantMessage([], "done")],
+    40,
+    { executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree } },
+  );
   let approvals = 0;
   f.controller.eventBus.subscribe((e) => {
     if (e.type === "permission.requested") {
@@ -919,12 +1052,18 @@ it("T9 new/resume commands replace Session identity and reset grants", async () 
       f.controller.resolveApproval(e.approvalId, "session");
     }
   });
-  await f.controller.submitPrompt("first");
+  const first = f.controller.submitPrompt("first");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(1));
+  fake.child.emit("close", 0);
+  await first;
   await f.controller.newSession();
   const fresh = f.controller.getSnapshot().session.ref!;
   expect(fresh).toBeNull();
   expect(await f.controller.readHistory()).toBeNull();
-  await f.controller.submitPrompt("second");
+  const second = f.controller.submitPrompt("second");
+  await vi.waitFor(() => expect(fake.spawnCalls).toHaveLength(2));
+  fake.child.emit("close", 0);
+  await second;
   expect(approvals).toBe(2);
   await f.controller.resumeSession(f.ref);
   const resumed = f.controller.getSnapshot().session.ref!;
@@ -1195,8 +1334,10 @@ it("manual compact retains the prompt and latest Turn when only one Run exists",
   const f = await compactionFixture();
   const outcome = await f.controller.compact();
   expect(outcome).toMatchObject({ status: "completed", coveredUpTo: f.boundary, path: "primary" });
-  // 压后估算写入快照，供状态栏在实测过期时立即更新。
-  expect(f.controller.getSnapshot().session.contextEstimateTokens).toBeGreaterThan(0);
+  // 压后全量刷新：无锚点落入纯估算，经快照直供状态栏。
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeGreaterThan(0);
+  expect(session.contextEstimated).toBe(true);
   expect(f.requests).toHaveLength(1);
   expect(f.requests[0]!.maxTokens).toBeUndefined();
   expect(f.requests[0]!.maxRetries).toBe(2);
@@ -1207,6 +1348,10 @@ it("manual compact retains the prompt and latest Turn when only one Run exists",
   const checkpoints = records.filter((r) => r.type === "checkpoint");
   expect(checkpoints).toHaveLength(1);
   expect(checkpoints[0]).toMatchObject({ summary: "SUMMARY", coveredUpTo: f.boundary });
+  // 手动压缩恒保留最新 Turn，边界必落在最后一条 assistant 之前：压后前缀重建不可比，
+  // Core 刷新因此落入纯估算（钉住真实几何，防回归到 coveredUpTo 判据）。
+  const lastAssistant = records.filter((r) => r.type === "assistant_message").at(-1)!;
+  expect(f.boundary).toBeLessThan(lastAssistant.recordSeq);
   expect(records.filter((r) => r.type === "user_prompt")).toHaveLength(1);
   expect(f.controller.getSnapshot().status).toEqual({ kind: "idle" });
 });
@@ -1466,9 +1611,11 @@ it("auto compacts at Run start (A) keeping the primary request prefix byte-ident
     coveredUpTo: lastSeq,
     runId: started[0]!.runId,
   });
-  const finished = finishedCompactions(f.events)[0]!;
-  expect(finished.contextTokens).toBeGreaterThan(0);
-  expect(f.controller.getSnapshot().session.contextEstimateTokens).toBe(finished.contextTokens);
+  // 估算改由 Core 快照维护，finished 事件不再携带；本 fixture 实测身份不匹配 → 纯估算口径。
+  expect(finishedCompactions(f.events)[0]).not.toHaveProperty("contextTokens");
+  const session = f.controller.getSnapshot().session;
+  expect(session.contextTokens).toBeGreaterThan(0);
+  expect(session.contextEstimated).toBe(true);
   const records = (await f.store.loadSession(f.ref)).records;
   expect(records.filter((r) => r.type === "checkpoint")).toHaveLength(1);
 });

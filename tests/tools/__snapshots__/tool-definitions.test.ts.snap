@@ -1,9 +1,8 @@
 // Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
 
-exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致 > 定义快照（name/access/description/parameters）与确认稿冻结一致 1`] = `
+exports[`V4 六工具固定 + view_image 条件注册，定义与确认稿一致 > 定义快照（name/description/parameters）与确认稿冻结一致 1`] = `
 [
   {
-    "access": "read",
     "description": "Reads text from a UTF-8 text file and returns numbered lines. Output is limited to 24000 characters. Lines longer than 2000 characters are truncated.
 Use offset and limit to read specific sections.
 ",
@@ -37,7 +36,6 @@ Use offset and limit to read specific sections.
     },
   },
   {
-    "access": "read",
     "description": "Find files matching a glob pattern. Respects \`.gitignore\` and returns one path per line, newest first. Paths are workspace-relative unless the search path is absolute. Decode display escapes before using a path in another tool call. Returns at most 200 files within a 24000-character output budget. Use \`grep\` to search file contents.
 ",
     "name": "glob",
@@ -62,7 +60,6 @@ Use offset and limit to read specific sections.
     },
   },
   {
-    "access": "read",
     "description": "Search file contents for a text or regex pattern. Returns matching lines as \`path:line: content\`. Decode display escapes before using a path in another tool call. Total output is limited to 24000 characters. Each matching line's content is limited to 500 characters. Use \`glob\` to find files by name.
 ",
     "name": "grep",
@@ -99,7 +96,6 @@ Use offset and limit to read specific sections.
     },
   },
   {
-    "access": "write",
     "description": "Create or overwrite a UTF-8 text file. Fails if the parent directory does not exist. Use edit for partial changes.
 ",
     "name": "write",
@@ -124,7 +120,6 @@ Use offset and limit to read specific sections.
     },
   },
   {
-    "access": "write",
     "description": "Replace exact text in an existing UTF-8 text file. Read the file before editing. CRLF and standalone CR are normalized to LF before matching. Use \`write\` to create a file or replace its entire contents.
 ",
     "name": "edit",
@@ -160,7 +155,6 @@ Use offset and limit to read specific sections.
     },
   },
   {
-    "access": "shell",
     "description": "Run a Bash command in the workspace root and return its exit code, stdout, and stderr. Uses Git Bash on Windows and system Bash on Linux/WSL. Use non-interactive commands. Stdout and stderr are limited to 16000 and 4000 characters respectively, preserving the beginning and end of each stream.
 ",
     "name": "bash",
@@ -187,7 +181,6 @@ Use offset and limit to read specific sections.
     },
   },
   {
-    "access": "read",
     "description": "View an image file (png, jpg, jpeg, webp) and return it as image content. Maximum 5242880 bytes.
 ",
     "name": "view_image",

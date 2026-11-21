@@ -120,8 +120,6 @@ export function bindExitSignals(
 export async function createApplication(result: BootstrapResult): Promise<TuiStore> {
   const sessions = new SessionStore({ sessionsDir: result.sessionsDir });
   const secrets = new Set(result.modelConfig.secrets);
-  if (result.decisionConfig.status === "ok")
-    for (const secret of result.decisionConfig.secrets) secrets.add(secret);
   const startupWarnings: string[] = [];
   startupWarnings.push(...collectSettingsWarnings(result.settings));
   let reportWarning = (message: string): void => {
@@ -129,8 +127,6 @@ export async function createApplication(result: BootstrapResult): Promise<TuiSto
   };
   const session = await createAgentSession({
     store: sessions,
-    decisionConfig: result.decisionConfig,
-    decisionPrompt: result.decisionPrompt,
     workspaceId: result.workspace.id,
     workspaceRoot: result.workspace.path,
     modelConfigPath: path.join(result.shanaDir, "model.json"),
@@ -150,23 +146,17 @@ export async function createApplication(result: BootstrapResult): Promise<TuiSto
     environment: `Workspace: ${result.workspace.path}\nPlatform: ${process.platform === "win32" ? "Windows (Git Bash)" : "Linux (bash)"}`,
     onWarning: (warning) => {
       const text =
-        warning.kind === "decision_fallback"
-          ? `自动决策失败（${warning.category}），转人工审批。`
-          : warning.kind === "decision_probe"
-            ? warning.category === "recovered"
-              ? "自动决策已恢复。"
-              : `自动决策已关闭：${warning.message ?? ""}`
-            : warning.kind === "temporary_file_cleanup_failed"
-              ? `未能清理临时文件：${warning.path}`
-              : warning.kind === "shell_cleanup_unconfirmed"
-                ? "Shell 终止无法确认，可能仍有子进程运行。"
-                : warning.kind === "tail_truncated"
-                  ? `Session 尾部记录不完整，已读取完整前缀：${warning.message}`
-                  : warning.kind === "compaction_failed"
-                    ? `自动压缩失败，本次继续使用原上下文：${warning.message}`
-                    : warning.kind === "agents_md_read_failed"
-                      ? `AGENTS.md 读取失败，本会话省略项目规则：${warning.path}`
-                      : "未识别的警告。";
+        warning.kind === "temporary_file_cleanup_failed"
+          ? `未能清理临时文件：${warning.path}`
+          : warning.kind === "shell_cleanup_unconfirmed"
+            ? "Shell 终止无法确认，可能仍有子进程运行。"
+            : warning.kind === "tail_truncated"
+              ? `Session 尾部记录不完整，已读取完整前缀：${warning.message}`
+              : warning.kind === "compaction_failed"
+                ? `自动压缩失败，本次继续使用原上下文：${warning.message}`
+                : warning.kind === "agents_md_read_failed"
+                  ? `AGENTS.md 读取失败，本会话省略项目规则：${warning.path}`
+                  : "未识别的警告。";
       reportWarning(text);
     },
   });

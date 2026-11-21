@@ -7,17 +7,21 @@ import {
 
 export type ToolAccessKind = "read" | "write" | "shell" | "unknown";
 
+// 审批模式的权威定义。sessions/records.ts 因层边界禁止依赖 security，
+// 使用结构同一的本地联合（SESSION_APPROVAL_MODES）自行校验。
+export type ApprovalMode = "readonly" | "auto" | "full";
+
+// D10：文件工具不再有会话授权（auto 区内写直接放行，区外写逐次人工不可豁免），
+// 会话授权只剩 bash 精确命令字符串。
 export interface SessionGrants {
-  fileTools: ReadonlySet<string>;
   shellCommands: ReadonlySet<string>;
 }
 
 export function emptySessionGrants(): SessionGrants {
-  return { fileTools: new Set<string>(), shellCommands: new Set<string>() };
+  return { shellCommands: new Set<string>() };
 }
 
-export type ApprovalGrantKey =
-  { kind: "file_tool"; toolName: string } | { kind: "shell_command"; command: string };
+export type ApprovalGrantKey = { kind: "shell_command"; command: string };
 
 export interface ApprovalRequest {
   toolCallId: string;
@@ -40,10 +44,12 @@ export interface ToolCallSubject {
 }
 
 export type PermissionVerdict =
-  | { outcome: "allow"; basis: "workspace_read" | "skills_read" | "session_grant" }
+  | {
+      outcome: "allow";
+      basis: "workspace_read" | "skills_read" | "session_grant" | "workspace_write" | "mode_full";
+    }
+  | { outcome: "deny"; reason: "denied_by_policy" }
   | { outcome: "ask"; request: ApprovalRequest };
-
-const FILE_TOOLS_WITH_GRANT = new Set(["write", "edit"]);
 
 function readFields(action: ReadToolAction) {
   return {
@@ -69,9 +75,8 @@ function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
       operation: action.operation,
       paths: [action.path.realPath],
       touchesOutsideWorkspace: !action.path.insideWorkspace,
-      grantKey: FILE_TOOLS_WITH_GRANT.has(subject.toolName)
-        ? { kind: "file_tool", toolName: subject.toolName }
-        : null,
+      // 区外写入逐次人工审批，会话授权不能豁免（I7）。
+      grantKey: null,
     };
   }
 
@@ -89,37 +94,55 @@ function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
   return { ...base, access: "unknown", paths: [], touchesOutsideWorkspace: false, grantKey: null };
 }
 
-function hasGrant(grants: SessionGrants, key: ApprovalGrantKey): boolean {
-  return key.kind === "file_tool"
-    ? grants.fileTools.has(key.toolName)
-    : grants.shellCommands.has(key.command);
-}
-
 export function withGrant(grants: SessionGrants, key: ApprovalGrantKey): SessionGrants {
-  if (key.kind === "file_tool") {
-    return { fileTools: new Set([...grants.fileTools, key.toolName]), shellCommands: grants.shellCommands };
-  }
-  return { fileTools: grants.fileTools, shellCommands: new Set([...grants.shellCommands, key.command]) };
+  return { shellCommands: new Set([...grants.shellCommands, key.command]) };
 }
 
-export function evaluatePermission(subject: ToolCallSubject, grants: SessionGrants): PermissionVerdict {
+/**
+ * 三模式判定（纯函数；bash analyzer 在 ApprovalManager 层，不在此处）。
+ * 顺序：unknown 防御 → full 放行 → readonly 非读拒绝 → read 分支 → auto 区内写放行 → bash 授权。
+ */
+export function evaluatePermission(
+  subject: ToolCallSubject,
+  grants: SessionGrants,
+  mode: ApprovalMode,
+): PermissionVerdict {
   if (!["read", "glob", "grep", "write", "edit", "bash", "view_image"].includes(subject.toolName)) {
+    // executor 已先拦 unknown，此为纵深防御：任何模式都人工。
     return {
       outcome: "ask",
       request: { ...buildApprovalRequest(subject), access: "unknown", grantKey: null },
     };
   }
-  if (!defaultNeedsApproval(subject.action)) {
-    // 含 skills 区路径的只读放行列 skills_read；纯区内仍 workspace_read。
-    const basis =
-      subject.action.type === "read" && subject.action.paths.some((target) => target.insideSkills)
+  // full 放行的是审批，不是安全校验：路径复验/UTF-8/限额/取消边界在 executor 层仍强制。
+  if (mode === "full") return { outcome: "allow", basis: "mode_full" };
+  // readonly 判据是动态真实调用对象：bash 即使运行只读命令也整体拒绝（v1 不做命令级豁免）。
+  if (mode === "readonly" && subject.action.type !== "read") {
+    return { outcome: "deny", reason: "denied_by_policy" };
+  }
+
+  if (subject.action.type === "read") {
+    if (!defaultNeedsApproval(subject.action)) {
+      // 含 skills 区路径的只读放行列 skills_read；纯区内仍 workspace_read。
+      const basis = subject.action.paths.some((target) => target.insideSkills)
         ? "skills_read"
         : "workspace_read";
-    return { outcome: "allow", basis };
+      return { outcome: "allow", basis };
+    }
+    return { outcome: "ask", request: buildApprovalRequest(subject) };
   }
-  const request = buildApprovalRequest(subject);
-  if (request.grantKey !== null && !request.touchesOutsideWorkspace && hasGrant(grants, request.grantKey)) {
-    return { outcome: "allow", basis: "session_grant" };
+
+  if (subject.action.type === "write") {
+    if (subject.action.path.insideWorkspace) return { outcome: "allow", basis: "workspace_write" };
+    return { outcome: "ask", request: buildApprovalRequest(subject) };
   }
-  return { outcome: "ask", request };
+
+  if (subject.action.type === "shell") {
+    if (grants.shellCommands.has(subject.action.command)) {
+      return { outcome: "allow", basis: "session_grant" };
+    }
+    return { outcome: "ask", request: buildApprovalRequest(subject) };
+  }
+
+  return { outcome: "ask", request: buildApprovalRequest(subject) };
 }

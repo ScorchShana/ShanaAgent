@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import fs from "node:fs";
+import path from "node:path";
 import { createAgentSession } from "../../src/core/agent-loop.js";
+import { BusyError } from "../../src/core/state.js";
 import type { ResolvedModel } from "../../src/llm/model-config-store.js";
 import type { StreamTurnOptions, TurnResult } from "../../src/llm/model-service.js";
 import { TurnError } from "../../src/llm/model-service.js";
@@ -110,13 +113,12 @@ describe("AgentLoop", () => {
       ]),
       makeAssistantMessage([], "done"),
     ]);
-    f.controller.eventBus.subscribe((e) => {
-      if (e.type === "permission.requested") f.controller.resolveApproval(e.approvalId, "deny");
-    });
+    // readonly 策略拒绝：区内 write 不再弹审批，直接 denied_by_policy。
+    await f.controller.setApprovalMode("readonly");
     await expect(f.controller.submitPrompt("task")).resolves.toBe("completed");
-    expect(
-      (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result").map((r) => r.status),
-    ).toEqual(["denied", "error"]);
+    const results = (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result");
+    expect(results.map((r) => r.status)).toEqual(["denied", "error"]);
+    expect(results[0]).toMatchObject({ content: "Error: Denied by read-only mode." });
     expect(f.requests[1]!.context.messages.map((m) => m.role)).toEqual([
       "user",
       "assistant",
@@ -559,49 +561,48 @@ it("takes the larger of started and prompted run ids", async () => {
   expect((await f.controller.listSessions())[0]?.runCount).toBe(4);
 });
 
-it("keeps blank session auto decision changes in memory and resets on new", async () => {
+it("keeps blank session mode changes in memory and resets on new", async () => {
   const { store } = makeStore();
   const { controller } = await createAgentSession({
     store,
     workspaceId: WORKSPACE_ID,
     workspaceRoot: tempDir(),
-    decisionPrompt: { status: "ok", text: "decide" },
     getModel: () => model,
     getSettings: () => parseSettings({}),
     modelService: { streamTurn: async () => turn(makeAssistantMessage([], "done")) },
   });
   try {
-    expect(await controller.getAutoDecisionStatus()).toEqual({ enabled: true, availability: "missing" });
-    await controller.setAutoDecisionEnabled(false);
-    expect(controller.getSnapshot().session.autoDecision.enabled).toBe(false);
+    expect(await controller.getApprovalMode()).toBe("auto");
+    await controller.setApprovalMode("readonly");
+    expect(controller.getSnapshot().session.approvalMode).toBe("readonly");
     const snapshot = controller.getSnapshot();
-    snapshot.session.autoDecision.enabled = true;
-    expect(controller.getSnapshot().session.autoDecision.enabled).toBe(false);
+    snapshot.session.approvalMode = "full";
+    expect(controller.getSnapshot().session.approvalMode).toBe("readonly");
     expect(await store.listSessions(WORKSPACE_ID)).toEqual([]);
     await controller.submitPrompt("hello");
     const ref = controller.getSnapshot().session.ref!;
-    expect((await store.readSessionMeta(ref)).autoDecisionEnabled).toBe(false);
+    expect((await store.readSessionMeta(ref)).approvalMode).toBe("readonly");
     await controller.newSession();
-    expect((await controller.getAutoDecisionStatus()).enabled).toBe(true);
+    expect(await controller.getApprovalMode()).toBe("auto");
     await controller.resumeSession(ref);
-    expect((await controller.getAutoDecisionStatus()).enabled).toBe(false);
+    expect(await controller.getApprovalMode()).toBe("readonly");
   } finally {
     await controller.exit();
   }
 });
 
 it.each([false, true])(
-  "reconciles failed auto decision saves (committed=%s) without false success",
+  "reconciles failed mode saves (committed=%s) without false success",
   async (committed) => {
     const f = await fixture([]);
-    const save = f.store.setAutoDecisionEnabled.bind(f.store);
-    vi.spyOn(f.store, "setAutoDecisionEnabled").mockImplementation(async (ref, enabled) => {
-      if (committed) await save(ref, enabled);
+    const save = f.store.setApprovalMode.bind(f.store);
+    vi.spyOn(f.store, "setApprovalMode").mockImplementation(async (ref, mode) => {
+      if (committed) await save(ref, mode);
       throw new Error("save failed");
     });
     try {
-      await expect(f.controller.setAutoDecisionEnabled(false)).rejects.toThrow("save failed");
-      expect(f.controller.getSnapshot().session.autoDecision.enabled).toBe(!committed);
+      await expect(f.controller.setApprovalMode("readonly")).rejects.toThrow("save failed");
+      expect(f.controller.getSnapshot().session.approvalMode).toBe(committed ? "readonly" : "auto");
       await expect(f.controller.submitPrompt("run")).resolves.toBe("failed");
     } finally {
       await f.controller.exit();
@@ -610,67 +611,16 @@ it.each([false, true])(
 );
 it("blocks new Runs only while failed save reconciliation remains unresolved", async () => {
   const f = await fixture([]);
-  vi.spyOn(f.store, "setAutoDecisionEnabled").mockRejectedValue(new Error("save failed"));
+  vi.spyOn(f.store, "setApprovalMode").mockRejectedValue(new Error("save failed"));
   const read = vi.spyOn(f.store, "readSessionMeta").mockRejectedValue(new Error("read failed"));
   try {
-    await expect(f.controller.setAutoDecisionEnabled(false)).rejects.toThrow("save failed");
+    await expect(f.controller.setApprovalMode("readonly")).rejects.toThrow("save failed");
     expect(() => f.controller.submitPrompt("run")).toThrow("reload Session metadata");
-    await expect(f.controller.getAutoDecisionStatus()).rejects.toThrow("read failed");
+    await expect(f.controller.getApprovalMode()).rejects.toThrow("read failed");
     read.mockRestore();
-    expect((await f.controller.getAutoDecisionStatus()).enabled).toBe(true);
+    expect(await f.controller.getApprovalMode()).toBe("auto");
   } finally {
     await f.controller.exit();
-  }
-});
-it("sends only the current Turn full text and write path to the decision service", async () => {
-  const { store } = makeStore();
-  const root = tempDir();
-  const message = makeAssistantMessage([
-    { id: "w", name: "write", arguments: { path: "a.txt", content: "secret content" } },
-  ]);
-  message.content.unshift(
-    { type: "text", text: "first" },
-    { type: "thinking", thinking: "private" },
-    { type: "text", text: "second" },
-  );
-  const bodies: unknown[] = [];
-  const { controller } = await createAgentSession({
-    store,
-    workspaceId: WORKSPACE_ID,
-    workspaceRoot: root,
-    getModel: () => model,
-    getSettings: () => parseSettings({ maxTurns: 1 }),
-    decisionConfig: { status: "ok", config: { base_url: "http://localhost:1" }, secrets: [] },
-    decisionPrompt: { status: "ok", text: "decide" },
-    decisionFetch: async (_url, init) => {
-      const body = JSON.parse(String(init?.body));
-      if (typeof body.state === "string")
-        return new Response(
-          JSON.stringify({ answers: { approval: { type: "choice", choice: "allow_once" } } }),
-        );
-      bodies.push(body);
-      return new Response(
-        JSON.stringify({ answers: { approval: { type: "choice", choice: "allow_once" } } }),
-      );
-    },
-    modelService: { streamTurn: async () => turn(message) },
-  });
-  try {
-    await expect(controller.submitPrompt("original task")).resolves.toBe("turn_limit");
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0]).toMatchObject({
-      state: {
-        user_task: "original task",
-        agent_intent: "first\nsecond\nok",
-        tool: "write",
-        arguments: { path: "a.txt" },
-        project_root: root,
-      },
-    });
-    expect(JSON.stringify(bodies)).not.toContain("secret content");
-    expect(JSON.stringify(bodies)).not.toContain("private");
-  } finally {
-    await controller.exit();
   }
 });
 
@@ -683,7 +633,7 @@ it.each([false, true])(
     const requested = new Promise<void>((resolve) => {
       started = resolve;
     });
-    let body: { state: Record<string, unknown> } | undefined;
+    let seenCommand: string | undefined;
     const spawnProcess = vi.fn();
     const { controller } = await createAgentSession({
       store,
@@ -691,22 +641,7 @@ it.each([false, true])(
       workspaceRoot: tempDir(),
       getModel: () => model,
       getSettings: () => parseSettings({ maxTurns: 1 }),
-      decisionConfig: { status: "ok", config: { base_url: "http://localhost:1" }, secrets: [] },
-      decisionPrompt: { status: "ok", text: "decide" },
       executorOptions: { spawnProcess },
-      decisionFetch: async (_url, init) => {
-        const parsed = JSON.parse(String(init?.body));
-        if (typeof parsed.state === "string")
-          return new Response(
-            JSON.stringify({ answers: { approval: { type: "choice", choice: "allow_once" } } }),
-          );
-        body = parsed;
-        started();
-        if (cancel) return new Promise<Response>(() => {});
-        return new Response(
-          JSON.stringify({ answers: { approval: { type: "choice", choice: "ask_user" } } }),
-        );
-      },
       modelService: {
         streamTurn: async () =>
           turn(
@@ -715,16 +650,18 @@ it.each([false, true])(
       },
     });
     const subscription = controller.subscribe((event) => {
-      if (event.type === "permission.requested") controller.resolveApproval(event.approvalId, "deny");
+      if (event.type === "permission.requested") {
+        seenCommand = controller.getSnapshot().pendingApproval?.summary?.command;
+        started();
+        if (!cancel) controller.resolveApproval(event.approvalId, "deny");
+      }
     });
     try {
       const run = controller.submitPrompt("task");
       await requested;
       if (cancel) controller.cancel();
       await expect(run).resolves.toBe(cancel ? "cancelled" : "turn_limit");
-      expect(body?.state.arguments).toEqual({ command, timeout: 123 });
-      expect(body?.state).not.toHaveProperty("resolved_paths");
-      expect(body?.state).not.toHaveProperty("touches_outside_workspace");
+      expect(seenCommand).toBe(command);
       expect(spawnProcess).not.toHaveBeenCalled();
       expect(controller.getSnapshot().pendingApproval).toBeNull();
     } finally {
@@ -734,308 +671,67 @@ it.each([false, true])(
   },
 );
 
-const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
-const approvalAnswer = { answers: { approval: { type: "choice", choice: "allow_once" } } };
-
-async function probeFixture(options: {
-  probe: (init: RequestInit | undefined) => Promise<Response>;
-  streamTurn?: (options: StreamTurnOptions) => Promise<TurnResult>;
-  maxTurns?: number;
-  ref?: ReturnType<typeof sessionRef>;
-  decision?: (init: RequestInit | undefined) => Promise<Response>;
-}) {
+it("freezes mode per Run: switches are blocked mid-Run and apply to the next Run", async () => {
   const { store } = makeStore();
   const root = tempDir();
-  const warnings: Array<Record<string, unknown>> = [];
-  const probeBodies: Array<Record<string, unknown>> = [];
-  const decisionBodies: Array<Record<string, unknown>> = [];
+  const fake = fakeShellRun();
+  const messages = [
+    makeAssistantMessage([{ id: "s", name: "bash", arguments: { command: "echo one; echo two" } }]),
+    makeAssistantMessage([{ id: "w", name: "write", arguments: { path: "a.txt", content: "x" } }]),
+    makeAssistantMessage([], "done"),
+    makeAssistantMessage([{ id: "w2", name: "write", arguments: { path: "b.txt", content: "y" } }]),
+    makeAssistantMessage([], "done"),
+  ];
   const { controller } = await createAgentSession({
     store,
     workspaceId: WORKSPACE_ID,
     workspaceRoot: root,
-    ref: options.ref,
     getModel: () => model,
-    getSettings: () => parseSettings({ maxTurns: options.maxTurns ?? 1 }),
-    decisionConfig: {
-      status: "ok",
-      config: { base_url: "http://localhost:1", model: "configured" },
-      secrets: [],
-    },
-    decisionPrompt: { status: "ok", text: "decide" },
-    decisionFetch: async (_url, init) => {
-      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      if (typeof body.state === "string") {
-        probeBodies.push(body);
-        return options.probe(init);
-      }
-      decisionBodies.push(body);
-      return options.decision ? options.decision(init) : Response.json(approvalAnswer);
-    },
-    modelService: {
-      streamTurn: options.streamTurn ?? (async () => turn(makeAssistantMessage([], "done"))),
-    },
-    onWarning: (warning) => warnings.push(warning as Record<string, unknown>),
+    getSettings: () => parseSettings({}),
+    executorOptions: { spawnProcess: fake.spawnProcess, terminateTree: fake.terminateTree },
+    modelService: { streamTurn: async () => turn(messages.shift()!) },
   });
-  return { store, root, controller, warnings, probeBodies, decisionBodies };
-}
-
-function deferredProbes() {
-  const probes: Array<{
-    resolve: (response: Response) => void;
-    promise: Promise<Response>;
-    signal: AbortSignal | undefined;
-  }> = [];
-  const probe = (init: RequestInit | undefined) => {
-    let resolve!: (response: Response) => void;
-    const promise = new Promise<Response>((r) => (resolve = r));
-    probes.push({ resolve, promise, signal: init?.signal ?? undefined });
-    return promise;
-  };
-  return { probes, probe };
-}
-
-it("disables auto decision on a confirmed name mismatch and falls back to manual approval", async () => {
-  const f = await probeFixture({
-    probe: async () => Response.json({ ...approvalAnswer, model: "served" }),
-    streamTurn: async () =>
-      turn(makeAssistantMessage([{ id: "w", name: "write", arguments: { path: "a.txt", content: "x" } }])),
-  });
-  try {
-    await vi.waitFor(() =>
-      expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("unavailable"),
-    );
-    const status = f.controller.getSnapshot().session.autoDecision;
-    expect(status.enabled).toBe(true);
-    expect(status.message).toContain("configured");
-    expect(status.message).toContain("served");
-    expect(f.warnings).toContainEqual(
-      expect.objectContaining({ kind: "decision_probe", category: "unavailable" }),
-    );
-    f.controller.subscribe((e) => {
-      if (e.type === "permission.requested") f.controller.resolveApproval(e.approvalId, "deny");
-    });
-    await expect(f.controller.submitPrompt("task")).resolves.toBe("turn_limit");
-    expect(f.decisionBodies).toHaveLength(0);
-    const ref = f.controller.getSnapshot().session.ref!;
-    expect((await f.store.readSessionMeta(ref)).autoDecisionEnabled).toBe(true);
-    const records = (await f.store.loadSession(ref)).records;
-    expect(records.find((r) => r.type === "tool_result")).toMatchObject({ status: "denied" });
-    expect(JSON.stringify(records)).not.toContain("ShanaAgent decision probe");
-  } finally {
-    await f.controller.exit();
-  }
-});
-
-it("disables auto decision when the service is not a decision model (501)", async () => {
-  const f = await probeFixture({
-    probe: async () => new Response(JSON.stringify(approvalAnswer), { status: 501 }),
-  });
-  try {
-    await vi.waitFor(() =>
-      expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("unavailable"),
-    );
-    expect(f.controller.getSnapshot().session.autoDecision.message).toBeTruthy();
-    expect(f.warnings).toContainEqual(
-      expect.objectContaining({ kind: "decision_probe", category: "unavailable" }),
-    );
-  } finally {
-    await f.controller.exit();
-  }
-});
-
-it.each([
-  ["a name match", async () => Response.json({ ...approvalAnswer, model: "configured" })],
-  ["missing response model", async () => Response.json(approvalAnswer)],
-  ["HTTP 500", async () => new Response("err", { status: 500 })],
-  [
-    "a transport error",
-    async () => {
-      throw new Error("down");
-    },
-  ],
-] as const)("keeps ready and stays silent when the probe sees %s", async (_label, probe) => {
-  const f = await probeFixture({ probe });
-  try {
-    await vi.waitFor(() => expect(f.probeBodies).toHaveLength(1));
-    await flush();
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready");
-    expect(f.warnings.filter((w) => w.kind === "decision_probe")).toHaveLength(0);
-  } finally {
-    await f.controller.exit();
-  }
-});
-
-it.each(["missing config", "invalid config", "invalid prompt", "switch off"])(
-  "skips the probe when %s",
-  async (scenario) => {
-    const { store } = makeStore();
-    const decisionFetch = vi.fn<typeof fetch>();
-    const ref = sessionRef("skip");
-    if (scenario === "switch off")
-      await store.createSession({
-        workspaceId: WORKSPACE_ID,
-        sessionId: ref.sessionId,
-        autoDecisionEnabled: false,
-      });
-    const { controller } = await createAgentSession({
-      store,
-      workspaceId: WORKSPACE_ID,
-      workspaceRoot: tempDir(),
-      ref: scenario === "switch off" ? ref : undefined,
-      getModel: () => model,
-      getSettings: () => parseSettings({}),
-      decisionConfig:
-        scenario === "missing config"
-          ? undefined
-          : scenario === "invalid config"
-            ? { status: "invalid", message: "bad" }
-            : { status: "ok", config: { base_url: "http://localhost:1" }, secrets: [] },
-      decisionPrompt:
-        scenario === "invalid prompt"
-          ? { status: "invalid", message: "bad" }
-          : { status: "ok", text: "decide" },
-      decisionFetch,
-      modelService: { streamTurn: async () => turn(makeAssistantMessage([], "done")) },
-    });
-    try {
-      await flush();
-      expect(decisionFetch).not.toHaveBeenCalled();
-      expect(controller.getSnapshot().session.autoDecision.availability).not.toBe("unavailable");
-    } finally {
-      await controller.exit();
+  let approvals = 0;
+  let pendingId: string | null = null;
+  const subscription = controller.subscribe((event) => {
+    if (event.type === "permission.requested") {
+      approvals++;
+      pendingId = event.approvalId;
     }
-  },
-);
-
-it("re-probes on /new and /resume, resetting availability optimistically", async () => {
-  const { probes, probe } = deferredProbes();
-  const f = await probeFixture({ probe });
-  try {
-    await vi.waitFor(() => expect(probes).toHaveLength(1));
-    probes[0]!.resolve(Response.json({ ...approvalAnswer, model: "served" }));
-    await vi.waitFor(() =>
-      expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("unavailable"),
-    );
-    await f.controller.newSession();
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready");
-    await vi.waitFor(() => expect(probes).toHaveLength(2));
-    expect(probes[0]!.signal?.aborted).toBe(true);
-    probes[1]!.resolve(Response.json({ ...approvalAnswer, model: "configured" }));
-    await flush();
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready");
-    expect(f.warnings.filter((w) => w.kind === "decision_probe")).toHaveLength(1);
-    const target = sessionRef("resume-target");
-    await f.store.createSession({ workspaceId: WORKSPACE_ID, sessionId: target.sessionId });
-    await f.store.appendRecord(target, { type: "user_prompt", runId: "r", text: "hello" });
-    await f.controller.resumeSession(target);
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready");
-    await vi.waitFor(() => expect(probes).toHaveLength(3));
-    probes[2]!.resolve(Response.json({ ...approvalAnswer, model: "served" }));
-    await vi.waitFor(() =>
-      expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("unavailable"),
-    );
-    expect(f.warnings.filter((w) => w.kind === "decision_probe")).toHaveLength(2);
-  } finally {
-    await f.controller.exit();
-  }
-});
-
-it("recovers auto decision via /autodecision on and notifies", async () => {
-  let probeModel = "served";
-  const f = await probeFixture({
-    probe: async () => Response.json({ ...approvalAnswer, model: probeModel }),
   });
   try {
-    await vi.waitFor(() =>
-      expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("unavailable"),
-    );
-    await f.controller.setAutoDecisionEnabled(false);
-    expect(f.controller.getSnapshot().session.autoDecision.enabled).toBe(false);
-    const probesAfterOff = f.probeBodies.length;
-    probeModel = "configured";
-    await f.controller.setAutoDecisionEnabled(true);
-    await vi.waitFor(() =>
-      expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready"),
-    );
-    expect(f.probeBodies.length).toBeGreaterThan(probesAfterOff);
-    expect(f.warnings).toContainEqual(
-      expect.objectContaining({ kind: "decision_probe", category: "recovered" }),
-    );
-  } finally {
-    await f.controller.exit();
-  }
-});
+    const first = controller.submitPrompt("first");
+    await vi.waitFor(() => expect(pendingId).not.toBeNull());
+    // 活动 Run 期间切换模式被生命周期门控拒绝；本 Run 沿用起点冻结的 auto。
+    expect(() => controller.setApprovalMode("readonly")).toThrow(BusyError);
+    controller.resolveApproval(pendingId!, "once");
+    const deadline = Date.now() + 5000;
+    while (fake.spawnCalls.length === 0 && Date.now() < deadline)
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(fake.spawnCalls).toHaveLength(1);
+    fake.child.emit("close", 0);
+    await expect(first).resolves.toBe("completed");
+    // 同一 Run 内后续区内 write 仍按冻结的 auto 直接放行。
+    expect(fs.readFileSync(path.join(root, "a.txt"), "utf8")).toBe("x");
 
-it("freezes probe availability per Run so a mid-run mismatch only affects the next Run", async () => {
-  let resolveProbe!: (response: Response) => void;
-  const probePromise = new Promise<Response>((r) => (resolveProbe = r));
-  let turns = 0;
-  const approvals: string[] = [];
-  const f = await probeFixture({
-    probe: () => probePromise,
-    streamTurn: async () => {
-      turns += 1;
-      if (turns === 1) {
-        resolveProbe(Response.json({ ...approvalAnswer, model: "served" }));
-        await flush();
-      }
-      return turn(
-        makeAssistantMessage([{ id: `w${turns}`, name: "write", arguments: { path: "a.txt", content: "x" } }]),
-      );
-    },
-  });
-  try {
-    f.controller.subscribe((e) => {
-      if (e.type === "permission.requested") {
-        approvals.push(e.approvalId);
-        f.controller.resolveApproval(e.approvalId, "deny");
-      }
+    await controller.setApprovalMode("readonly");
+    await expect(controller.submitPrompt("second")).resolves.toBe("completed");
+    expect(fs.existsSync(path.join(root, "b.txt"))).toBe(false);
+    const results = (await store.loadSession(controller.getSnapshot().session.ref!)).records.filter(
+      (r) => r.type === "tool_result",
+    );
+    expect(results.at(-1)).toMatchObject({
+      status: "denied",
+      content: "Error: Denied by read-only mode.",
     });
-    await expect(f.controller.submitPrompt("one")).resolves.toBe("turn_limit");
-    expect(approvals).toHaveLength(0);
-    expect(f.decisionBodies).toHaveLength(1);
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("unavailable");
-    await expect(f.controller.submitPrompt("two")).resolves.toBe("turn_limit");
-    expect(approvals).toHaveLength(1);
-    expect(f.decisionBodies).toHaveLength(1);
+    expect(approvals).toBe(1);
   } finally {
-    await f.controller.exit();
+    subscription.unsubscribe();
+    await controller.exit();
   }
 });
 
-it("discards a stale probe result superseded by /new", async () => {
-  const { probes, probe } = deferredProbes();
-  const f = await probeFixture({ probe });
-  try {
-    await vi.waitFor(() => expect(probes).toHaveLength(1));
-    await f.controller.newSession();
-    await vi.waitFor(() => expect(probes).toHaveLength(2));
-    expect(probes[0]!.signal?.aborted).toBe(true);
-    probes[0]!.resolve(Response.json({ ...approvalAnswer, model: "served" }));
-    await flush();
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready");
-    probes[1]!.resolve(Response.json({ ...approvalAnswer, model: "configured" }));
-    await flush();
-    expect(f.controller.getSnapshot().session.autoDecision.availability).toBe("ready");
-    expect(f.warnings.filter((w) => w.kind === "decision_probe")).toHaveLength(0);
-  } finally {
-    await f.controller.exit();
-  }
-});
-
-it("cancels an in-flight probe on exit without hanging", async () => {
-  const probes: Array<{ signal: AbortSignal | undefined }> = [];
-  const f = await probeFixture({
-    probe: (init) => {
-      probes.push({ signal: init?.signal ?? undefined });
-      return new Promise<Response>(() => {});
-    },
-  });
-  await vi.waitFor(() => expect(probes).toHaveLength(1));
-  await f.controller.exit();
-  expect(probes[0]!.signal?.aborted).toBe(true);
-});
-
+const flush = () => new Promise<void>((resolve) => setImmediate(resolve));
 it("bash 实时输出经 tool.output.delta 上总线，持久化仍为最终裁剪结果", async () => {
   const { store } = makeStore();
   const fake = fakeShellRun();
