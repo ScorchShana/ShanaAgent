@@ -521,7 +521,7 @@ it("keeps a newer approval and its selected action when an effort save finishes"
       };
     }) },
     hooks: { getSessionView: () => ({ title: null, ref: null, model, models: [model], runModel: null,
-      contextBaselineTokens: null, approvalMode: "readonly" }) },
+      contextTokens: null, contextEstimated: false, approvalMode: "readonly" }) },
   });
   vi.spyOn(core, "setReasoningEffort").mockImplementation(() => new Promise(resolve => { releaseSave = resolve; }));
   const decision = vi.spyOn(core, "resolveApproval");

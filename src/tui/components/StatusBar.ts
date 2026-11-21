@@ -6,18 +6,21 @@ import { truncateToWidth, visibleWidth, sliceByColumn } from "../framework/index
 import type {
   AssistantMessageRecord,
   RunFinishedRecord,
-  RunStartedRecord,
   SessionRecord,
 } from "../../sessions/records.js";
-import { findLatestCheckpoint } from "../../sessions/recovery.js";
 
 export interface SessionContextMetrics {
   contextTokens: number | null;
   contextWindow: number | null;
   cacheHitRate: number | null;
   speedTokPerSec: number | null;
-  /** contextTokens 为压后估算而非 Provider 实测（显示加 ~ 前缀）。 */
+  /** contextTokens 为纯估算（无可信实测锚点），显示加 ~ 前缀。 */
   contextEstimated: boolean;
+}
+
+export interface SessionUsageMetrics {
+  cacheHitRate: number | null;
+  speedTokPerSec: number | null;
 }
 
 function finiteToken(value: unknown): number | null {
@@ -26,87 +29,25 @@ function finiteToken(value: unknown): number | null {
 
 function usageOf(
   record: AssistantMessageRecord,
-): { input?: unknown; output?: unknown; cacheRead?: unknown; totalTokens?: unknown } | undefined {
+): { input?: unknown; output?: unknown; cacheRead?: unknown } | undefined {
   return record.message?.usage as
-    { input?: unknown; output?: unknown; cacheRead?: unknown; totalTokens?: unknown } | undefined;
+    { input?: unknown; output?: unknown; cacheRead?: unknown } | undefined;
 }
 
-export interface ContextMetricsFallback {
-  contextTokens: number | null;
-  contextWindow: number | null;
-}
-
+// Context 数值由 Core 单一权威值经快照直供（实测锚定优先、无实测全量估算），此处只累计
+// Cache/Speed：整段对话口径，跨 Run、跨压缩持续累加，压缩不重置。摘要请求本身也是真实
+// 请求，其用量随 checkpoint 落盘并计入同一累计（重启 / /resume 后仍完整）。
 export function sessionContextMetrics(
   records: readonly SessionRecord[],
-  fallback?: ContextMetricsFallback,
   activeRunId: string | null = null,
-  contextEstimate: number | null = null,
-): SessionContextMetrics {
+): SessionUsageMetrics {
   const finished = records.filter((record): record is RunFinishedRecord => record.type === "run_finished");
   const assistants = records.filter(
     (record): record is AssistantMessageRecord => record.type === "assistant_message",
   );
-  const lastFinished =
-    finished.length === 0
-      ? null
-      : finished.reduce((latest, record) => (record.recordSeq >= latest.recordSeq ? record : latest));
-  const activeHasAssistant =
-    activeRunId !== null && assistants.some((record) => record.runId === activeRunId);
-  const measuredRunId: string | null = activeHasAssistant ? activeRunId : (lastFinished?.runId ?? null);
-
-  // 最新 checkpoint 的 coveredUpTo 只服务于 Context：被覆盖的实测是压缩前旧值，改用压后估算。
-  // checkpoint 损坏时无法判定覆盖范围，保持实测显示，状态栏不因坏记录崩溃。
-  let coveredUpTo: number | null = null;
-  try {
-    coveredUpTo = findLatestCheckpoint(records)?.coveredUpTo ?? null;
-  } catch {
-    coveredUpTo = null;
-  }
-
-  let contextTokens: number | null;
-  let contextWindow: number | null;
-  let latestSeq = -1;
-  if (measuredRunId === null) {
-    contextWindow = finiteToken(fallback?.contextWindow);
-    if (contextWindow === null)
-      return {
-        contextTokens: null,
-        contextWindow: null,
-        cacheHitRate: null,
-        speedTokPerSec: null,
-        contextEstimated: false,
-      };
-    contextTokens = finiteToken(fallback?.contextTokens);
-  } else {
-    contextTokens = null;
-    for (const record of assistants) {
-      if (record.runId !== measuredRunId) continue;
-      if (record.recordSeq < latestSeq) continue;
-      latestSeq = record.recordSeq;
-      contextTokens = finiteToken(usageOf(record)?.totalTokens);
-    }
-    const started = records.find(
-      (record): record is RunStartedRecord => record.type === "run_started" && record.runId === measuredRunId,
-    );
-    contextWindow = finiteToken(started?.model?.contextWindow);
-  }
-
-  // 最新 checkpoint 覆盖了被测量的 assistant（或该 Run 尚无 assistant）：实测是压缩前旧值，
-  // 改用压后估算，与模型实际所见同构；新实测落盘后 recordSeq 超出覆盖范围，自动切回。
-  // checkpoint 损坏时 coveredUpTo 为 null，保持实测显示。
-  let contextEstimated = false;
-  if (contextEstimate !== null && measuredRunId !== null) {
-    if (coveredUpTo !== null && (latestSeq < 0 || coveredUpTo >= latestSeq)) {
-      contextTokens = contextEstimate;
-      contextEstimated = true;
-    }
-  }
-
   const countedRunIds = new Set(finished.map((record) => record.runId));
   if (activeRunId !== null) countedRunIds.add(activeRunId);
 
-  // Cache/Speed 是整段对话的累计口径：跨 Run、跨压缩都持续累加，压缩不重置。
-  // 摘要请求本身也是真实请求，其用量随 checkpoint 落盘并计入同一累计（重启 / /resume 后仍完整）。
   let inputSum = 0;
   let cacheReadSum = 0;
   let cacheComplete = true;
@@ -154,16 +95,14 @@ export function sessionContextMetrics(
 
   const denominator = inputSum + cacheReadSum;
   return {
-    contextTokens,
-    contextWindow,
     cacheHitRate: cacheComplete && denominator > 0 ? cacheReadSum / denominator : null,
     speedTokPerSec: durationMsSum > 0 ? outputSum / (durationMsSum / 1000) : null,
-    contextEstimated,
   };
 }
 
 function formatTokens(value: number | null, forceDecimal: boolean): string {
-  if (value === null) return "0";
+  // 未知不能伪装成零。
+  if (value === null) return "—";
   if (value < 1000) return String(value);
   const thousands = value / 1000;
   if (forceDecimal || !Number.isInteger(thousands)) return `${thousands.toFixed(1)}k`;
@@ -243,17 +182,16 @@ export class StatusBar implements Component {
       this.refreshKey = `${state.history?.meta.sessionId ?? ""}:${activeRunId ?? "idle"}:${seq}:${checkpointSeq}`;
     }
     const contextWindow = (state.core.session.runModel ?? state.core.session.model)?.contextWindow ?? null;
-    const contextTokens = state.core.session.contextBaselineTokens;
-    const contextEstimate = state.core.session.contextEstimateTokens;
-    const key = JSON.stringify([this.refreshKey, contextWindow, contextTokens, contextEstimate]);
+    const { contextTokens, contextEstimated } = state.core.session;
+    const key = JSON.stringify([this.refreshKey, contextWindow, contextTokens, contextEstimated]);
     if (key !== this.metricsKey) {
       this.metricsKey = key;
-      this.metrics = sessionContextMetrics(
-        state.history?.records ?? [],
-        contextWindow === null ? undefined : { contextWindow, contextTokens },
-        activeRunId,
-        contextEstimate,
-      );
+      this.metrics = {
+        contextTokens,
+        contextWindow,
+        contextEstimated,
+        ...sessionContextMetrics(state.history?.records ?? [], activeRunId),
+      };
     }
   }
   invalidate(): void {}

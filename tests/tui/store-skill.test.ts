@@ -48,7 +48,7 @@ function skillController(options: {
         },
         models: [],
         runModel: null,
-        contextBaselineTokens: null,
+        contextTokens: null, contextEstimated: false,
         approvalMode: "auto",
       }),
     },

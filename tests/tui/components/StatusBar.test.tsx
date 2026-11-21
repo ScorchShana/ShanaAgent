@@ -11,7 +11,7 @@ import type {
   SessionRunOutcome,
   StoredAssistantMessage,
 } from "../../../src/sessions/records.js";
-import { StatusBar, sessionContextMetrics, contextSegment, formatWorkspacePath } from "../../../src/tui/components/StatusBar.js";
+import { StatusBar, sessionContextMetrics, contextSegment } from "../../../src/tui/components/StatusBar.js";
 import { TuiStore, type TuiState } from "../../../src/tui/store.js";
 import { makeAssistantMessage, makeModelSnapshot } from "../../sessions/helpers.js";
 const stores: TuiStore[] = [];
@@ -96,12 +96,14 @@ function render(value: { state: TuiState; width: number }) {
     unmount: () => {},
   };
 }
+// Context 三字段由 Core 经快照直供；测试以 options 模拟 Core 的维护结果。
 function stateWith(
   records: SessionRecord[],
   options: {
     sessionId?: string;
     model?: RunModelSnapshot | null;
-    baseline?: number | null;
+    contextTokens?: number | null;
+    contextEstimated?: boolean;
     status?: ControllerStatus;
   } = {},
 ): TuiState {
@@ -117,7 +119,8 @@ function stateWith(
           model: options.model === undefined ? makeModelSnapshot() : options.model,
           models: [],
           runModel: null,
-          contextBaselineTokens: options.baseline ?? null,
+          contextTokens: options.contextTokens ?? null,
+          contextEstimated: options.contextEstimated ?? false,
         }),
       },
     }),
@@ -136,87 +139,75 @@ function stateWith(
     },
   };
 }
-it("returns no metrics for an empty history or for runs that have not finished", () => {
-  expect(sessionContextMetrics([])).toEqual({
-    contextTokens: null,
-    contextWindow: null,
-    cacheHitRate: null,
-    speedTokPerSec: null,
-    contextEstimated: false,
-  });
+function contextMetrics(
+  contextTokens: number | null,
+  contextWindow: number | null,
+  contextEstimated = false,
+) {
+  return { contextTokens, contextWindow, contextEstimated, cacheHitRate: null, speedTokPerSec: null };
+}
+it("returns no usage metrics for an empty history or for runs that have not finished", () => {
+  expect(sessionContextMetrics([])).toEqual({ cacheHitRate: null, speedTokPerSec: null });
   expect(sessionContextMetrics([started(1, "r1"), assistant(2, "r1", 100, 50)])).toEqual({
-    contextTokens: null,
-    contextWindow: null,
     cacheHitRate: null,
     speedTokPerSec: null,
-    contextEstimated: false,
   });
   const view = render(wideStatus(stateWith([], { model: null })));
-  expect(view.lastFrame()).toContain("Context: 0 / 0 · Speed: — · Cache: 0.0%");
+  expect(view.lastFrame()).toContain("Context: — / — · Speed: — · Cache: 0.0%");
   expect((view.lastFrame() ?? "").split("\n")).toHaveLength(2);
   view.unmount();
 });
-it("shows the fixed-overhead estimate against the current model window before the first finished run", () => {
-  const view = render(wideStatus(stateWith([], { baseline: 3941 })));
-  expect(view.lastFrame()).toContain("Context: 3.9k / 128k · Speed: — · Cache: 0.0%");
+it("displays the Core context value and estimate flag from the snapshot", () => {
+  const view = render(wideStatus(stateWith([], { contextTokens: 3941, contextEstimated: true })));
+  expect(view.lastFrame()).toContain("Context: ~3.9k / 128k · Speed: — · Cache: 0.0%");
   view.rerender(
     wideStatus(
       stateWith([], {
-        baseline: 3941,
+        contextTokens: 3941,
+        contextEstimated: true,
         model: { ...makeModelSnapshot(), contextWindow: 256000 },
       }),
     ),
   );
-  expect(view.lastFrame()).toContain("Context: 3.9k / 256k · Speed: — · Cache: 0.0%");
-  view.rerender(wideStatus(stateWith([], { baseline: null })));
-  expect(view.lastFrame()).toContain("Context: 0 / 128k · Speed: — · Cache: 0.0%");
+  expect(view.lastFrame()).toContain("Context: ~3.9k / 256k · Speed: — · Cache: 0.0%");
+  view.rerender(wideStatus(stateWith([], { contextTokens: null })));
+  expect(view.lastFrame()).toContain("Context: — / 128k · Speed: — · Cache: 0.0%");
   view.unmount();
 });
-it("uses the estimate for an active first run and real usage after it finishes", () => {
-  const active = [started(1, "r1", 256000), assistant(2, "r1", 300, 0, 2000)];
-  const view = render(wideStatus(stateWith(active, { baseline: 3941 })));
-  expect(view.lastFrame()).toContain("Context: 3.9k / 128k · Speed: — · Cache: 0.0%");
-  view.rerender(wideStatus(stateWith([...active, finished(3, "r1")], { baseline: 3941 })));
-  expect(view.lastFrame()).toContain("Context: 2.0k / 256k · Speed: — · Cache: 0.0%");
-  view.unmount();
-});
-it("keeps real metrics when the estimate or current model window changes after a finished run", () => {
-  const records = [started(1, "r1", 128000), assistant(2, "r1", 100, 40, 1500), finished(3, "r1")];
-  const view = render(wideStatus(stateWith(records, { baseline: 3941 })));
-  expect(view.lastFrame()).toContain("Context: 1.5k / 128k · Speed: — · Cache: 28.6%");
+it("follows the Core value transition from estimate to measured across a run", () => {
+  const active = [started(1, "r1", 256000)];
+  const view = render(
+    wideStatus(stateWith(active, { contextTokens: 3941, contextEstimated: true, status: running("r1") })),
+  );
+  expect(view.lastFrame()).toContain("Context: ~3.9k / 128k · Speed: — · Cache: 0.0%");
   view.rerender(
     wideStatus(
-      stateWith(records, {
-        baseline: 9000,
-        model: { ...makeModelSnapshot(), contextWindow: 512000 },
+      stateWith([...active, assistant(2, "r1", 300, 0, 2000), finished(3, "r1")], {
+        contextTokens: 2000,
+        model: { ...makeModelSnapshot(), contextWindow: 256000 },
       }),
     ),
   );
-  expect(view.lastFrame()).toContain("Context: 1.5k / 128k · Speed: — · Cache: 28.6%");
+  expect(view.lastFrame()).toContain("Context: 2.0k / 256k · Speed: — · Cache: 0.0%");
   view.unmount();
 });
-it("takes the latest request totalTokens within the most recently finished run", () => {
+it("cumulates cache across assistants of a finished run", () => {
   const metrics = sessionContextMetrics([
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 40, 1000),
     assistant(3, "r1", 200, 60, 2000),
     finished(4, "r1"),
   ]);
-  expect(metrics.contextTokens).toBe(2000);
-  expect(metrics.contextWindow).toBe(128000);
   expect(metrics.cacheHitRate).toBeCloseTo(100 / 400);
 });
 it("keeps Cache and Speed cumulative at a checkpoint without usage", () => {
   const records = [started(1, "r1", 128000), assistant(2, "r1", 100, 50, 1000), finished(3, "r1")];
   const metrics = sessionContextMetrics([...records, checkpoint(4, 2)]);
-  expect(metrics.contextTokens).toBe(1000);
-  expect(metrics.contextWindow).toBe(128000);
   // 压缩不重置 Cache：checkpoint 自己没带 usage 时，累计只来自 assistant。
   expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
   expect(metrics.speedTokPerSec).toBeNull();
-  expect(metrics.contextEstimated).toBe(false);
 });
-it("keeps earlier runs out of the context value while the hit rate still spans runs of the same era", () => {
+it("spans the hit rate across every finished run of the conversation", () => {
   const metrics = sessionContextMetrics([
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 50, 1000),
@@ -225,8 +216,6 @@ it("keeps earlier runs out of the context value while the hit rate still spans r
     assistant(5, "r2", 300, 30, 2000),
     finished(6, "r2"),
   ]);
-  expect(metrics.contextTokens).toBe(2000);
-  expect(metrics.contextWindow).toBe(256000);
   expect(metrics.cacheHitRate).toBeCloseTo(80 / 480);
 });
 it("counts cancelled, failed and turn-limited runs alike", () => {
@@ -241,11 +230,9 @@ it("counts cancelled, failed and turn-limited runs alike", () => {
     assistant(8, "r3", 10, 0, 300),
     finished(9, "r3", "turn_limit"),
   ]);
-  expect(metrics.contextTokens).toBe(300);
-  expect(metrics.contextWindow).toBe(300000);
   expect(metrics.cacheHitRate).toBeCloseTo(10 / 40);
 });
-it("measures the active run when given its id and ignores it otherwise", () => {
+it("includes the active run only when its id is given", () => {
   const records = [
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 50, 1000),
@@ -253,16 +240,10 @@ it("measures the active run when given its id and ignores it otherwise", () => {
     started(4, "r2", 512000),
     assistant(5, "r2", 9999, 9999, 99999),
   ];
-  const idle = sessionContextMetrics(records);
-  expect(idle.contextTokens).toBe(1000);
-  expect(idle.contextWindow).toBe(128000);
-  expect(idle.cacheHitRate).toBeCloseTo(1 / 3);
-  const active = sessionContextMetrics(records, undefined, "r2");
-  expect(active.contextTokens).toBe(99999);
-  expect(active.contextWindow).toBe(512000);
-  expect(active.cacheHitRate).toBeCloseTo(10049 / 20148);
+  expect(sessionContextMetrics(records).cacheHitRate).toBeCloseTo(1 / 3);
+  expect(sessionContextMetrics(records, "r2").cacheHitRate).toBeCloseTo(10049 / 20148);
 });
-it("falls back only the context value when the latest finished run has no assistant message", () => {
+it("counts assistants of earlier runs when the latest finished run has none", () => {
   const metrics = sessionContextMetrics([
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 50, 1000),
@@ -270,8 +251,6 @@ it("falls back only the context value when the latest finished run has no assist
     started(4, "r2", 256000),
     finished(5, "r2"),
   ]);
-  expect(metrics.contextTokens).toBeNull();
-  expect(metrics.contextWindow).toBe(256000);
   expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
 });
 it("keeps the hit rate at or below 100 percent when cacheRead exceeds input", () => {
@@ -295,40 +274,31 @@ it("keeps the hit rate at or below 100 percent when cacheRead exceeds input", ()
   expect(zeroView.lastFrame()).toContain("Cache: 0.0%");
   zeroView.unmount();
 });
-it("formats k units, decimals and small token values", () => {
+it("formats k units, decimals, small values and unknown", () => {
   const cases: Array<{
-    total: number;
-    window: number;
+    total: number | null;
+    window: number | null;
+    estimated?: boolean;
     expected: string;
   }> = [
     { total: 12345, window: 128000, expected: "Context: 12.3k / 128k" },
     { total: 128000, window: 65536, expected: "Context: 128.0k / 65.5k" },
     { total: 500, window: 999, expected: "Context: 500 / 999" },
     { total: 0, window: 0, expected: "Context: 0 / 0" },
+    { total: null, window: 128000, expected: "Context: — / 128k" },
+    { total: null, window: null, expected: "Context: — / —" },
+    { total: 52000, window: 128000, estimated: true, expected: "Context: ~52.0k / 128k" },
   ];
-  for (const { total, window, expected } of cases) {
-    const records = [started(1, "r1", window), assistant(2, "r1", 100, 0, total), finished(3, "r1")];
-    const view = render(wideStatus(stateWith(records)));
-    expect(view.lastFrame()).toContain(expected);
-    view.unmount();
+  for (const { total, window, estimated, expected } of cases) {
+    expect(contextSegment(contextMetrics(total, window, estimated))).toBe(expected);
   }
 });
-it("falls back to zero when snapshots, usage or numbers are missing", () => {
-  const missingWindow = sessionContextMetrics([assistant(1, "r1", 100, 50, 1000), finished(2, "r1")]);
-  expect(missingWindow.contextWindow).toBeNull();
-  expect(missingWindow.contextTokens).toBe(1000);
-  const invalidWindow = sessionContextMetrics([
-    started(1, "r1", Number.NaN),
-    assistant(2, "r1", 100, 50, 1000),
-    finished(3, "r1"),
-  ]);
-  expect(invalidWindow.contextWindow).toBeNull();
+it("ignores unusable usage fields in Cache and shows — for unknown context", () => {
   const missingUsage = sessionContextMetrics([
     started(1, "r1"),
     assistantWithUsage(2, "r1", undefined),
     finished(3, "r1"),
   ]);
-  expect(missingUsage.contextTokens).toBeNull();
   expect(missingUsage.cacheHitRate).toBeNull();
   const invalidUsage = sessionContextMetrics([
     started(1, "r1"),
@@ -336,19 +306,17 @@ it("falls back to zero when snapshots, usage or numbers are missing", () => {
     assistantWithUsage(3, "r1", { input: Number.NaN, cacheRead: 10, totalTokens: 100 }),
     finished(4, "r1"),
   ]);
-  expect(invalidUsage.contextTokens).toBe(100);
   expect(invalidUsage.cacheHitRate).toBeNull();
   const missingTotal = sessionContextMetrics([
     started(1, "r1"),
     assistantWithUsage(2, "r1", { input: 100, cacheRead: 50 }),
     finished(3, "r1"),
   ]);
-  expect(missingTotal.contextTokens).toBeNull();
   expect(missingTotal.cacheHitRate).toBeCloseTo(50 / 150);
   const view = render(
     wideStatus(stateWith([started(1, "r1"), assistantWithUsage(2, "r1", undefined), finished(3, "r1")])),
   );
-  expect(view.lastFrame()).toContain("Context: 0 / 128k · Speed: — · Cache: 0.0%");
+  expect(view.lastFrame()).toContain("Context: — / 128k · Speed: — · Cache: 0.0%");
   view.unmount();
 });
 it("keeps the five status variants, drops the two hints and renders one line", () => {
@@ -358,7 +326,7 @@ it("keeps the five status variants, drops the two hints and renders one line", (
   expect(frame()).not.toContain("Ctrl+C");
   expect(frame()).not.toContain("/effort 强度");
   expect(frame()).not.toContain("PgUp/PgDn 历史");
-  expect(frame()).toContain("Context: 0 / 128k · Speed: — · Cache: 0.0%");
+  expect(frame()).toContain("Context: — / 128k · Speed: — · Cache: 0.0%");
   expect(frame().split("\n")).toHaveLength(2);
   view.rerender(
     wideStatus({ ...base, core: { ...base.core, session: { ...base.core.session, model: null } } }),
@@ -375,67 +343,124 @@ it("keeps the five status variants, drops the two hints and renders one line", (
   expect(frame()).not.toContain("草稿（运行中不提交）");
   view.unmount();
 });
-it("refreshes metrics after every committed turn during an active run", () => {
+it("refreshes the context value after every committed turn during an active run", () => {
   const records: SessionRecord[] = [
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 40, 1500),
     finished(3, "r1"),
   ];
-  const view = render(wideStatus(stateWith(records)));
+  const view = render(wideStatus(stateWith(records, { contextTokens: 1500 })));
   expect(view.lastFrame()).toContain("Context: 1.5k / 128k · Speed: — · Cache: 28.6%");
   const active = [...records, started(4, "r2", 512000)];
-  view.rerender(wideStatus(stateWith(active, { status: running("r2") })));
+  view.rerender(wideStatus(stateWith(active, { contextTokens: 1500, status: running("r2") })));
   expect(view.lastFrame()).toContain("Context: 1.5k / 128k · Speed: — · Cache: 28.6%");
   const firstTurn = [...active, assistant(5, "r2", 300, 30, 2000)];
-  view.rerender(wideStatus(stateWith(firstTurn, { status: running("r2") })));
+  view.rerender(
+    wideStatus(
+      stateWith(firstTurn, {
+        contextTokens: 2000,
+        model: { ...makeModelSnapshot(), contextWindow: 512000 },
+        status: running("r2"),
+      }),
+    ),
+  );
   expect(view.lastFrame()).toContain("Context: 2.0k / 512k · Speed: — · Cache: 14.9%");
-  view.rerender(wideStatus(stateWith([...firstTurn, finished(6, "r2")])));
+  view.rerender(
+    wideStatus(
+      stateWith([...firstTurn, finished(6, "r2")], {
+        contextTokens: 2000,
+        model: { ...makeModelSnapshot(), contextWindow: 512000 },
+      }),
+    ),
+  );
   expect(view.lastFrame()).toContain("Context: 2.0k / 512k · Speed: — · Cache: 14.9%");
   view.unmount();
 });
-it("keeps the previous metrics on a mid-stream cancel and falls back after the cancelled run finishes", () => {
+it("never shows zero after a cancelled run with no assistant", () => {
+  // 回归：首个 Run 发出即取消，无 assistant 落盘。Core 收尾刷新给出含系统提示词的估算，
+  // 状态栏直显 ~ 估算，绝不因"选不出实测"渲染 0。
   const finishedRun = [started(1, "r1", 128000), assistant(2, "r1", 100, 40, 1500), finished(3, "r1")];
   const view = render(
-    wideStatus(stateWith([...finishedRun, started(4, "r2", 512000)], { status: running("r2") })),
+    wideStatus(
+      stateWith([...finishedRun, started(4, "r2", 512000)], {
+        contextTokens: 1500,
+        status: running("r2"),
+      }),
+    ),
   );
   expect(view.lastFrame()).toContain("Context: 1.5k / 128k · Speed: — · Cache: 28.6%");
   view.rerender(
-    wideStatus(stateWith([...finishedRun, started(4, "r2", 512000), finished(5, "r2", "cancelled")])),
+    wideStatus(
+      stateWith([...finishedRun, started(4, "r2", 512000), finished(5, "r2", "cancelled")], {
+        contextTokens: 4200,
+        contextEstimated: true,
+      }),
+    ),
   );
-  expect(view.lastFrame()).toContain("Context: 0 / 512k · Speed: — · Cache: 28.6%");
+  expect(view.lastFrame()).toContain("Context: ~4.2k / 128k · Speed: — · Cache: 28.6%");
+  expect(view.lastFrame()).not.toContain("Context: 0");
+  view.unmount();
+});
+it("shows the estimate, not zero, when a cancelled run persists a zero-usage partial", () => {
+  // 回归：流式中途取消落盘的 aborted partial 携带零占位 usage（pi-ai 初始 partial /
+  // 时机 B 合成）。Core 拒零后回退估算，状态栏不再把 0 当实测。
+  const zeroUsage = {
+    input: 0,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+  const records = [
+    started(1, "r1", 128000),
+    assistantWithUsage(2, "r1", zeroUsage),
+    finished(3, "r1", "cancelled"),
+  ];
+  const view = render(wideStatus(stateWith(records, { contextTokens: 5200, contextEstimated: true })));
+  expect(view.lastFrame()).toContain("Context: ~5.2k / 128k");
+  expect(view.lastFrame()).not.toContain("Context: 0");
   view.unmount();
 });
 it("keeps a committed turn of a tool-batch cancel once the run finishes", () => {
   const active = [started(1, "r1", 128000), assistant(2, "r1", 300, 30, 2000)];
-  const view = render(wideStatus(stateWith(active, { status: running("r1") })));
+  const view = render(wideStatus(stateWith(active, { contextTokens: 2000, status: running("r1") })));
   expect(view.lastFrame()).toContain("Context: 2.0k / 128k · Speed: — · Cache: 9.1%");
-  view.rerender(wideStatus(stateWith([...active, finished(3, "r1", "cancelled")])));
+  view.rerender(wideStatus(stateWith([...active, finished(3, "r1", "cancelled")], { contextTokens: 2000 })));
   expect(view.lastFrame()).toContain("Context: 2.0k / 128k · Speed: — · Cache: 9.1%");
   view.unmount();
 });
 it("keeps Cache for the active run when a checkpoint covers its measured assistant", () => {
   const active: SessionRecord[] = [started(1, "r1", 128000), assistant(2, "r1", 100, 50, 1000)];
-  const metrics = sessionContextMetrics([...active, checkpoint(3, 2)], undefined, "r1");
-  expect(metrics.contextTokens).toBe(1000);
+  const metrics = sessionContextMetrics([...active, checkpoint(3, 2)], "r1");
   expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
 });
-it("shows the post-compaction estimate when the checkpoint covers the measured assistant", () => {
+it("renders the post-compaction estimate from the snapshot with a ~ prefix", () => {
+  // 手动 /compact 的真实几何：恒保留最新 Turn，coveredUpTo 严格小于最后一条 assistant。
+  // Context 取值已归 Core，checkpoint 几何不再影响状态栏选值。
   const records: SessionRecord[] = [
     started(1, "r1", 128000),
-    assistant(2, "r1", 100, 50, 230000),
-    finished(3, "r1"),
-    checkpoint(4, 2),
+    assistant(2, "r1", 100, 50, 200000),
+    assistant(3, "r1", 100, 50, 230000),
+    finished(4, "r1"),
+    checkpoint(5, 2),
   ];
-  const metrics = sessionContextMetrics(records, undefined, null, 52000);
-  expect(metrics.contextTokens).toBe(52000);
-  expect(metrics.contextEstimated).toBe(true);
-  expect(contextSegment(metrics)).toBe("Context: ~52.0k / 128k");
-  // 无估算值时保持实测（旧行为不回退）。
-  const withoutEstimate = sessionContextMetrics(records);
-  expect(withoutEstimate.contextTokens).toBe(230000);
-  expect(withoutEstimate.contextEstimated).toBe(false);
+  const view = render(wideStatus(stateWith(records, { contextTokens: 52000, contextEstimated: true })));
+  expect(view.lastFrame()).toContain("Context: ~52.0k / 128k");
+  // 压后首个 Run 进行中同样直显估算。
+  view.rerender(
+    wideStatus(
+      stateWith([...records, started(6, "r2", 128000)], {
+        contextTokens: 52000,
+        contextEstimated: true,
+        status: running("r2"),
+      }),
+    ),
+  );
+  expect(view.lastFrame()).toContain("Context: ~52.0k / 128k");
+  view.unmount();
 });
-it("switches back to real usage once a post-compaction assistant is committed", () => {
+it("switches back to measured display once Core re-anchors after compaction", () => {
   const records: SessionRecord[] = [
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 50, 230000),
@@ -445,11 +470,13 @@ it("switches back to real usage once a post-compaction assistant is committed", 
     assistant(6, "r2", 40000, 10000, 55000),
     finished(7, "r2"),
   ];
-  const metrics = sessionContextMetrics(records, undefined, null, 52000);
-  expect(metrics.contextTokens).toBe(55000);
-  expect(metrics.contextEstimated).toBe(false);
+  const view = render(wideStatus(stateWith(records, { contextTokens: 52000, contextEstimated: true })));
+  expect(view.lastFrame()).toContain("Context: ~52.0k / 128k");
+  view.rerender(wideStatus(stateWith(records, { contextTokens: 55000 })));
+  expect(view.lastFrame()).toContain("Context: 55.0k / 128k");
   // Cache 是整段对话累计：压缩前的 assistant(2) 与压后 assistant(6) 都计入。
-  expect(metrics.cacheHitRate).toBeCloseTo(10050 / 50150);
+  expect(view.lastFrame()).toContain("Cache: 20.0%");
+  view.unmount();
 });
 it("recomputes metrics when a checkpoint with usage is appended", () => {
   const records = [
@@ -469,50 +496,18 @@ it("recomputes metrics when a checkpoint with usage is appended", () => {
   expect(view.lastFrame()).toContain("Cache: 9.1%");
   view.unmount();
 });
-it("shows the estimate during the first post-compaction request of an active run", () => {
-  const records: SessionRecord[] = [
-    started(1, "r1", 128000),
-    assistant(2, "r1", 100, 50, 230000),
-    finished(3, "r1"),
-    checkpoint(4, 2),
-    started(5, "r2", 128000),
-  ];
-  const metrics = sessionContextMetrics(records, undefined, "r2", 52000);
-  expect(metrics.contextTokens).toBe(52000);
-  expect(metrics.contextEstimated).toBe(true);
-});
-it("renders the estimate from the controller snapshot with a ~ prefix", () => {
-  const records: SessionRecord[] = [
-    started(1, "r1", 128000),
-    assistant(2, "r1", 100, 50, 230000),
-    finished(3, "r1"),
-    checkpoint(4, 2),
-  ];
-  const base = stateWith(records);
-  const view = render(
-    wideStatus({
-      ...base,
-      core: {
-        ...base.core,
-        session: { ...base.core.session, contextEstimateTokens: 52000 },
-      },
-    }),
-  );
-  expect(view.lastFrame()).toContain("Context: ~52.0k / 128k");
-  view.unmount();
-});
-it("keeps real usage without crashing when the checkpoint is invalid", () => {
+it("ignores invalid checkpoint records without crashing", () => {
   const records: SessionRecord[] = [
     started(1, "r1", 128000),
     assistant(2, "r1", 100, 50, 230000),
     finished(3, "r1"),
     checkpoint(4, 3),
   ];
-  const metrics = sessionContextMetrics(records, undefined, null, 52000);
-  expect(metrics.contextTokens).toBe(230000);
-  expect(metrics.contextEstimated).toBe(false);
-  // Cache/Speed 不依赖 checkpoint 边界；坏记录只影响 Context 的实测/估算切换。
-  expect(metrics.cacheHitRate).toBeCloseTo(50 / 150);
+  const view = render(wideStatus(stateWith(records, { contextTokens: 230000 })));
+  expect(view.lastFrame()).toContain("Context: 230.0k / 128k");
+  // Cache/Speed 不依赖 checkpoint 边界；坏记录只被忽略。
+  expect(view.lastFrame()).toContain("Cache: 33.3%");
+  view.unmount();
 });
 it("counts checkpoint usage on top of every assistant in Cache and Speed", () => {
   const records: SessionRecord[] = [
@@ -526,7 +521,6 @@ it("counts checkpoint usage on top of every assistant in Cache and Speed", () =>
     finished(8, "r2"),
   ];
   const metrics = sessionContextMetrics(records);
-  expect(metrics.contextTokens).toBe(2000);
   // Cache：(50 + 0 + 30 + 400) / (100 + 100 + 300 + 50 + 0 + 30 + 600 + 400)。
   expect(metrics.cacheHitRate).toBeCloseTo(480 / 1580);
   // Speed：(80 + 200) / (1275 + 2000)。
@@ -589,17 +583,11 @@ it("renders non-zero Cache and Speed after a compaction", () => {
   expect(view.lastFrame()).toContain("Speed: 47 tok/s");
   view.unmount();
 });
-it("uses real usage and cache for an active run without any finished run", () => {
-  const metrics = sessionContextMetrics(
-    [started(1, "r1", 256000), assistant(2, "r1", 100, 50, 1500)],
-    { contextTokens: 3941, contextWindow: 128000 },
-    "r1",
-  );
-  expect(metrics.contextTokens).toBe(1500);
-  expect(metrics.contextWindow).toBe(256000);
+it("counts the active run without any finished run", () => {
+  const metrics = sessionContextMetrics([started(1, "r1", 256000), assistant(2, "r1", 100, 50, 1500)], "r1");
   expect(metrics.cacheHitRate).toBeCloseTo(1 / 3);
 });
-it("shows zero instead of carrying an earlier run when the active run's usage is invalid", () => {
+it("counts valid usage fields of the active run even without totalTokens", () => {
   const metrics = sessionContextMetrics(
     [
       started(1, "r1", 128000),
@@ -608,11 +596,8 @@ it("shows zero instead of carrying an earlier run when the active run's usage is
       started(4, "r2", 512000),
       assistantWithUsage(5, "r2", { input: 10, cacheRead: 5 }),
     ],
-    undefined,
     "r2",
   );
-  expect(metrics.contextTokens).toBeNull();
-  expect(metrics.contextWindow).toBe(512000);
   expect(metrics.cacheHitRate).toBeCloseTo(55 / 165);
 });
 it("truncates the single line in a narrow frame without adding rows", () => {
@@ -632,14 +617,13 @@ it("derives speed from output and request duration", () => {
   ]);
   expect(metrics.speedTokPerSec).toBeCloseTo(80 / 1.275);
 });
-it("sums speed across the run while context still takes the latest record", () => {
+it("sums speed across the run", () => {
   const metrics = sessionContextMetrics([
     started(1, "r1", 128000),
     timedAssistant(2, "r1", 80, 1275),
     assistant(3, "r1", 100, 40, 2000),
     finished(4, "r1"),
   ]);
-  expect(metrics.contextTokens).toBe(2000);
   expect(metrics.speedTokPerSec).toBeCloseTo(80 / 1.275);
 });
 it("weights the run average by duration instead of averaging turn speeds", () => {
@@ -694,7 +678,6 @@ it("weights every run of the conversation into the average", () => {
       timedAssistant(6, "r2", 50, 1000),
       timedAssistant(7, "r2", 30, 1000),
     ],
-    undefined,
     "r2",
   );
   expect(metrics.speedTokPerSec).toBeCloseTo(260 / 4.35);
@@ -718,11 +701,10 @@ it("dilutes the conversation average with a new turn of the active run", () => {
     timedAssistant(3, "r1", 100, 1075),
     finished(4, "r1"),
   ];
-  const before = sessionContextMetrics([...records, started(5, "r2", 512000)], undefined, "r2");
+  const before = sessionContextMetrics([...records, started(5, "r2", 512000)], "r2");
   expect(before.speedTokPerSec).toBeCloseTo(180 / 2.35);
   const after = sessionContextMetrics(
     [...records, started(5, "r2", 512000), timedAssistant(6, "r2", 100, 1075)],
-    undefined,
     "r2",
   );
   expect(after.speedTokPerSec).toBeCloseTo(280 / 3.425);
@@ -751,7 +733,11 @@ it("falls back to null when output or duration is unusable", () => {
 });
 it("renders the speed as an integer between context and cache", () => {
   const view = render(
-    wideStatus(stateWith([started(1, "r1", 128000), timedAssistant(2, "r1", 80, 1275), finished(3, "r1")])),
+    wideStatus(
+      stateWith([started(1, "r1", 128000), timedAssistant(2, "r1", 80, 1275), finished(3, "r1")], {
+        contextTokens: 1000,
+      }),
+    ),
   );
   expect(view.lastFrame()).toContain("Context: 1.0k / 128k · Speed: 63 tok/s · Cache: 0.0%");
   view.unmount();
@@ -781,69 +767,4 @@ it("hides the whole speed segment when the line would exceed the width", () => {
   expect(tight.lastFrame()).toContain("Cache: 0.0%");
   expect((tight.lastFrame() ?? "").split("\n")).toHaveLength(2);
   tight.unmount();
-});
-it("hides the speed segment at the running-prefix boundary", () => {
-  const state = stateWith([started(1, "r1", 128000), timedAssistant(2, "r1", 80, 1275)], {
-    status: running("r1"),
-  });
-  const width = visibleWidth(new StatusBar(state).render(1000)[1]!);
-  const fit = render(wideStatus(state, width));
-  expect(fit.lastFrame()).toContain("Speed: 63 tok/s");
-  fit.unmount();
-  const tight = render(wideStatus(state, width - 1));
-  expect(tight.lastFrame()).not.toContain("Speed");
-  expect(tight.lastFrame()).toContain("Cache: 0.0%");
-  tight.unmount();
-});
-it("hides the dash segment at the running-prefix boundary too", () => {
-  const state = stateWith([], { baseline: 3941, status: running("r1") });
-  const width = visibleWidth(new StatusBar(state).render(1000)[1]!);
-  const fit = render(wideStatus(state, width));
-  expect(fit.lastFrame()).toContain("Speed: —");
-  fit.unmount();
-  const tight = render(wideStatus(state, width - 1));
-  expect(tight.lastFrame()).not.toContain("Speed");
-  expect(tight.lastFrame()).toContain("Cache: 0.0%");
-  tight.unmount();
-});
-it("hides the dash segment too when the width is short", () => {
-  const state = stateWith([], { baseline: 3941 });
-  const width = visibleWidth(new StatusBar(state).render(1000)[1]!);
-  const fit = render(wideStatus(state, width));
-  expect(fit.lastFrame()).toContain("Speed: —");
-  fit.unmount();
-  const tight = render(wideStatus(state, width - 1));
-  expect(tight.lastFrame()).not.toContain("Speed");
-  expect(tight.lastFrame()).toContain("Cache: 0.0%");
-  tight.unmount();
-});
-
-it("renders a workspace line and mode line without a permanent interrupt hint", () => {
-  const bar = new StatusBar(stateWith([]));
-  const rows = bar.render(120);
-  expect(rows).toHaveLength(2);
-  expect(stripAnsi(rows[1]!)).toContain("Mode: auto");
-  expect(rows.join("\n")).not.toContain("Ctrl+C");
-});
-
-it.each(["readonly", "auto", "full"] as const)("renders mode %s", (mode) => {
-  const state = stateWith([]);
-  state.core.session.approvalMode = mode;
-  const rows = new StatusBar(state, { workspacePath: "D:\\project", homeDirectory: "C:\\Users\\me" }).render(120);
-  expect(stripAnsi(rows[1]!)).toContain(`Mode: ${mode}`);
-  expect(stripAnsi(rows[0]!)).toBe("D:\\project");
-});
-it("shortens workspace paths at directory boundaries and respects display widths", () => {
-  expect(formatWorkspacePath("C:\\Users\\me\\project", "C:\\Users\\me", 80)).toBe("~\\project");
-  expect(formatWorkspacePath("/home/me2/project", "/home/me", 80)).toBe("/home/me2/project");
-  expect(formatWorkspacePath("/home/me", "/home/me", 80)).toBe("~");
-  for (const value of ["D:\\very-long-parent\\project", "/long/parent/项目😀", "\\\\server\\share\\long\\project"]) {
-    for (const width of [0, 1, 5, 16, 80]) expect(visibleWidth(formatWorkspacePath(value, "", width))).toBeLessThanOrEqual(width);
-  }
-  expect(formatWorkspacePath("/secret/project", "", 80, text => text.replace("secret", "[redacted]"))).toBe("/[redacted]/project");
-});
-
-it("keeps path output single line and accepts dot-prefixed home children", () => {
-  expect(formatWorkspacePath("/home/me/..project", "/home/me", 80)).toBe("~/..project");
-  expect(formatWorkspacePath("/tmp/line\nbreak", "", 80)).toBe("/tmp/line break");
 });

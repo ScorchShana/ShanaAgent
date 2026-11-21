@@ -92,19 +92,6 @@ function toolDefinitions(
     }));
 }
 
-// 与压缩预算的固定开销同源：System Prompt + environment + AGENTS.md + 工具 Schema。
-function computeBaselineTokens(
-  context: StoredContext,
-  settings: Settings,
-  platform?: NodeJS.Platform,
-  imageInput = false,
-): number {
-  return estimateContextTokens(
-    { ...context, messages: [], tools: toolDefinitions(platform, settings, imageInput) },
-    settings.tokenEstimate,
-  );
-}
-
 function retainedContextBudget(context: StoredContext, model: ResolvedModel, settings: Settings): number {
   const fixedTokens = estimateContextTokens({ ...context, messages: [] }, settings.tokenEstimate);
   return Math.min(
@@ -197,44 +184,24 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   let runModel: ResolvedModel;
   let runSettings: Settings;
   let built: Awaited<ReturnType<typeof buildContext>>;
-  // 不变量：contextTokens 是下一次请求输入的最佳已知 token 数——优先"最近一次实测 prompt +
-  // 未测量增量的估算"（锚定），实测不可用时为 estimateContextTokens(built.context)。
-  // built.context 的每处变更必须同步它。
+  // 不变量：contextTokens 是当前上下文的最佳已知 token 数——优先"最近一次实测 prompt +
+  // 未测量增量的估算"（锚定），无可信实测时为全量估算（contextEstimated=true，状态栏加 ~）。
+  // 状态栏直显此值；每处上下文变更（每 Turn/取消/压缩//new//resume）必须同步维护。
   let contextTokens = 0;
-  let contextBaselineTokens: number | null = null;
+  // false = 未知（空闲态重建失败、model.json 非法等），状态栏显 "—"；Run 内恒 true。
+  let contextTokensKnown = false;
+  let contextEstimated = false;
+  const setContextTokens = (tokens: number, estimated: boolean): void => {
+    contextTokens = tokens;
+    contextEstimated = estimated;
+    contextTokensKnown = true;
+  };
+  const invalidateContextTokens = (): void => {
+    contextTokensKnown = false;
+    contextEstimated = false;
+  };
   // Session 级冻结快照：进程启动、/new、/resume 时读取，Session 内不再重读。
   let sessionAgentsMd: AgentsMdLoad = await loadRootAgentsMd(options.workspaceRoot);
-  const applyBaseline = (context: StoredContext, settings: Settings, imageInput = false): void => {
-    try {
-      contextBaselineTokens = computeBaselineTokens(
-        context,
-        settings,
-        options.executorOptions?.platform,
-        imageInput,
-      );
-    } catch {
-      contextBaselineTokens = null;
-    }
-  };
-  const refreshBaseline = async (): Promise<void> => {
-    try {
-      const baseline = await buildContext({
-        records: [],
-        workspacePath: options.workspaceRoot,
-        agentsMd: sessionAgentsMd,
-        systemPrompt: options.systemPrompt,
-        environment: options.environment,
-      });
-      // currentModel 可能因 model.json 非法抛错，由外层 catch 统一降级为无 baseline。
-      applyBaseline(
-        baseline.context,
-        parseSettings(options.getSettings()),
-        currentModel().input.includes("image"),
-      );
-    } catch {
-      contextBaselineTokens = null;
-    }
-  };
   const makeManager = () =>
     new ApprovalManager({
       onAnalyzerError: (error) =>
@@ -345,7 +312,11 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
   // 无法校验，误差以头部大小为界；工具 Schema 经 run_started 的 settings 快照校验。
   // 旧记录的 aborted thinking 读取时剥离：历史实测含当时发送的 thinking，锚定偏高，
   // 误差以被剥 thinking 大小为界、方向安全（提前压缩），下一次响应重新锚定即消除。
-  const anchorContextTokens = async (context: StoredContext): Promise<number | null> => {
+  const anchorContextTokens = async (
+    context: StoredContext,
+    model: ResolvedModel,
+    settings: Settings,
+  ): Promise<number | null> => {
     let reason = "no_measurement";
     let anchored: number | null = null;
     for (let index = records.length - 1; index >= 0; index -= 1) {
@@ -353,7 +324,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       if (record.type !== "assistant_message") continue;
       const measured = measuredPromptTokens(record.message.usage);
       if (measured === null) continue;
-      if (!sameModelIdentity(record.message, runModel)) {
+      if (!sameModelIdentity(record.message, model)) {
         reason = "model_mismatch";
         continue;
       }
@@ -385,7 +356,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           agentsMd: sessionAgentsMd,
           systemPrompt: options.systemPrompt,
           environment: options.environment,
-          imageInput: runModel.input.includes("image"),
+          imageInput: model.input.includes("image"),
         });
       } catch {
         reason = "prefix_build_failed";
@@ -409,7 +380,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       }
       let suffixTokens = 0;
       for (const message of context.messages.slice(count))
-        suffixTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
+        suffixTokens += estimateMessageTokens(message, settings.tokenEstimate);
       anchored = measured + suffixTokens;
       break;
     }
@@ -417,6 +388,51 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       JSON.stringify({ event: "context.anchor", anchored: anchored !== null, reason: anchored !== null ? null : reason }),
     );
     return anchored;
+  };
+  // 统一取值：锚定优先（实测 prompt + 未测后缀估算，按实测口径显示）；无可信锚点全量估算。
+  // 零占位 usage 被 measuredPromptTokens 拒绝，取消 Run 在此自然落入估算分支。
+  const computeContextTokens = async (
+    context: StoredContext,
+    model: ResolvedModel,
+    settings: Settings,
+  ): Promise<{ tokens: number; estimated: boolean }> => {
+    const anchored = await anchorContextTokens(context, model, settings);
+    if (anchored !== null) return { tokens: anchored, estimated: false };
+    return { tokens: estimateContextTokens(context, settings.tokenEstimate), estimated: true };
+  };
+  // 空闲态全量刷新：从 records 重建（含工具 Schema）后统一取值。失败返回 false 且不动现值，
+  // 由调用方决定降级（会话切换清为未知；Run 收尾/手动压缩保留活值）。
+  const refreshContextTokens = async (): Promise<boolean> => {
+    try {
+      const model = currentModel();
+      const settings = parseSettings(options.getSettings());
+      const imageInput = model.input.includes("image");
+      const rebuilt = await buildContext({
+        records,
+        workspacePath: options.workspaceRoot,
+        agentsMd: sessionAgentsMd,
+        systemPrompt: options.systemPrompt,
+        environment: options.environment,
+        imageInput,
+      });
+      const computed = await computeContextTokens(
+        {
+          ...rebuilt.context,
+          tools: toolDefinitions(options.executorOptions?.platform, settings, imageInput),
+        },
+        model,
+        settings,
+      );
+      setContextTokens(computed.tokens, computed.estimated);
+      return true;
+    } catch {
+      options.diagnostics?.debug(JSON.stringify({ event: "context.refresh", ok: false }));
+      return false;
+    }
+  };
+  const refreshContextTokensKeepingKnown = async (): Promise<void> => {
+    const kept = contextTokensKnown ? { tokens: contextTokens, estimated: contextEstimated } : null;
+    if (!(await refreshContextTokens()) && kept) setContextTokens(kept.tokens, kept.estimated);
   };
   const compactForRun = async (
     handle: RunHandle,
@@ -449,8 +465,7 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
       handle.reportPhase("streaming");
       throw error;
     }
-    // 压后估算随 finished 事件上报供状态栏立即更新；try/finally 保证重建抛错时事件仍恰发一次。
-    let contextEstimate: number | undefined;
+    // try/finally 保证重建抛错时 finished 事件仍恰发一次。
     try {
       if (outcome.status === "completed") {
         const tools = built.context.tools;
@@ -467,18 +482,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         // 复用原数组保证与上一次正式请求逐字节一致。
         built.context.tools = tools;
         // 压后上下文未发送过、无实测可用，只能纯估算；下一次响应返回后重新锚定。
-        contextTokens = estimateContextTokens(built.context, tokenEstimate);
-        contextEstimate = contextTokens;
+        setContextTokens(estimateContextTokens(built.context, tokenEstimate), true);
       }
     } finally {
       handle.notifyCompactionFinished(
         outcome.status === "completed" && outcome.coveredUpTo !== null
-          ? {
-              status: "completed",
-              path: outcome.path,
-              coveredUpTo: outcome.coveredUpTo,
-              ...(contextEstimate !== undefined ? { contextTokens: contextEstimate } : {}),
-            }
+          ? { status: "completed", path: outcome.path, coveredUpTo: outcome.coveredUpTo }
           : { status: outcome.status },
       );
       handle.reportPhase("streaming");
@@ -532,10 +541,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         description: tool.description,
         parameters: tool.parameters,
       }));
-      contextTokens = estimateContextTokens(built.context, runSettings.tokenEstimate);
       // 估算对代码/JSON 系统性偏低会让阈值触发漂移；有可信实测时以其锚定历史大头。
-      const anchored = await anchorContextTokens(built.context);
-      if (anchored !== null) contextTokens = anchored;
+      const computed = await computeContextTokens(built.context, runModel, runSettings);
+      setContextTokens(computed.tokens, computed.estimated);
       try {
         let autoCompactionFailedThisRun = false;
         let overflowRemediedThisRun = false;
@@ -728,10 +736,12 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             deltaTokens += estimateMessageTokens(message, runSettings.tokenEstimate);
           }
           const measured = measuredPromptTokens(response.usage);
-          contextTokens =
-            measured !== null && sameModelIdentity(response.message, runModel)
-              ? measured + deltaTokens
-              : contextTokens + deltaTokens;
+          if (measured !== null && sameModelIdentity(response.message, runModel)) {
+            setContextTokens(measured + deltaTokens, false);
+          } else {
+            // 实测缺失/身份不符回退增量估算，保持原有实测/估算口径。
+            setContextTokens(contextTokens + deltaTokens, contextEstimated);
+          }
           if (turn === runSettings.maxTurns) return { outcome: "turn_limit" };
           turn += 1;
         }
@@ -823,27 +833,9 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         appendRecord: append,
       });
       if (outcome.status !== "completed") return outcome;
-      // 压后估算仅供状态栏即时显示；重建/估算失败不影响压缩结果本身。
-      try {
-        const rebuilt = await buildContext({
-          records,
-          workspacePath: options.workspaceRoot,
-          agentsMd: sessionAgentsMd,
-          systemPrompt: options.systemPrompt,
-          environment: options.environment,
-          imageInput,
-        });
-        const estimatedContextTokens = estimateContextTokens(
-          {
-            ...rebuilt.context,
-            tools: toolDefinitions(options.executorOptions?.platform, settings, imageInput),
-          },
-          settings.tokenEstimate,
-        );
-        return { ...outcome, estimatedContextTokens };
-      } catch {
-        return outcome;
-      }
+      // 压后全量刷新（无锚点落入纯估算）；重建失败保留活值，不影响压缩结果本身。
+      await refreshContextTokensKeepingKnown();
+      return outcome;
     },
   };
   const controller = new SessionController({
@@ -930,7 +922,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
         await closePendingShells();
         if (ref) await options.store.releaseSession(ref);
         adoptSession(null, [], null, [], await loadRootAgentsMd(options.workspaceRoot));
-        await refreshBaseline();
+        invalidateContextTokens();
+        await refreshContextTokens();
       },
       resumeSession: async (source) => {
         if (source.workspaceId !== workspaceId) throw new Error("Cannot resume a different workspace");
@@ -950,7 +943,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           restored.warnings,
           await loadRootAgentsMd(options.workspaceRoot),
         );
-        await refreshBaseline();
+        invalidateContextTokens();
+        await refreshContextTokens();
       },
       switchModel: options.modelConfigPath
         ? async (providerId, modelId) => {
@@ -985,7 +979,8 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
             : [options.getModel()]
         ).map(displayModel),
         runModel: runModel ? displayModel(runModel) : null,
-        contextBaselineTokens,
+        contextTokens: contextTokensKnown ? contextTokens : null,
+        contextEstimated,
       }),
       closeSession: async () => {
         await closePendingShells();
@@ -1044,16 +1039,25 @@ export async function createAgentSession(options: AgentSessionOptions): Promise<
           environment: options.environment,
           imageInput: runModel.input.includes("image"),
         });
-        applyBaseline(built.context, runSettings, runModel.input.includes("image"));
+        // Run 发出即有值：覆盖"发出即取消"（尚无 assistant，状态栏不得显 0）。
+        built.context.tools = toolDefinitions(
+          options.executorOptions?.platform,
+          runSettings,
+          runModel.input.includes("image"),
+        );
+        const computed = await computeContextTokens(built.context, runModel, runSettings);
+        setContextTokens(computed.tokens, computed.estimated);
         for (const warning of built.warnings) options.onWarning?.(warning);
       },
       persistRunFinished: async ({ runId, outcome, elapsedMs }) => {
         await append({ type: "run_finished", runId, outcome, elapsedMs, persisted: true });
+        // Run 收尾（含取消）全量刷新：aborted partial 的零占位 usage 不可信，无锚点落入估算。
+        await refreshContextTokensKeepingKnown();
       },
     },
   });
 
-  await refreshBaseline();
+  await refreshContextTokens();
 
   return { controller, acknowledgeUnknownSideEffects: () => gate.acknowledge() };
 }
