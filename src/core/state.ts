@@ -1,3 +1,4 @@
+import type { ApprovalGrantKey } from "../security/permissions.js";
 import type { RunModelSnapshot, SessionMeta } from "../sessions/records.js";
 import type { SessionRef } from "../sessions/session-store.js";
 import type { ApprovalMode } from "../security/permissions.js";
@@ -17,6 +18,7 @@ export const RUN_OUTCOMES = ["completed", "cancelled", "failed", "turn_limit"] a
 export type RunOutcome = (typeof RUN_OUTCOMES)[number];
 
 export interface ApprovalSummary {
+  grantKey?: ApprovalGrantKey | null;
   paths: string[];
   touchesOutsideWorkspace: boolean;
   operation?: string;

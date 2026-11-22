@@ -38,6 +38,7 @@ function call(id: string, name: string, args: Record<string, unknown>): ToolCall
 function writeSubject(root: string, relative: string, toolName = "write"): ToolCallSubject {
   const target = createPathPolicy(root).resolve(relative);
   return {
+    workspaceRoot: root,
     toolCallId: "subject-1",
     toolName,
     action: { type: "write", path: target, operation: target.exists ? "overwrite" : "create" },
@@ -46,11 +47,21 @@ function writeSubject(root: string, relative: string, toolName = "write"): ToolC
 
 function readSubject(root: string, relative: string, toolName = "read"): ToolCallSubject {
   const target = createPathPolicy(root).resolve(relative);
-  return { toolCallId: "subject-1", toolName, action: { type: "read", paths: [target] } };
+  return {
+    workspaceRoot: root,
+    toolCallId: "subject-1",
+    toolName,
+    action: { type: "read", paths: [target] },
+  };
 }
 
 function shellSubject(command: string): ToolCallSubject {
-  return { toolCallId: "subject-1", toolName: shellName, action: { type: "shell", command } };
+  return {
+    pathPolicy: createPathPolicy(process.cwd()),
+    toolCallId: "subject-1",
+    toolName: shellName,
+    action: { type: "shell", command },
+  };
 }
 
 /** 区外写入用例需要嵌套工作区：../ 落在受清理的父临时目录内，而非共享 os.tmpdir()。 */
@@ -187,24 +198,22 @@ function makeHarness(workspaceRoot: string, mode: ApprovalMode = "auto"): Harnes
 }
 
 describe("三模式门控矩阵", () => {
-  it("confirm 每次询问 Bash，即使存在会话授权或分析器会放行", async () => {
+  it("confirm 复用 auto 的精确 Bash 授权并跳过分析器", async () => {
     const approver = vi.fn(async (_request: ApprovalRequest) => "session" as const);
-    const analyzeBash = vi.fn().mockReturnValueOnce("ask").mockReturnValue("allow");
+    const analyzeBash = vi.fn().mockResolvedValue({ decision: "ask" });
     const manager = new ApprovalManager({ approver, analyzeBash });
-    const subject = shellSubject("cat README.md");
+    const subject = shellSubject("git fetch");
 
     expect(await manager.requestPermission(subject, { mode: "auto" })).toMatchObject({
       basis: "approved_for_session",
     });
-    for (const call of [subject, subject, shellSubject("mkdir logs")]) {
-      expect(await manager.requestPermission(call, { mode: "confirm" })).toEqual({
-        decision: "allow",
-        basis: "approved_once",
-      });
-    }
-    expect(approver.mock.calls.slice(1).map(([request]) => request.grantKey)).toEqual([null, null, null]);
+    expect(await manager.requestPermission(subject, { mode: "confirm" })).toEqual({
+      decision: "allow",
+      basis: "session_grant",
+    });
+    expect(approver).toHaveBeenCalledTimes(1);
     expect(analyzeBash).toHaveBeenCalledTimes(1);
-    expect(manager.grants.shellCommands).toEqual(new Set(["cat README.md"]));
+    expect(manager.grants.shellCommands).toEqual(new Set(["git fetch"]));
   });
 
   it("confirm 对写入、Bash 和区外读取逐次询问，区内读取直接放行", async () => {
@@ -217,7 +226,7 @@ describe("三模式门控矩阵", () => {
     for (const subject of [
       writeSubject(root, "a.txt"),
       writeSubject(root, "a.txt", "edit"),
-      shellSubject("ls"),
+      shellSubject("git fetch"),
       writeSubject(root, "../out.txt"),
       readSubject(root, "../secret.txt"),
     ]) {
@@ -230,8 +239,12 @@ describe("三模式门控矩阵", () => {
       decision: "allow",
       basis: "workspace_read",
     });
-    expect(approver.mock.calls.map(([request]) => request.grantKey)).toEqual([
-      null, null, null, null, null,
+    expect(approver.mock.calls.map(([request]) => request.grantKey)).toMatchObject([
+      { kind: "file" },
+      { kind: "file" },
+      { kind: "shell_command" },
+      { kind: "file" },
+      { kind: "file" },
     ]);
   });
 
@@ -254,7 +267,7 @@ describe("三模式门控矩阵", () => {
     expect(approver).not.toHaveBeenCalled();
   });
 
-  it("auto：区内写直接放行 workspace_write，区外写逐次人工且授权不能豁免", async () => {
+  it("auto 区内写直接放行，区外写按文件分别授权", async () => {
     const { root, parent } = nestedWorkspace();
     const mock = mockApprover(["session", "session"]);
     const manager = new ApprovalManager({ approver: mock.approver });
@@ -268,11 +281,11 @@ describe("三模式门控矩阵", () => {
     for (const relative of ["../out1.txt", "../out2.txt"]) {
       expect(await manager.requestPermission(writeSubject(root, relative), { mode: "auto" })).toEqual({
         decision: "allow",
-        basis: "approved_once",
+        basis: "approved_for_session",
       });
     }
     expect(mock.prompts).toHaveLength(2);
-    expect(mock.prompts.every((prompt) => prompt.grantKey === null)).toBe(true);
+    expect(mock.prompts.every((prompt) => prompt.grantKey?.kind === "file")).toBe(true);
     expect(manager.grants.shellCommands.size).toBe(0);
     expect(fs.existsSync(path.join(parent, "out1.txt"))).toBe(false);
   });
@@ -303,17 +316,20 @@ describe("三模式门控矩阵", () => {
 });
 
 describe("auto 模式 bash analyzer", () => {
-  it("缺省 analyzer：白名单直通 bash_policy，守卫命令落人工", async () => {
+  it("缺省 analyzer 分析只读命令和不支持的展开", async () => {
     const mock = mockApprover(["once"]);
     const manager = new ApprovalManager({ approver: mock.approver });
 
-    expect(await manager.requestPermission(shellSubject("ls -la"), { mode: "auto" })).toEqual({
+    expect(await manager.requestPermission(shellSubject("pwd"), { mode: "auto" })).toEqual({
       decision: "allow",
       basis: "bash_policy",
+      revalidate: expect.any(Function),
     });
     expect(mock.prompts).toHaveLength(0);
 
-    expect(await manager.requestPermission(shellSubject("cat ~/.shana/model.json"), { mode: "auto" })).toEqual({
+    expect(
+      await manager.requestPermission(shellSubject("cat ~/.shana/model.json"), { mode: "auto" }),
+    ).toEqual({
       decision: "allow",
       basis: "approved_once",
     });
@@ -321,14 +337,20 @@ describe("auto 模式 bash analyzer", () => {
   });
 
   it("注入 analyzer：allow 直通、ask 落人工、抛错按 ask 且走诊断出口", async () => {
-    const allow = new ApprovalManager({ analyzeBash: () => "allow" });
+    const allow = new ApprovalManager({
+      analyzeBash: async () => ({ decision: "allow" as const, revalidate: async () => {} }),
+    });
     expect(await allow.requestPermission(shellSubject("anything goes"), { mode: "auto" })).toEqual({
       decision: "allow",
       basis: "bash_policy",
+      revalidate: expect.any(Function),
     });
 
     const mock = mockApprover(["once"]);
-    const ask = new ApprovalManager({ analyzeBash: () => "ask", approver: mock.approver });
+    const ask = new ApprovalManager({
+      analyzeBash: async () => ({ decision: "ask" }),
+      approver: mock.approver,
+    });
     expect(await ask.requestPermission(shellSubject("ls"), { mode: "auto" })).toEqual({
       decision: "allow",
       basis: "approved_once",
@@ -351,16 +373,16 @@ describe("auto 模式 bash analyzer", () => {
     expect(crashMock.prompts).toHaveLength(1);
   });
 
-  it("analyzer 只在 auto + shell 生效：confirm/full 不调用，write 不调用", async () => {
+  it("confirm 分析 Bash，full 和文件工具跳过分析器", async () => {
     const { root } = nestedWorkspace();
-    const analyzeBash = vi.fn(() => "allow" as const);
+    const analyzeBash = vi.fn(async () => ({ decision: "allow" as const, revalidate: async () => {} }));
     const manager = new ApprovalManager({ analyzeBash });
 
     await manager.requestPermission(shellSubject("ls"), { mode: "confirm" });
     await manager.requestPermission(shellSubject("ls"), { mode: "full" });
     await manager.requestPermission(writeSubject(root, "a.txt"), { mode: "auto" });
     await manager.requestPermission(writeSubject(root, "../out.txt"), { mode: "auto" });
-    expect(analyzeBash).not.toHaveBeenCalled();
+    expect(analyzeBash).toHaveBeenCalledTimes(1);
   });
 
   it("bash 会话授权先于 analyzer：命中即 session_grant，analyzer 抛错也不影响", async () => {
@@ -386,7 +408,7 @@ describe("auto 模式 bash analyzer", () => {
   });
 });
 
-describe("会话授权：仅 bash 精确命令字符串", () => {
+describe("Bash 精确命令授权", () => {
   it("never applies a bash grant to an unknown shell tool", async () => {
     const approver = vi.fn(async () => "session" as const);
     const manager = new ApprovalManager({ approver });
@@ -434,7 +456,7 @@ describe("会话授权：仅 bash 精确命令字符串", () => {
   it("同一命令跨 Run 免问，另一命令仍需审批", async () => {
     const root = makeWorkspace();
     // 元字符命令确保 analyzer 落人工；真实 shell 执行两条 echo 无副作用。
-    const command = "echo shana-granted; echo ok";
+    const command = "(echo shana-granted)";
     const harness = makeHarness(root);
 
     const firstRun = harness.startRun([call("c1", shellName, { command })]);
@@ -442,7 +464,7 @@ describe("会话授权：仅 bash 精确命令字符串", () => {
     harness.controller.resolveApproval(harness.pendingId(), "session");
     expect(await firstRun).toBe("completed");
 
-    const other = "echo shana-other; echo ok";
+    const other = "(echo shana-other)";
     const secondRun = harness.startRun([
       call("c2", shellName, { command }),
       call("c3", shellName, { command: other }),
@@ -472,12 +494,12 @@ describe("工作区外访问", () => {
       access: "write",
       operation: "create",
       touchesOutsideWorkspace: true,
-      grantKey: null,
+      grantKey: { kind: "file", toolName: "write" },
       paths: [path.join(fs.realpathSync.native(parent), "out.txt")],
     });
   });
 
-  it("区外读取与区外搜索每次都询问，选“本会话允许”也不产生授权", async () => {
+  it("区外读取与搜索的授权彼此独立并跨模式复用", async () => {
     const { root, parent } = nestedWorkspace();
     fs.writeFileSync(path.join(parent, "secret.txt"), "secret");
     const mock = mockApprover(["session", "session"]);
@@ -485,11 +507,15 @@ describe("工作区外访问", () => {
 
     expect(await manager.requestPermission(readSubject(root, "../secret.txt"), { mode: "auto" })).toEqual({
       decision: "allow",
-      basis: "approved_once",
+      basis: "approved_for_session",
     });
     expect(
       await manager.requestPermission(readSubject(root, "../secret.txt", "grep"), { mode: "auto" }),
-    ).toEqual({ decision: "allow", basis: "approved_once" });
+    ).toEqual({ decision: "allow", basis: "approved_for_session" });
+    expect(await manager.requestPermission(readSubject(root, "../secret.txt"), { mode: "confirm" })).toEqual({
+      decision: "allow",
+      basis: "session_grant",
+    });
     expect(manager.grants.shellCommands.size).toBe(0);
     expect(mock.prompts).toHaveLength(2);
   });
@@ -681,7 +707,7 @@ describe("事件通知", () => {
     expect(
       harness.events.filter((event) => event.type.startsWith("permission.")).map((event) => event.type),
     ).toEqual(["permission.requested", "permission.resolved"]);
-    // 区外写入 grantKey null：“本会话允许”只对本次生效，不产生授权。
+    expect(harness.manager.grants.fileScopes.size).toBe(1);
     expect(harness.manager.grants.shellCommands.size).toBe(0);
     expect(readFileAt(parent, "a.txt")).toBe("x");
   });

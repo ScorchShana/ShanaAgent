@@ -1,6 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ApprovalManager } from "../../src/security/approval-manager.js";
+import type { ApprovalMode } from "../../src/security/permissions.js";
+import type { ToolPermissionRequest } from "../../src/tools/executor.js";
 import { createPathPolicy } from "../../src/security/path-policy.js";
 import {
   call,
@@ -18,17 +21,19 @@ afterEach(cleanupTempDirs);
 
 const DIR_LINKS = supportsDirectoryLinks();
 
-// skills 根注入临时目录，不碰真实 home；gate 记录审批请求，免审批 = 零请求。
-function fixture() {
+// 分别记录权限判定和人工审批，以覆盖自动放行的生产路径。
+function fixture(mode: ApprovalMode = "confirm") {
   const ws = makeWorkspace();
   const skills = tempDir("shana-skills-");
-  const gate = recordingGate("allow");
+  const prompt = vi.fn(async () => "deny" as const);
+  const manager = new ApprovalManager({ approver: prompt });
+  const gate = vi.fn((request: ToolPermissionRequest) => manager.requestPermission(request, { mode }));
   const executor = makeExecutor(ws, {
     pathPolicy: createPathPolicy(ws, process.platform, skills),
-    permissionGate: gate.gate,
+    permissionGate: gate,
     imageInput: true,
   });
-  return { ws, skills, executor, requests: gate.requests };
+  return { ws, skills, executor, gate, prompt };
 }
 
 function pngBytes(width = 4, height = 3): Buffer {
@@ -67,10 +72,11 @@ describe("skills 只读区端到端（D3）", () => {
     expect(image.status).toBe("success");
     expect(image.images).toHaveLength(1);
 
-    expect(f.requests).toHaveLength(0);
+    expect(f.gate).toHaveBeenCalledTimes(4);
+    expect(f.prompt).not.toHaveBeenCalled();
   });
 
-  it("skills 内 write 仍逐次审批；bash 不豁免", async () => {
+  it("skills 内未授权 write 和 Bash 均经过权限入口", async () => {
     const f = fixture();
     const target = writeFileAt(f.skills, "review/SKILL.md", "x");
     const denied = recordingGate("deny");
@@ -110,11 +116,13 @@ describe("skills 只读区端到端（D3）", () => {
     expect(denied.requests).toHaveLength(1);
   });
 
-  it("工作区读取不受影响：仍零审批", async () => {
-    const f = fixture();
+  it.each(["confirm", "auto", "full"] as const)("%s 工作区读取经统一入口自动放行", async (mode) => {
+    const f = fixture(mode);
     writeFileAt(f.ws, "a.txt", "workspace");
     const result = await f.executor.execute(call("c1", "read", { path: "a.txt" }));
     expect(result.status).toBe("success");
-    expect(f.requests).toHaveLength(0);
+    expect(f.gate).toHaveBeenCalledOnce();
+    await expect(f.gate.mock.results[0]!.value).resolves.toMatchObject({ basis: mode === "full" ? "mode_full" : "workspace_read" });
+    expect(f.prompt).not.toHaveBeenCalled();
   });
 });

@@ -61,6 +61,7 @@ export interface WriteToolAction {
 }
 
 export interface ShellToolAction {
+  shellExecutable?: string;
   type: "shell";
   command: string;
 }
@@ -588,7 +589,7 @@ function createShellTool(shell: ShellDescriptor): RegisteredTool {
     },
     prepare(args, context) {
       return {
-        action: { type: "shell", command: args.command },
+          action: { type: "shell", command: args.command, shellExecutable: shell.executable },
         execute: async () => {
           const result = await runShellCommand(args.command, {
             cwd: context.workspaceRoot,

@@ -13,17 +13,16 @@
 - 同批任一工具结果 unknown：保留真实结果，停止同批剩余调用并逐个记录 `not_executed`，进入 Run 收尾，不发下一 Turn、不自动重试。
 - **UTF-8 ground rule**：read/write/edit 只操作 UTF-8 文本；解码失败或含 NUL 即判二进制拒绝，不降级、不覆盖（架构 §5）。carve-out：仅 read/write/edit 受此约束，view_image 是显式二进制只读通道。
 - **路径目标复验**：审批后及读取、破坏性打开、临时文件创建、rename 等关键操作前复验真实目标；变化返回 `Path target changed. Stop and ask user.`，不自动重试。复验与操作间的竞态窗口不承诺抵御。
-- 区外路径逐次人工审批（full 除外，见审批模式）；例外：read/glob/grep/view_image 命中 `~/.shana/skills` 只读默认放行（精确限 `skills/` 子目录，`~/.shana` 其余不放行；write/edit/bash 不豁免）。write/edit 经 path-policy 把符号链接解析为真实目标后判越区。
+- 文件工具按真实路径判断区内外。read/glob/grep/view_image 对 `~/.shana/skills` 享有只读豁免。其余区外文件读写在 confirm/auto 下匹配同一工具、同一真实目标的会话授权，未命中时询问。
 - 结果路径的显示转义仅作用于展示，调用历史保留原文；模型再次调用前须还原真实路径。
 
 ## 审批模式（confirm / auto / full）
 
 每 Session 持久化（meta `approvalMode`，缺省 auto），Run 起点冻结；`/mode` 查询或切换，运行中切换只影响后续 Run。完整矩阵与门控顺序见架构 §5，判定实现以 `src/security/permissions.ts` / `approval-manager.ts` / `bash-policy.ts` 为准。
 
-- **confirm**：区内和 skills 豁免目录的读取直接放行，其他区外读取、所有 write/edit 和所有 bash 逐次人工审批。
-- **auto**（缺省）：区内 write/edit 直接放行；区外 write/edit 逐次人工且会话授权不能豁免；bash 会话授权（仅完全相同命令串）命中放行，否则本地保守 analyzer（首命令白名单 + 元字符/路径守卫）判定，判不了转人工。
-- **full**：用户显式全豁免（含区外写入与 skills 写入），审批全放行；路径复验、UTF-8/NUL、参数校验、限额、取消边界不变。
-- auto 模式的会话授权仅匹配完全相同的 bash 命令字符串，不持久化。bash analyzer 的区内 symlink 跟随为已声明残余风险（架构 §5）。
+- 所有工具先校验参数并准备实际目标，再匹配活动会话内的授权。区内文件工具按工具名和工作区匹配，区外按工具名和真实目标精确匹配，glob/grep 核对指定搜索根。多目标调用须全部命中。Bash 按原始命令精确匹配。
+- 未命中授权时，`confirm` 放行区内和 skills 目录读取，以及能确认只读的 Bash 调用。`auto` 也放行区内 write/edit 和能确认范围的 Bash 普通写入。两种模式下其余调用询问用户。`full` 免除审批，参数、内容、限额和取消检查照常执行。
+- 「允许一次」批准当前调用。「本会话允许」保存面板列出的范围，切换 confirm/auto 时可复用，切换会话或退出进程时清空。
 
 ## read
 
@@ -39,7 +38,7 @@ globby 递归路径搜索，结果 newest first，每行一个路径。不跟随
 
 ## write
 
-新建或全量覆盖 UTF-8 文件（部分修改用 edit）。父目录必须存在；已有文件须为有效 UTF-8 无 NUL 且不超过 `editMaxFileBytes`（默认 16 MiB）。保留 supplied 内容与行尾，不加 BOM/末尾换行。写入前捕获旧文件全量快照（priorContent，新建文件记空串；仅供 TUI 历史 Diff，不入模型上下文）；捕获失败（ENOENT 之外）不写入。不可逆写入（open/truncate）开始前取消返回 `not_executed`（文件未改动）；写入临界区一旦开始即完成并如实报告 success。
+新建或全量覆盖 UTF-8 文件（部分修改用 edit）。父目录必须存在。准备时目标不存在则排他创建，若其他进程已创建同名文件，保留该文件并返回路径变化错误。已有文件须为有效 UTF-8 无 NUL 且不超过 `WRITE_MAX_EXISTING_FILE_BYTES`（16 MiB）。保留 supplied 内容与行尾，不加 BOM/末尾换行。写入前捕获旧文件全量快照（priorContent，新建文件记空串；仅供 TUI 历史 Diff，不入模型上下文）；捕获失败（ENOENT 之外）不写入。不可逆写入（open/truncate）开始前取消返回 `not_executed`（文件未改动）；写入临界区一旦开始即完成并如实报告 success。
 
 ## edit
 
@@ -49,6 +48,7 @@ globby 递归路径搜索，结果 newest first，每行一个路径。不跟随
 
 全平台统一 bash 语法：Windows → Git Bash，Linux/WSL → 系统 bash；固定工作区根目录执行，每调用独立子进程，不维持常驻 Shell。`timeout` 参数 1–1200 秒、默认 120 秒（代码常量 DEFAULT_SHELL_TIMEOUT_MS，不在 settings.json）。stdout/stderr 分别限 16000/4000 字符，各保头尾。正常退出返回真实退出码（含非零）；启动失败按原因分类，执行错误保留输出区块。
 
+- 会话授权或 full 放行时跳过 Bash 解析。自动判定按整条命令核对各段的参数、重定向和实际路径，启动前复验。见 [Bash 调用审批策略](./bash-policy.md)。
 - **超时混合收尾**：尝试终止进程树；确认终止 → 确定超时 ToolResult、Run 继续；无法确认 → 副作用 unknown 收尾，阻塞下个 Run 至用户知情确认。
 - 取消请求终止进程树；取消生效前进程已退出按真实退出结果处理。取消且确认终止 → 确定态 ToolResult，文案提示命令可能已部分执行、需先核实副作用（不触发门控）；无法确认终止 → 副作用 unknown 门控。Session 关闭/退出主动终止受管进程树并等待收尾；确认失败如实提示可能遗留进程，不回滚副作用、不谎称清理完成。
 
@@ -59,5 +59,5 @@ globby 递归路径搜索，结果 newest first，每行一个路径。不跟随
 - 扩展名白名单 `.png/.jpg/.jpeg/.webp`（大小写不敏感）+ 文件头 magic 校验（PNG/JPEG/WEBP）；mimeType 以内容为准（扩展名与实际格式不符时按真实格式报告）。不支持 `Unsupported image format. Supported: png, jpg, jpeg, webp.`；magic 不符 `File content does not match a supported image format.`。
 - 大小上限 `viewImageMaxBytes`（默认 5 MiB，范围 1024–16777216）；stat 与限量读（max+1）双重检查防竞态增长，超限 `Image exceeds the size limit (N bytes; max M bytes).`。
 - 仅成功携带 images（恰 1 项：base64 + mimeType + 宽高）；失败/取消/拒绝只有 Error 文本，不带图。成功结果 `<path>…</path>` + `(Image attached: <mime>, <w>x<h>, <size>.)`。
-- 权限同 read：区内与 `~/.shana/skills` 只读允许、其余区外逐次人工审批（full 除外），不产生会话授权；路径目标复验同总则。只读无副作用，取消在读取前后边界检查。
+- view_image 的授权范围独立于 read。区内与 skills 目录读取自动允许，其余区外读取按真实文件精确匹配已有授权。取消在读取前后边界检查。
 - 非视觉模型回放含图历史时渲染期替换为显式占位文本（记录保留、切回可逆）；TUI 内联显示仅 kitty 协议 + PNG 出真图，其余文本回退（见架构 §7/§9）。

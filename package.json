@@ -29,7 +29,9 @@
     "highlight.js": "11.11.2",
     "marked": "18.0.11",
     "marked-cjk-friendly": "0.1.2",
-    "sharp": "0.35.5"
+    "sharp": "0.35.5",
+    "tree-sitter": "0.25.1",
+    "tree-sitter-bash": "0.25.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

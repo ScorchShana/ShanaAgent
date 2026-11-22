@@ -17,7 +17,7 @@
 | I4   | 工具意图记录成功持久化后才可开始执行；正式完成事件不得早于相应成功持久化。                                                |
 | I5   | Session History 永久保留完整审计（唯一例外：aborted partial 的半截 thinking 在落盘前剥离，经用户授权修订）；LLM Context 含可用的完整 Turn、受控的用户中断 Turn（aborted，显式标注）与未知/缺结果 Turn（显式 unknown 占位 + 询问标注）；用户 Prompt 恒进 Context（零 Turn 失败 Run 附失败标注；零 Turn 取消 Run 不附标注，其下一条 Prompt 渲染期前置中断前缀，不落盘，经用户裁决修订）。 |
 | I6   | 缺结果/未知结果的工具可在构建上下文时合成显式 unknown 占位（仅渲染期、不落盘、绝不写成确定态），使 Turn 受控进入上下文并附"停下询问用户"标注；恢复不自动重放工具；门控不变。 |
-| I7   | 权限以实际 Tool Call 为对象；confirm/auto 模式下文件工具区外写入必须逐次人工审批（模型与会话授权均不能豁免）；full 为用户显式全豁免（含区外写入与 skills 写入），路径复验与内容规则仍强制（§5，经用户授权修订）。 |
+| I7   | 权限以实际 Tool Call 为对象。参数校验与真实目标准备后先匹配当前会话的显式授权。区外写入可复用同工具、同真实路径的授权，未命中时 confirm/auto 须询问。full 豁免审批，各模式均执行适用的路径与内容校验（§5）。 |
 | I8   | `/resume` 原子抢独占锁后续写原历史，不复制不新建身份；同一 Session 同时仅一个持锁写者；异常残锁仅人工确认处理。           |
 | I9   | 模型切换只影响后续 Run；跨模型继续必须重新计算上下文预算。                                                                |
 
@@ -84,20 +84,20 @@ flowchart TD
 - 模型可见错误以 `Error:` 开头；Session 只存实际发给模型的格式化裁剪后 ToolResult（priorContent 例外，见 §6）。edit 不做版本快照比对，TOCTOU/丢失更新不在首发强一致性承诺内。
 - 审批模式（每 Session 持久化于 meta，缺省 `auto`；Run 起点冻结，运行中切换只影响后续 Run；`/mode` 查询/切换）：
 
-| 操作                | confirm                | auto                                   | full        |
-| ------------------- | ---------------------- | -------------------------------------- | ----------- |
-| 区内 read/glob/grep/view_image | 允许 `workspace_read`  | 同左                                   | 同左        |
-| skills 只读（read/glob/grep/view_image） | 允许 `skills_read` | 同左              | 同左        |
-| 区外 read/glob/grep/view_image | 逐次人工（无授权键）   | 逐次人工（无授权键）                   | 允许 `mode_full` |
-| 区内 write/edit     | 逐次人工（无授权键）   | 允许 `workspace_write`（无审批无授权） | 允许 `mode_full` |
-| 区外 write/edit（含 skills） | 逐次人工（无授权键） | 逐次人工，授权不能豁免                 | 允许 `mode_full` |
-| bash                | 逐次人工（无授权键） | 会话授权命中 → `session_grant`；否则本地 analyzer 放行 → `bash_policy`；否则人工（可"本会话允许"） | 允许 `mode_full` |
-| 未知工具            | registry 层 `Unknown tool`（不到门控） | 同左                    | 同左        |
+所有已注册工具均在参数校验和操作对象准备后进入权限门控。若已有会话授权覆盖本次调用的全部目标，以 `session_grant` 放行。未命中时按本次 Run 冻结的模式判定。
 
-- confirm 的审批面板提供「允许一次」和「拒绝」。full 免除审批，路径复验、UTF-8/NUL、参数校验、限额与取消边界继续适用。
-- executor 对区内和 skills 只读调用直接放行。其余调用依次经过 unknown 防御（任何模式人工）、full 放行、区外读取审批和 confirm 逐次审批。auto 接下来检查区内写入、bash 会话授权和 bash analyzer，均未放行时询问用户。`~/.shana/skills` 的只读豁免以真实路径为准，符号链接指向其他区外路径时须审批。confirm 和 auto 下文件工具区外写入逐次审批。
-- bash analyzer（`src/security/bash-policy.ts`，纯函数零 IO，经 `BashCommandAnalyzer` 函数类型 seam 注入 ApprovalManager）：v1 为首命令白名单（`ls pwd echo cat head tail wc which whoami hostname uname true false`）+ 元字符/赋值前缀/路径守卫（绝对路径、`~`、`..` 上跳、盘符/UNC 一律人工），glob 参数放行；判不了或抛错 → 人工，永不兜底放行。**已声明残余风险**：区内 symlink 指向区外可被 `cat` 跟随读取（bash 无 path-policy 复验），glob 展开可能命中此类 symlink；analyzer 是 best-effort 第一道闸，auto 为用户显式选择，后续以解析包增强。白名单命令读区内文件与 read 工具既有暴露面等价，无新增。
-- 会话授权仅 auto 模式的 bash 可用，按精确命令字符串匹配（D10）。审批后及关键操作前路径复验；目标变化返回错误不自动重试；复验与操作间的竞态窗口不承诺抵御。会话授权不持久化，仅同一内存持有者连续占用期间有效；外部写入为一次综合审批。
+| 未命中授权时的操作 | confirm | auto | full |
+| --- | --- | --- | --- |
+| 区内文件读取、skills 豁免目录读取 | 允许 | 允许 | 允许 |
+| 其他区外文件读取 | 询问 | 询问 | 允许 |
+| 区内 write/edit | 询问 | 允许 | 允许 |
+| 区外 write/edit（含 skills） | 询问 | 询问 | 允许 |
+| bash | 允许可确认的区内只读调用，其余询问 | 另允许可确认的区内普通写入，其余询问 | 允许 |
+
+- 「允许一次」仅批准本次调用。「本会话允许」保存面板显示的范围。区内文件授权按工具名和工作区匹配，区外按工具名和规范化真实目标精确匹配。glob/grep 以指定搜索根为目标。各读取工具、write 和 edit 独立授权。文件工具每次重新解析路径，skills 只读豁免仅覆盖真实目标位于 `~/.shana/skills` 的调用。
+- Bash 授权按原始命令串精确匹配，空白也参与比较。同一命令即使文件内容或仓库状态变化也复用显式授权。授权保存在活动 Session 内存中，切换审批模式可以复用，切换 Session 或退出进程时清空。
+- Bash 授权未命中时，confirm/auto 按需加载解析器，检查整条命令的语法、各段命令及参数、重定向、执行环境与真实目标。无法确认时整次调用询问一次。full 和授权命中均跳过分析。支持的调用与 Git 查询边界见 [Bash 调用审批策略](./bash-policy.md)。
+- 文件工具和自动放行的 Bash 调用在执行前复验已确定的目标。复验与操作间仍可能发生并发修改。write 对准备时不存在的目标使用排他创建，若同名文件已出现，保留该文件并返回路径变化错误。
 - Diff 预览与历史回看是**纯 TUI 展示层**：不新增事件；预览旧内容按需读盘（预览≠执行时刻），历史回看用持久化参数 + priorContent 重建、不读盘；模型可见 ToolResult 不含 Diff。
 - Shell 边界：每调用独立子进程（cwd 固定工作区根）；超时混合收尾——确认终止 → 确定超时结果、Run 继续，无法确认 → 副作用未知收尾并阻塞下个 Run 至知情确认。取消/退出终止进程树并等待收尾，未确认如实提示可能遗留进程；不回滚副作用；结果未知按 §6 门控。取消且确认终止的 bash 返回确定态结果，文案提示命令可能已部分执行、需先核实副作用（不触发门控）；无法确认终止仍按 unknown 门控。运行中 TUI 以 ≤1Hz 尾快照展示实时输出，仅展示层，最终裁剪结果不变。
 
@@ -199,4 +199,7 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 - 诊断日志独立脱敏；Session 权限尽力而为 → §6
 - 提示词与 Error 模板英文、prompts/ 独立文件；只读根 AGENTS.md → §7
 - 首发 Windows、Linux/WSL → §1
-- 审批模式轮决策（D1–D13，均经用户确认）：D1 I7 修订——full 为显式全豁免（含 skills 写入），路径复验/内容规则各模式不变；D2 原策略拒绝已由 confirm 逐次审批替代；D3 无决策模型，bash v1 首命令白名单 analyzer，`BashCommandAnalyzer` 函数类型 seam 注入；D4 决策模型子系统整体删除（用户 decision-model.json 文件保留不动）；D5 Session v6 硬切拒载；D6 模式每 Session 持久化、Run 起点冻结、/mode 无参重载 meta；D7 confirm 区外读逐次人工（skills 只读豁免）；D8 缺省 auto；D9 `/mode` 硬切无别名；D10 文件工具会话授权删除（仅留 bash 精确命令授权）；D11 bash 白名单 13 项 + 元字符/路径守卫（细则以 `src/security/bash-policy.ts` 为准）；D12 删除死字段 `RegisteredTool.access`/`ToolAccess`，权限判据使用真实 action；D13 settings 严格未知键拒绝保留（decisionTimeoutMs 迁移提示见 §8 与 CHANGELOG）→ §5、§6、§8
+- 审批模式决策（D1–D13，按已确认的会话授权与 Bash 策略修订）：
+  - D1 full 显式豁免审批，路径与内容检查仍适用。D2 confirm 对超出自动规则的调用询问。D3 由本地分析器判定 Bash 效果。D4 删除决策模型子系统，保留用户原有 decision-model.json 文件。
+  - D5 Session v6 拒载旧版本。D6 模式按 Session 持久化，Run 起点冻结，`/mode` 无参重载 meta。D7 区外读取先查同工具同目标授权，skills 有只读豁免。D8 缺省 auto。D9 `/mode` 无别名。
+  - D10 文件工具和 Bash 按 §5 分别匹配会话授权。D11 Bash 在授权未命中时按整条命令、参数、重定向和真实目标分析。D12 删除 `RegisteredTool.access`/`ToolAccess`，以实际 action 为权限依据。D13 settings 严格拒绝未知键，decisionTimeoutMs 迁移提示见 §8 与 CHANGELOG。

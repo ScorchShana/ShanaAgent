@@ -231,13 +231,17 @@ export async function writeFileContent(
   let outcome: ToolOutcome | undefined;
   try {
     await context.assertPathTarget?.();
-    handle = await fs.promises.open(target.realPath, "w");
+    handle = await fs.promises.open(target.realPath, target.exists ? "w" : "wx");
     writeStarted = true;
     await context.assertPathTarget?.();
     await handle.writeFile(args.content, "utf8");
   } catch (error) {
     diagnose(context, writeStarted ? "overwrite" : "open", error);
-    outcome = fileOperationError(error);
+    outcome = fileOperationError(
+      !target.exists && !writeStarted && (error as NodeJS.ErrnoException)?.code === "EEXIST"
+        ? new PathTargetChangedError()
+        : error,
+    );
   } finally {
     if (handle) {
       try {

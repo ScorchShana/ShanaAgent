@@ -115,10 +115,12 @@ describe("AgentLoop", () => {
     ]);
     await f.controller.setApprovalMode("confirm");
     const run = f.controller.submitPrompt("task");
-    await vi.waitFor(() => expect(f.controller.getSnapshot().pendingApproval).toMatchObject({
-      toolCallId: "a",
-      onceOnly: true,
-    }));
+    await vi.waitFor(() =>
+      expect(f.controller.getSnapshot().pendingApproval).toMatchObject({
+        toolCallId: "a",
+        summary: { grantKey: { kind: "file", toolName: "write" } },
+      }),
+    );
     f.controller.resolveApproval(f.controller.getSnapshot().pendingApproval!.id, "deny");
     await expect(run).resolves.toBe("completed");
     const results = (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result");
@@ -721,10 +723,12 @@ it("freezes mode per Run: switches are blocked mid-Run and apply to the next Run
 
     await controller.setApprovalMode("confirm");
     const second = controller.submitPrompt("second");
-    await vi.waitFor(() => expect(controller.getSnapshot().pendingApproval).toMatchObject({
-      toolCallId: "w2",
-      onceOnly: true,
-    }));
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().pendingApproval).toMatchObject({
+        toolCallId: "w2",
+        summary: { grantKey: { kind: "file", toolName: "write" } },
+      }),
+    );
     controller.resolveApproval(controller.getSnapshot().pendingApproval!.id, "deny");
     await expect(second).resolves.toBe("completed");
     expect(fs.existsSync(path.join(root, "b.txt"))).toBe(false);

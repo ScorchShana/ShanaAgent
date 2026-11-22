@@ -386,7 +386,7 @@ export class TuiApp {
     }
     const labels =
       modal.kind === "approval"
-        ? ["仅本次允许", "本会话允许", "拒绝"]
+        ? approvalChoices(state.core.pendingApproval).map((choice) => choice.label)
         : modal.kind === "models"
           ? modal.effortOnly
             ? [...REASONING_EFFORTS]

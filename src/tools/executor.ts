@@ -28,15 +28,22 @@ import type { SpawnProcess, TerminateProcessTree } from "./shell.js";
 export type ToolCallRequest = StoredToolCall;
 
 export interface ToolPermissionRequest {
+  workspaceRoot: string;
+  pathPolicy: PathPolicy;
   toolCallId: string;
   toolName: string;
   action: ToolAction;
 }
 
 export type ToolPermissionDecision =
-  { decision: "allow" } | { decision: "deny"; reason: PermissionDenyReason } | { decision: "cancelled" };
+  | { decision: "allow"; revalidate?: () => Promise<void> }
+  | { decision: "deny"; reason: PermissionDenyReason }
+  | { decision: "cancelled" };
 
 export type ToolPermissionGate = (request: ToolPermissionRequest) => Promise<ToolPermissionDecision>;
+
+const standaloneGate: ToolPermissionGate = async ({ action }) =>
+  defaultNeedsApproval(action) ? { decision: "deny", reason: "no_approver" } : { decision: "allow" };
 
 export type ToolErrorCategory =
   "arguments" | "unknown_tool" | "path" | "permission" | "cancelled" | "io" | "shell" | "internal";
@@ -59,7 +66,10 @@ export interface ToolExecutorOptions {
   onCleanupWarning?: (temporaryPath: string) => void;
   onPendingShell?: (cleanup: import("./shell.js").PendingShellCleanup) => void;
   onToolOutput?: (toolCallId: string, snapshot: string) => void;
-  settings?: Pick<Settings, "editMaxFileBytes" | "viewImageMaxBytes" | "globTimeoutMs" | "grepStderrMaxChars">;
+  settings?: Pick<
+    Settings,
+    "editMaxFileBytes" | "viewImageMaxBytes" | "globTimeoutMs" | "grepStderrMaxChars"
+  >;
   // 当前模型接受 image 输入时注册 view_image；默认 false（六工具）。
   imageInput?: boolean;
   permissionGate?: ToolPermissionGate;
@@ -141,14 +151,18 @@ export class ToolExecutor {
       plan.action.type === "read" ? plan.action.paths : plan.action.type === "write" ? [plan.action.path] : []
     ).map((target) => ({ ...target }));
 
-    if (defaultNeedsApproval(plan.action)) {
-      const gate = this.#options.permissionGate;
-      if (!gate) {
-        return fail("denied", "permission", permissionMessage("no_approver"));
-      }
+    let revalidate: (() => Promise<void>) | undefined;
+    {
+      const gate = this.#options.permissionGate ?? standaloneGate;
       let decision: ToolPermissionDecision;
       try {
-        decision = await gate({ toolCallId: call.id, toolName: tool.name, action: plan.action });
+        decision = await gate({
+          toolCallId: call.id,
+          toolName: tool.name,
+          action: plan.action,
+          workspaceRoot: this.#pathPolicy.workspaceRoot,
+          pathPolicy: this.#pathPolicy,
+        });
       } catch (error) {
         reportToolDiagnostic(this.#options.onDiagnostic, "tool.approval", error);
         return fail("denied", "permission", permissionMessage("approver_error"));
@@ -159,6 +173,7 @@ export class ToolExecutor {
       if (decision.decision !== "allow") {
         return fail("denied", "permission", permissionMessage(decision.reason));
       }
+      revalidate = decision.revalidate;
     }
 
     if (signal?.aborted) {
@@ -168,6 +183,7 @@ export class ToolExecutor {
     let outcome: ToolOutcome;
     try {
       for (const target of approvedPaths) await assertPathTargetUnchanged(this.#pathPolicy, target);
+      await revalidate?.();
       if (signal?.aborted) return fail("not_executed", "cancelled", "Cancelled by user.");
       outcome = await plan.execute();
     } catch (error) {

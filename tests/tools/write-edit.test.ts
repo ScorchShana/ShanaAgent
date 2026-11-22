@@ -25,6 +25,19 @@ afterEach(() => {
 const DIR_LINKS = supportsDirectoryLinks();
 
 describe("confirmed write/edit semantics", () => {
+  it("preserves a file created while approval is pending", async () => {
+    const root = makeWorkspace();
+    const executor = makeExecutor(root, {
+      permissionGate: async () => {
+        writeFileAt(root, "shared.txt", "concurrent content");
+        return { decision: "allow" };
+      },
+    });
+    const result = await executor.execute(call("race", "write", { path: "shared.txt", content: "new" }));
+    expect(result.errorCategory).toBe("path");
+    expect(readFileAt(root, "shared.txt")).toBe("concurrent content");
+  });
+
   it("normalizes working content while retaining the original BOM snapshot", async () => {
     const root = makeWorkspace();
     writeFileAt(root, "a.txt", "\uFEFFa\r\nb\rc\uFEFF");

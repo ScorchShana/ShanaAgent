@@ -1,142 +1,154 @@
-import { describe, expect, it } from "vitest";
-import { matchFirstCommand } from "../../src/security/bash-policy.js";
+﻿import { execFileSync } from "node:child_process";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { analyzeBash } from "../../src/security/bash-policy.js";
+import { createPathPolicy } from "../../src/security/path-policy.js";
 
-describe("v1 首命令白名单", () => {
+let root: string;
+beforeEach(async () => {
+  root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-bash-policy-"));
+  await fs.mkdir(path.join(root, "docs"));
+  for (const file of ["a.txt", "b.txt", "docs/guide.md", "a b.md"])
+    await fs.writeFile(path.join(root, file), "ok");
+});
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  await fs.rm(root, { recursive: true, force: true });
+});
+function analyze(command: string, mode: "confirm" | "auto" = "auto") {
+  return analyzeBash(command, { mode, pathPolicy: createPathPolicy(root) });
+}
+describe("Bash 命令效果", () => {
   it.each([
-    "ls",
     "pwd",
-    "echo",
-    "cat",
-    "head",
-    "tail",
-    "wc",
-    "which",
-    "whoami",
-    "hostname",
-    "uname",
-    "true",
-    "false",
-  ])("白名单命令 %s 放行", (command) => {
-    expect(matchFirstCommand(command)).toBe("allow");
+    "printf '%s\\n' hello",
+    "cat 'a b.md'",
+    "wc -l < a.txt",
+    "ls docs",
+    "grep -nF -- TODO a.txt",
+    "diff -u a.txt b.txt",
+    "cmp a.txt b.txt",
+    "sha256sum -- a.txt",
+    "test -f absent",
+    "cut -d , -f 1 a.txt",
+    "tr -d '\\r' < a.txt",
+    "uniq a.txt",
+    "cat a.txt | wc -l",
+    "cd -- ./docs && wc -l guide.md",
+  ])("只读 %s", async (command) => {
+    expect((await analyze(command, "confirm")).decision).toBe("allow");
   });
-
-  it("白名单命令带相对路径参数与常规选项放行", () => {
-    for (const command of [
-      "ls -la",
-      "ls -la src sub/dir",
-      "cat src/a.ts",
-      "cat -n a.txt b.txt",
-      "head -20 src/a.ts",
-      "wc -l *.ts",
-      "which node",
-      "uname -a",
-      "echo hello world",
-      "  pwd  ",
-    ]) {
-      expect(matchFirstCommand(command)).toBe("allow");
-    }
-  });
-
-  it("glob 参数放行（纯展开无写副作用）", () => {
-    for (const command of ["ls *.ts", "cat file?.txt", "ls [ab].txt", "cat src/**/*.ts"]) {
-      expect(matchFirstCommand(command)).toBe("allow");
-    }
-  });
-
-  it("tail -f 只读长驻由 timeout 兜底，放行", () => {
-    expect(matchFirstCommand("tail -f log.txt")).toBe("allow");
-  });
-
   it.each([
-    "git status",
-    "find . -delete",
+    "mkdir -p out/a",
+    "touch new",
+    "cat a.txt > b.txt",
+    "printf '%s\\n' hi >> new",
+    "uniq a.txt b.txt",
+    "cp -- a.txt docs/",
+    "cp -- a.txt new",
+    "printf '%s\\n' hi | tee -a -- new other",
+    "truncate -s 0 -- new",
+  ])("区内写入 %s", async (command) => {
+    expect((await analyze(command)).decision).toBe("allow");
+    expect((await analyze(command, "confirm")).decision).toBe("ask");
+    expect(await fs.readFile(path.join(root, "b.txt"), "utf8")).toBe("ok");
+  });
+  it.each([
+    "cat a.txt && git fetch",
+    "cat *.txt",
+    'cat "$HOME/a.txt"',
+    "cat '",
     "rm a.txt",
-    "node script.js",
-    "python -c x",
-    "npm install",
-    "date -s now",
-    "env",
-    "printenv",
-    "sed -i s/a/b/ f",
-    "awk {print}",
-    "sort -o out f",
-    "tee out.txt",
-    "xargs rm",
-    "dd if=a of=b",
-    "curl http://x",
-    "mkdir d",
-    "mv a b",
-    "cp a b",
-    "touch a",
-  ])("非白名单命令 %s 询问", (command) => {
-    expect(matchFirstCommand(command)).toBe("ask");
+    "mv a.txt b.txt",
+    "cp -R docs out",
+    "ls -R docs",
+    "ln -s a.txt new",
+    "sort a.txt",
+    "cd docs || wc -l guide.md",
+    "cat a.txt > ../out",
+    "echo test &",
+    "printf -v PATH new",
+    "cd -- -",
+    "tee --output-error=warn",
+    "cat a.txt;",
+    "cat a.txt | unknown",
+  ])("人工 %s", async (command) => {
+    expect((await analyze(command)).decision).toBe("ask");
+  });
+  it("分析后重新检查目标类型", async () => {
+    const result = await analyze("touch new");
+    expect(result.decision).toBe("allow");
+    await fs.mkdir(path.join(root, "new"));
+    if (result.decision === "allow") await expect(result.revalidate()).rejects.toThrow("Path target changed");
+  });
+  it("继承启动脚本时询问", async () => {
+    vi.stubEnv("BASH_ENV", "startup");
+    expect((await analyze("pwd")).decision).toBe("ask");
   });
 });
 
-describe("shell 元字符一律询问", () => {
-  it.each([
-    ["分号", "ls; rm a"],
-    ["后台/与", "ls & rm a"],
-    ["逻辑与", "ls && rm a"],
-    ["逻辑或", "ls || rm a"],
-    ["管道", "ls | tee out"],
-    ["重定向写", "echo x > out.txt"],
-    ["追加重定向", "echo x >> out.txt"],
-    ["重定向读", "cat < in.txt"],
-    ["命令替换括号", "echo $(whoami)"],
-    ["变量", "echo $HOME"],
-    ["变量花括号", "echo ${HOME}"],
-    ["反引号", "echo `whoami`"],
-    ["换行", "ls\nrm a"],
-    ["回车", "ls\rrm a"],
-    ["波浪号", "cat ~/x"],
-    ["子 shell 括号", "(ls)"],
-    ["命令组花括号", "{ ls; }"],
-  ])("%s 询问", (_label, command) => {
-    expect(matchFirstCommand(command)).toBe("ask");
+it("checks the final copy destination and every tee operand", async () => {
+  expect((await analyze("printf '%s' hi | tee -- new ../other")).decision).toBe("ask");
+  await fs.mkdir(path.join(root, "docs", "a.txt"));
+  expect((await analyze("cp -- a.txt docs/")).decision).toBe("ask");
+});
+
+it("requires approval for an external directory reached through a workspace link", async () => {
+  const external = await fs.mkdtemp(path.join(os.tmpdir(), "shana-bash-external-"));
+  try {
+    await fs.writeFile(path.join(external, "data"), "outside");
+    await fs.symlink(external, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
+    expect((await analyze("cat linked/data")).decision).toBe("ask");
+    expect((await analyze("touch linked/new")).decision).toBe("ask");
+  } finally {
+    await fs.rm(external, { recursive: true, force: true });
+  }
+});
+
+it("revalidates the directory used by cd", async () => {
+  const result = await analyze("cd docs && wc -l guide.md");
+  expect(result.decision).toBe("allow");
+  const old = path.join(root, "docs");
+  await fs.rename(old, path.join(root, "moved"));
+  await fs.writeFile(old, "file");
+  if (result.decision === "allow") await expect(result.revalidate()).rejects.toThrow("Path target changed");
+});
+
+it.each(["pwd\u00a0", "cat\u000b a.txt", "cat\\ a.txt"])(
+  "rejects unsupported token separators",
+  async (command) => {
+    expect((await analyze(command)).decision).toBe("ask");
+  },
+);
+
+it("records validated forms and real targets for a pipeline", async () => {
+  const result = await analyze("cat a.txt | tee -- new");
+  expect(result).toMatchObject({
+    decision: "allow",
+    commands: ["cat a.txt", "tee -- new"],
+    readPaths: [path.join(root, "a.txt")],
+    writePaths: [path.join(root, "new")],
   });
 });
 
-describe("首 token 必须是裸白名单命令名", () => {
-  it.each([
-    "/bin/ls",
-    "./ls",
-    "../bin/ls",
-    "sub\\ls",
-    "C:\\tools\\ls.exe",
-    "FOO=bar ls",
-    "LS=1 pwd",
-  ])("路径/赋值形式 %s 询问", (command) => {
-    expect(matchFirstCommand(command)).toBe("ask");
-  });
+it("asks for compound writes when a workspace directory participates in command lookup", async () => {
+  vi.stubEnv("PATH", path.join(root, "docs") + path.delimiter + process.env.PATH);
+  expect((await analyze("touch new && wc -l a.txt")).decision).toBe("ask");
 });
 
-describe("参数隐私守卫", () => {
-  it.each([
-    ["绝对路径", "cat /etc/passwd"],
-    ["家目录", "cat ~/.shana/model.json"],
-    ["上跳开头", "cat ../secret.txt"],
-    ["上跳开头裸", "ls .."],
-    ["中间上跳段", "cat src/../secret.txt"],
-    ["反斜杠上跳段", "cat src\\..\\secret.txt"],
-    ["盘符绝对", "cat C:\\Users\\me\\.shana\\model.json"],
-    ["盘符相对", "cat C:secret.txt"],
-    ["UNC", "cat \\\\server\\share\\x"],
-    ["盘根反斜杠", "cat \\secret.txt"],
-    ["双点前缀文件名（保守）", "cat ..notes.txt"],
-  ])("%s 询问", (_label, command) => {
-    expect(matchFirstCommand(command)).toBe("ask");
-  });
-
-  it("普通相对路径与含点文件名不误伤", () => {
-    for (const command of ["cat a.txt", "ls .hidden", "ls dir/..."]) {
-      expect(matchFirstCommand(command)).toBe("allow");
-    }
-  });
+it.skipIf(process.platform === "win32")("accepts a verified absolute Bash for probes after cd", async () => {
+  vi.stubEnv("PATH", ".:/usr/bin:/bin");
+  await fs.writeFile(path.join(root, "docs", "bash"), "", { mode: 0o755 });
+  expect((await analyze("cd docs && wc -l guide.md", "confirm")).decision).toBe("allow");
 });
 
-describe("空输入", () => {
-  it.each(["", "   ", "\t\n"])("空串/纯空白 %j 询问", (command) => {
-    expect(matchFirstCommand(command)).toBe("ask");
-  });
+it("resolves Git through the actual Bash command path", async () => {
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  for (const command of ["git rev-parse --show-toplevel", "git ls-files --cached"]) {
+    const result = await analyze(command);
+    expect(result.decision).toBe("allow");
+    if (result.decision === "allow") await result.revalidate();
+  }
 });

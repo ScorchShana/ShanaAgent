@@ -98,7 +98,11 @@ describe("V1/V6 Shell 真实执行", () => {
     expect(result.status).toBe("success");
     const reported = fs.realpathSync.native(result.content.split("Stdout:\n")[1].split("\nStderr:")[0]);
     expect(path.resolve(reported)).toBe(path.resolve(fs.realpathSync.native(root)));
-    expect(requests[0].action).toEqual({ type: "shell", command: "node cwd.js" });
+    expect(requests[0].action).toEqual({
+      type: "shell",
+      command: "node cwd.js",
+      shellExecutable: shellDescriptor.executable,
+    });
 
     const echo = await executor.execute(call("c2", shellName, { command: "echo hello" }));
     expect(echo.status).toBe("success");

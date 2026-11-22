@@ -51,9 +51,15 @@ const APPROVAL_CHOICES = [
 ] as const;
 
 export function approvalChoices(approval: PendingApproval | null) {
-  return approval?.onceOnly
-    ? APPROVAL_CHOICES.filter((choice) => choice.decision !== "session")
-    : APPROVAL_CHOICES;
+  if (approval?.onceOnly) return APPROVAL_CHOICES.filter((choice) => choice.decision !== "session");
+  const key = approval?.summary?.grantKey;
+  if (!key) return APPROVAL_CHOICES;
+  const scope =
+    key.kind === "shell_command"
+      ? key.command
+      : [...(key.workspace ? ["工作区"] : []), ...key.paths].join("、");
+  const label = `本会话允许 ${approval.toolName} · ${sanitizeDisplayText(scope).replaceAll("\n", " ")}`;
+  return APPROVAL_CHOICES.map((choice) => (choice.decision === "session" ? { ...choice, label } : choice));
 }
 
 export const COMMANDS = [
