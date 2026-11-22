@@ -199,7 +199,7 @@ export class StatusBar implements Component {
     const state = this.state;
     const mode = state.core.session.approvalMode;
     // full 是全豁免（含区外写入），用 warning 色做视觉提醒。
-    const label = theme.muted("Mode: ") + (mode === "readonly" ? theme.muted("readonly")
+    const label = theme.muted("Mode: ") + (mode === "confirm" ? theme.muted("confirm")
       : mode === "auto" ? theme.cyan("auto") : theme.warning("full"));
     const metrics = this.metrics;
     const prefix = `${state.core.status.kind !== "idle" ? theme.muted("Draft · ") : ""}${label}`;

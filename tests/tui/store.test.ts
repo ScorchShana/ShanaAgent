@@ -1969,12 +1969,12 @@ it("offers mode completion and rejects invalid arguments without a Run", async (
   try {
     store.setDraft("/mo");
     expect(store.commandOptions().map((option) => option.name)).toContain("/mode");
-    store.setDraft("/mode maybe");
+    store.setDraft("/mode readonly");
     await store.submit();
-    expect(store.getSnapshot().notice?.text).toContain("/mode [readonly|auto|full]");
+    expect(store.getSnapshot().notice?.text).toContain("/mode [confirm|auto|full]");
     store.setDraft("/mode auto extra");
     await store.submit();
-    expect(store.getSnapshot().notice?.text).toContain("/mode [readonly|auto|full]");
+    expect(store.getSnapshot().notice?.text).toContain("/mode [confirm|auto|full]");
   } finally {
     await store.dispose();
   }
@@ -2004,7 +2004,7 @@ it("reports busy mode commands during a Run", async () => {
 });
 
 it("refreshes the approval mode snapshot when a notice arrives", async () => {
-  let mode: "readonly" | "auto" | "full" = "auto";
+  let mode: "confirm" | "auto" | "full" = "auto";
   const core = new SessionController({
     driver: { execute: async () => ({ outcome: "completed" }) },
     hooks: {
@@ -2033,7 +2033,7 @@ it("refreshes the approval mode snapshot when a notice arrives", async () => {
 it("reports the Core-reloaded mode in the /mode query", async () => {
   const core = new SessionController({
     driver: { execute: async () => ({ outcome: "completed" }) },
-    commands: { getApprovalMode: async () => "readonly" },
+    commands: { getApprovalMode: async () => "confirm" },
     hooks: {
       getSessionView: () => ({
         ref: { workspaceId: "ws", sessionId: "s" },
@@ -2049,14 +2049,14 @@ it("reports the Core-reloaded mode in the /mode query", async () => {
   try {
     store.setDraft("/mode");
     await store.submit();
-    expect(store.getSnapshot().notice?.text).toBe("Mode: readonly");
+    expect(store.getSnapshot().notice?.text).toBe("Mode: confirm");
   } finally {
     await store.dispose();
   }
 });
 
-it("switches the mode via /mode full and reports the snapshot value", async () => {
-  let mode: "readonly" | "auto" | "full" = "auto";
+it("switches the mode via /mode confirm and reports the snapshot value", async () => {
+  let mode: "confirm" | "auto" | "full" = "auto";
   const core = new SessionController({
     driver: { execute: async () => ({ outcome: "completed" }) },
     commands: {
@@ -2077,10 +2077,10 @@ it("switches the mode via /mode full and reports the snapshot value", async () =
   });
   const store = new TuiStore(core, parseSettings({}));
   try {
-    store.setDraft("/mode full");
+    store.setDraft("/mode confirm");
     await store.submit();
-    expect(mode).toBe("full");
-    expect(store.getSnapshot().notice?.text).toBe("Mode: full");
+    expect(mode).toBe("confirm");
+    expect(store.getSnapshot().notice?.text).toBe("Mode: confirm");
   } finally {
     await store.dispose();
   }

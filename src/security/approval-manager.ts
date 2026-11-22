@@ -1,5 +1,5 @@
 import type { ApprovalDecision } from "../core/state.js";
-import { matchFirstCommand, type BashCommandAnalyzer } from "./bash-policy.js";
+import { analyzeBash } from "./bash-policy.js";
 import {
   emptySessionGrants,
   evaluatePermission,
@@ -17,15 +17,12 @@ import {
  */
 export type Approver = (request: ApprovalRequest) => Promise<ApprovalDecision>;
 
-export type PermissionDenyReason =
-  | "no_approver"
-  | "denied_by_user"
-  | "denied_by_policy"
-  | "approver_error";
+export type PermissionDenyReason = "no_approver" | "denied_by_user" | "approver_error";
 
 export type PermissionOutcome =
   | {
       decision: "allow";
+      revalidate?: () => Promise<void>;
       basis:
         | "workspace_read"
         | "skills_read"
@@ -41,8 +38,7 @@ export type PermissionOutcome =
 
 export interface ApprovalManagerOptions {
   approver?: Approver;
-  /** auto 模式 bash 判定 seam；缺省为首命令白名单 analyzer。 */
-  analyzeBash?: BashCommandAnalyzer;
+  analyzeBash?: typeof analyzeBash;
   /** analyzer 抛错时的诊断出口（永不兜底放行，按 ask 处理）。 */
   onAnalyzerError?: (error: unknown) => void;
 }
@@ -50,17 +46,20 @@ export interface ApprovalManagerOptions {
 export class ApprovalManager {
   #grants: SessionGrants = emptySessionGrants();
   readonly #approver: Approver | undefined;
-  readonly #analyzeBash: BashCommandAnalyzer;
+  readonly #analyzeBash: typeof analyzeBash;
   readonly #onAnalyzerError: ((error: unknown) => void) | undefined;
 
   constructor(options: ApprovalManagerOptions = {}) {
     this.#approver = options.approver;
-    this.#analyzeBash = options.analyzeBash ?? matchFirstCommand;
+    this.#analyzeBash = options.analyzeBash ?? analyzeBash;
     this.#onAnalyzerError = options.onAnalyzerError;
   }
 
   get grants(): SessionGrants {
-    return { shellCommands: new Set(this.#grants.shellCommands) };
+    return {
+      shellCommands: new Set(this.#grants.shellCommands),
+      fileScopes: new Set(this.#grants.fileScopes),
+    };
   }
 
   async requestPermission(
@@ -69,26 +68,26 @@ export class ApprovalManager {
   ): Promise<PermissionOutcome> {
     if (options.signal?.aborted) return { decision: "cancelled" };
     const verdict = evaluatePermission(subject, this.#grants, options.mode);
-    if (verdict.outcome === "deny") {
-      return { decision: "deny", reason: verdict.reason };
-    }
     if (verdict.outcome === "allow") {
       return { decision: "allow", basis: verdict.basis };
     }
     if (options.signal?.aborted) return { decision: "cancelled" };
 
-    // auto 模式 bash：会话授权已在 evaluatePermission 命中放行，此处 analyzer 是第二道；
-    // 判不了或抛错一律落人工，绝不兜底放行。
-    if (options.mode === "auto" && verdict.request.access === "shell") {
-      let analyzed: ReturnType<BashCommandAnalyzer>;
+    if (verdict.request.access === "shell" && subject.pathPolicy) {
       try {
-        analyzed = this.#analyzeBash(verdict.request.command ?? "");
+        const result = await this.#analyzeBash(verdict.request.command!, {
+          mode: options.mode,
+          pathPolicy: subject.pathPolicy,
+          shellExecutable: subject.action.type === "shell" ? subject.action.shellExecutable : undefined,
+        });
+        if (options.signal?.aborted) return { decision: "cancelled" };
+        if (result.decision === "allow")
+          return { decision: "allow", basis: "bash_policy", revalidate: result.revalidate };
       } catch (error) {
         this.#onAnalyzerError?.(error);
-        analyzed = "ask";
       }
-      if (analyzed === "allow") return { decision: "allow", basis: "bash_policy" };
     }
+    if (options.signal?.aborted) return { decision: "cancelled" };
 
     const approver = this.#approver;
     if (!approver) {

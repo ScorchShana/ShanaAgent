@@ -1,3 +1,4 @@
+import { PathTargetChangedError } from "../../src/security/path-policy.js";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -241,7 +242,7 @@ describe("权限钩子 — 默认策略与外部路径", () => {
 
     expect(result.status).toBe("success");
     expect(requests).toHaveLength(1);
-    expect(requests[0].action).toEqual({ type: "shell", command });
+    expect(requests[0].action).toEqual({ type: "shell", command, shellExecutable: detectShell(process.platform).executable });
   });
 
   it("审批被拒绝不阻断后续工具调用", async () => {
@@ -321,7 +322,6 @@ describe("V8 取消与待决审批", () => {
     const root = makeWorkspace();
     const cases: Array<[ToolPermissionDecision, string]> = [
       [{ decision: "deny", reason: "denied_by_user" }, "Error: User denied."],
-      [{ decision: "deny", reason: "denied_by_policy" }, "Error: Denied by read-only mode."],
       [{ decision: "deny", reason: "no_approver" }, "Error: Internal error. Stop and ask user."],
       [{ decision: "deny", reason: "approver_error" }, "Error: Internal error. Stop and ask user."],
     ];
@@ -495,4 +495,20 @@ describe("bash 运行中实时输出穿透", () => {
     vi.advanceTimersByTime(5000);
     expect(outputs).toEqual([["c-live", "step1\n"]]);
   });
+});
+
+it("Bash 执行前复验发现目标变化时返回路径错误，并保留目标内容", async () => {
+  const root = makeWorkspace();
+  const original = writeFileAt(root, "target", "keep");
+  const fake = fakeShellRun();
+  const revalidate = vi.fn(async () => { throw new PathTargetChangedError(); });
+  const executor = makeExecutor(root, {
+    spawnProcess: fake.spawnProcess,
+    permissionGate: async () => ({decision:"allow", revalidate}),
+  });
+  const result = await executor.execute(call("c", "bash", { command:"printf changed > target" }));
+  expect(result).toMatchObject({status:"error",errorCategory:"path",content:"Error: Path target changed. Stop and ask user."});
+  expect(revalidate).toHaveBeenCalledOnce();
+  expect(fake.spawnCalls).toHaveLength(0);
+  expect(fs.readFileSync(original,"utf8")).toBe("keep");
 });

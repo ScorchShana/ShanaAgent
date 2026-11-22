@@ -113,12 +113,19 @@ describe("AgentLoop", () => {
       ]),
       makeAssistantMessage([], "done"),
     ]);
-    // readonly 策略拒绝：区内 write 不再弹审批，直接 denied_by_policy。
-    await f.controller.setApprovalMode("readonly");
-    await expect(f.controller.submitPrompt("task")).resolves.toBe("completed");
+    await f.controller.setApprovalMode("confirm");
+    const run = f.controller.submitPrompt("task");
+    await vi.waitFor(() =>
+      expect(f.controller.getSnapshot().pendingApproval).toMatchObject({
+        toolCallId: "a",
+        summary: { grantKey: { kind: "file", toolName: "write" } },
+      }),
+    );
+    f.controller.resolveApproval(f.controller.getSnapshot().pendingApproval!.id, "deny");
+    await expect(run).resolves.toBe("completed");
     const results = (await f.store.loadSession(f.ref)).records.filter((r) => r.type === "tool_result");
     expect(results.map((r) => r.status)).toEqual(["denied", "error"]);
-    expect(results[0]).toMatchObject({ content: "Error: Denied by read-only mode." });
+    expect(results[0]).toMatchObject({ content: "Error: User denied." });
     expect(f.requests[1]!.context.messages.map((m) => m.role)).toEqual([
       "user",
       "assistant",
@@ -573,19 +580,19 @@ it("keeps blank session mode changes in memory and resets on new", async () => {
   });
   try {
     expect(await controller.getApprovalMode()).toBe("auto");
-    await controller.setApprovalMode("readonly");
-    expect(controller.getSnapshot().session.approvalMode).toBe("readonly");
+    await controller.setApprovalMode("confirm");
+    expect(controller.getSnapshot().session.approvalMode).toBe("confirm");
     const snapshot = controller.getSnapshot();
     snapshot.session.approvalMode = "full";
-    expect(controller.getSnapshot().session.approvalMode).toBe("readonly");
+    expect(controller.getSnapshot().session.approvalMode).toBe("confirm");
     expect(await store.listSessions(WORKSPACE_ID)).toEqual([]);
     await controller.submitPrompt("hello");
     const ref = controller.getSnapshot().session.ref!;
-    expect((await store.readSessionMeta(ref)).approvalMode).toBe("readonly");
+    expect((await store.readSessionMeta(ref)).approvalMode).toBe("confirm");
     await controller.newSession();
     expect(await controller.getApprovalMode()).toBe("auto");
     await controller.resumeSession(ref);
-    expect(await controller.getApprovalMode()).toBe("readonly");
+    expect(await controller.getApprovalMode()).toBe("confirm");
   } finally {
     await controller.exit();
   }
@@ -601,8 +608,8 @@ it.each([false, true])(
       throw new Error("save failed");
     });
     try {
-      await expect(f.controller.setApprovalMode("readonly")).rejects.toThrow("save failed");
-      expect(f.controller.getSnapshot().session.approvalMode).toBe(committed ? "readonly" : "auto");
+      await expect(f.controller.setApprovalMode("confirm")).rejects.toThrow("save failed");
+      expect(f.controller.getSnapshot().session.approvalMode).toBe(committed ? "confirm" : "auto");
       await expect(f.controller.submitPrompt("run")).resolves.toBe("failed");
     } finally {
       await f.controller.exit();
@@ -614,7 +621,7 @@ it("blocks new Runs only while failed save reconciliation remains unresolved", a
   vi.spyOn(f.store, "setApprovalMode").mockRejectedValue(new Error("save failed"));
   const read = vi.spyOn(f.store, "readSessionMeta").mockRejectedValue(new Error("read failed"));
   try {
-    await expect(f.controller.setApprovalMode("readonly")).rejects.toThrow("save failed");
+    await expect(f.controller.setApprovalMode("confirm")).rejects.toThrow("save failed");
     expect(() => f.controller.submitPrompt("run")).toThrow("reload Session metadata");
     await expect(f.controller.getApprovalMode()).rejects.toThrow("read failed");
     read.mockRestore();
@@ -703,7 +710,7 @@ it("freezes mode per Run: switches are blocked mid-Run and apply to the next Run
     const first = controller.submitPrompt("first");
     await vi.waitFor(() => expect(pendingId).not.toBeNull());
     // 活动 Run 期间切换模式被生命周期门控拒绝；本 Run 沿用起点冻结的 auto。
-    expect(() => controller.setApprovalMode("readonly")).toThrow(BusyError);
+    expect(() => controller.setApprovalMode("confirm")).toThrow(BusyError);
     controller.resolveApproval(pendingId!, "once");
     const deadline = Date.now() + 5000;
     while (fake.spawnCalls.length === 0 && Date.now() < deadline)
@@ -714,17 +721,25 @@ it("freezes mode per Run: switches are blocked mid-Run and apply to the next Run
     // 同一 Run 内后续区内 write 仍按冻结的 auto 直接放行。
     expect(fs.readFileSync(path.join(root, "a.txt"), "utf8")).toBe("x");
 
-    await controller.setApprovalMode("readonly");
-    await expect(controller.submitPrompt("second")).resolves.toBe("completed");
+    await controller.setApprovalMode("confirm");
+    const second = controller.submitPrompt("second");
+    await vi.waitFor(() =>
+      expect(controller.getSnapshot().pendingApproval).toMatchObject({
+        toolCallId: "w2",
+        summary: { grantKey: { kind: "file", toolName: "write" } },
+      }),
+    );
+    controller.resolveApproval(controller.getSnapshot().pendingApproval!.id, "deny");
+    await expect(second).resolves.toBe("completed");
     expect(fs.existsSync(path.join(root, "b.txt"))).toBe(false);
     const results = (await store.loadSession(controller.getSnapshot().session.ref!)).records.filter(
       (r) => r.type === "tool_result",
     );
     expect(results.at(-1)).toMatchObject({
       status: "denied",
-      content: "Error: Denied by read-only mode.",
+      content: "Error: User denied.",
     });
-    expect(approvals).toBe(1);
+    expect(approvals).toBe(2);
   } finally {
     subscription.unsubscribe();
     await controller.exit();

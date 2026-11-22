@@ -1,6 +1,6 @@
 import { visibleWidth } from "./framework/index.js";
 import { SessionController } from "../core/session-controller.js";
-import type { ApprovalDecision, ControllerSnapshot, SessionListEntry } from "../core/state.js";
+import type { ApprovalDecision, ControllerSnapshot, PendingApproval, SessionListEntry } from "../core/state.js";
 import {
   FAILED_REQUEST_ANNOTATION,
   INTERRUPTED_RESPONSE_ANNOTATION,
@@ -44,6 +44,24 @@ export function sanitizeDisplayText(text: string): string {
     .replace(CONTROL_CHARACTERS, "");
 }
 export const cellWidth = visibleWidth;
+const APPROVAL_CHOICES = [
+  { label: "允许一次", decision: "once" },
+  { label: "本会话允许", decision: "session" },
+  { label: "拒绝", decision: "deny" },
+] as const;
+
+export function approvalChoices(approval: PendingApproval | null) {
+  if (approval?.onceOnly) return APPROVAL_CHOICES.filter((choice) => choice.decision !== "session");
+  const key = approval?.summary?.grantKey;
+  if (!key) return APPROVAL_CHOICES;
+  const scope =
+    key.kind === "shell_command"
+      ? key.command
+      : [...(key.workspace ? ["工作区"] : []), ...key.paths].join("、");
+  const label = `本会话允许 ${approval.toolName} · ${sanitizeDisplayText(scope).replaceAll("\n", " ")}`;
+  return APPROVAL_CHOICES.map((choice) => (choice.decision === "session" ? { ...choice, label } : choice));
+}
+
 export const COMMANDS = [
   { name: "/mode", description: "查看或切换审批模式" },
   { name: "/model", description: "选择模型" },
@@ -573,8 +591,8 @@ export class TuiStore {
       const parts = command.split(/\s+/);
       const mode = parts[1];
       // 显式比较让 TS 收窄为 ApprovalMode，避免 cast。
-      if (parts.length > 2 || (mode !== undefined && mode !== "readonly" && mode !== "auto" && mode !== "full")) {
-        this.notice("用法：/mode [readonly|auto|full]", true);
+      if (parts.length > 2 || (mode !== undefined && mode !== "confirm" && mode !== "auto" && mode !== "full")) {
+        this.notice("用法：/mode [confirm|auto|full]", true);
         return Promise.resolve();
       }
       return this.command(async () => {
@@ -678,7 +696,7 @@ export class TuiStore {
     if (!modal || (this.commandRequest && modal.kind !== "approval")) return;
     const count =
       modal.kind === "approval"
-        ? 3
+        ? approvalChoices(this.state.core.pendingApproval).length
         : modal.kind === "models"
           ? modal.effortOnly
             ? REASONING_EFFORTS.length
@@ -693,11 +711,8 @@ export class TuiStore {
     if (!modal) return Promise.resolve();
     if (modal.kind === "approval") {
       const approval = this.controller.getSnapshot().pendingApproval;
-      if (approval)
-        this.controller.resolveApproval(
-          approval.id,
-          (["once", "session", "deny"] as const)[modal.selection]!,
-        );
+      const choice = approvalChoices(approval)[modal.selection];
+      if (approval && choice) this.controller.resolveApproval(approval.id, choice.decision);
       this.update({ modal: null });
       return Promise.resolve();
     }

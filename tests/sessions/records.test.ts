@@ -387,7 +387,7 @@ describe("approvalMode metadata", () => {
   const meta = { version: 6, sessionId: "s1", workspaceId: "ws", createdAt: TS };
   it("preserves absence and accepts all three modes", () => {
     expect(parseSessionMeta(meta)).not.toHaveProperty("approvalMode");
-    for (const mode of ["readonly", "auto", "full"] as const) {
+    for (const mode of ["confirm", "auto", "full"] as const) {
       expect(parseSessionMeta({ ...meta, approvalMode: mode }).approvalMode).toBe(mode);
     }
   });

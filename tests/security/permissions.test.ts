@@ -27,14 +27,14 @@ afterEach(cleanupTempDirs);
 
 const DIR_LINKS = supportsDirectoryLinks();
 const shellName = detectShell(process.platform).kind;
-const MODES: readonly ApprovalMode[] = ["readonly", "auto", "full"];
+const MODES: readonly ApprovalMode[] = ["confirm", "auto", "full"];
 
 async function prepareAction(
   root: string,
   toolName: string,
   args: Record<string, unknown>,
 ): Promise<ToolAction> {
-  const registry = createToolRegistry();
+  const registry = createToolRegistry(process.platform, undefined, undefined, toolName === "view_image");
   const tool = registry.get(toolName);
   if (!tool) throw new Error(`tool not registered: ${toolName}`);
   const plan = await tool.prepare(args as JsonObject, {
@@ -53,7 +53,7 @@ async function verdictFor(
   grants = emptySessionGrants(),
 ): Promise<PermissionVerdict> {
   const action = await prepareAction(root, toolName, args);
-  return evaluatePermission({ toolCallId: "call-1", toolName, action }, grants, mode);
+  return evaluatePermission({ toolCallId: "call-1", toolName, action, workspaceRoot: root }, grants, mode);
 }
 
 function requireAsk(verdict: PermissionVerdict): ApprovalRequest {
@@ -69,14 +69,12 @@ function outsideLayout(): { root: string; parent: string } {
 }
 
 describe("read 类：区内/skills 区放行与模式无关，区外逐次人工（full 除外）", () => {
-  it("工作区内 read/glob/grep：readonly/auto workspace_read；full 按 §3.1 顺序 mode_full", async () => {
+  it("工作区内 read/glob/grep：confirm/auto workspace_read；full 按 §3.1 顺序 mode_full", async () => {
     const root = makeWorkspace();
     writeFileAt(root, "src/a.ts", "x");
     writeFileAt(root, "src/b.ts", "y");
 
-    // 生产路径上区内读由 executor defaultNeedsApproval 跳过门控（三模式均不触达
-    // evaluatePermission）；此处直接验证纯函数在各模式下的判定。
-    for (const mode of ["readonly", "auto"] as const) {
+    for (const mode of ["confirm", "auto"] as const) {
       for (const [toolName, args] of [
         ["read", { path: "src/a.ts" }],
         ["glob", { pattern: "src/*.ts" }],
@@ -94,7 +92,7 @@ describe("read 类：区内/skills 区放行与模式无关，区外逐次人工
     });
   });
 
-  it("区外 read/glob/grep：readonly/auto 逐次 ask 且无授权键，full 放行 mode_full", async () => {
+  it("区外 read/glob/grep/view_image：confirm/auto ask 且提供工具授权键，full 放行 mode_full", async () => {
     const { root, parent } = outsideLayout();
     const outsideFile = path.join(parent, "outside.txt");
     fs.writeFileSync(outsideFile, "secret");
@@ -102,13 +100,14 @@ describe("read 类：区内/skills 区放行与模式无关，区外逐次人工
       ["read", { path: outsideFile }],
       ["glob", { pattern: "*.txt", path: parent }],
       ["grep", { pattern: "x", path: parent }],
+      ["view_image", { path: writeFileAt(parent, "outside.png", "x") }],
     ];
 
-    for (const mode of ["readonly", "auto"] as const) {
+    for (const mode of ["confirm", "auto"] as const) {
       for (const [toolName, args] of cases) {
         const request = requireAsk(await verdictFor(root, toolName, args, mode));
         expect(request.touchesOutsideWorkspace).toBe(true);
-        expect(request.grantKey).toBeNull();
+        expect(request.grantKey).toMatchObject({ kind: "file", toolName });
       }
     }
     for (const [toolName, args] of cases) {
@@ -120,8 +119,8 @@ describe("read 类：区内/skills 区放行与模式无关，区外逐次人工
   });
 });
 
-describe("write/edit：readonly 拒绝、auto 区内放行区外人工、full 全放行", () => {
-  it("区内 write/edit：readonly deny，auto workspace_write，full mode_full", async () => {
+describe("write/edit：confirm 人工、auto 区内放行区外人工、full 全放行", () => {
+  it("区内 write/edit：confirm ask，auto workspace_write，full mode_full", async () => {
     const root = makeWorkspace();
     writeFileAt(root, "exists.txt", "original");
     const cases: Array<[string, Record<string, unknown>]> = [
@@ -131,9 +130,11 @@ describe("write/edit：readonly 拒绝、auto 区内放行区外人工、full �
     ];
 
     for (const [toolName, args] of cases) {
-      expect(await verdictFor(root, toolName, args, "readonly")).toEqual({
-        outcome: "deny",
-        reason: "denied_by_policy",
+      const request = requireAsk(await verdictFor(root, toolName, args, "confirm"));
+      expect(request).toMatchObject({
+        access: "write",
+        touchesOutsideWorkspace: false,
+        grantKey: { kind: "file" },
       });
       expect(await verdictFor(root, toolName, args, "auto")).toEqual({
         outcome: "allow",
@@ -146,7 +147,7 @@ describe("write/edit：readonly 拒绝、auto 区内放行区外人工、full �
     }
   });
 
-  it("区外写入：readonly deny，auto 逐次 ask（grantKey null，bash 授权不豁免），full mode_full", async () => {
+  it("区外写入：confirm/auto 逐次 ask，full mode_full", async () => {
     const { root, parent } = outsideLayout();
     const outsideFile = path.join(parent, "target.txt");
     const bashGrants = withGrant(emptySessionGrants(), { kind: "shell_command", command: "ls" });
@@ -156,13 +157,10 @@ describe("write/edit：readonly 拒绝、auto 区内放行区外人工、full �
     ];
 
     for (const [toolName, args] of cases) {
-      expect(await verdictFor(root, toolName, args, "readonly")).toEqual({
-        outcome: "deny",
-        reason: "denied_by_policy",
-      });
-      const request = requireAsk(await verdictFor(root, toolName, args, "auto", bashGrants));
-      expect(request.touchesOutsideWorkspace).toBe(true);
-      expect(request.grantKey).toBeNull();
+      for (const mode of ["confirm", "auto"] as const) {
+        const request = requireAsk(await verdictFor(root, toolName, args, mode, bashGrants));
+        expect(request).toMatchObject({ touchesOutsideWorkspace: true, grantKey: { kind: "file" } });
+      }
       expect(await verdictFor(root, toolName, args, "full")).toEqual({
         outcome: "allow",
         basis: "mode_full",
@@ -182,7 +180,7 @@ describe("write/edit：readonly 拒绝、auto 区内放行区外人工、full �
       access: "write",
       operation: "create",
       touchesOutsideWorkspace: true,
-      grantKey: null,
+      grantKey: { kind: "file" },
       paths: [path.join(fs.realpathSync.native(parent), "target.txt")],
     });
 
@@ -198,13 +196,11 @@ describe("write/edit：readonly 拒绝、auto 区内放行区外人工、full �
   });
 });
 
-describe("bash：readonly 整体拒绝、auto 授权/人工、full 全放行", () => {
-  it("readonly 即使只读命令也策略拒绝（v1 不做命令级豁免）", async () => {
+describe("bash：confirm 人工、auto 授权/人工、full 全放行", () => {
+  it("confirm 将未授权 Bash 交给分析器，保留精确授权键", async () => {
     const root = makeWorkspace();
-    expect(await verdictFor(root, shellName, { command: "ls" }, "readonly")).toEqual({
-      outcome: "deny",
-      reason: "denied_by_policy",
-    });
+    const request = requireAsk(await verdictFor(root, shellName, { command: "ls" }, "confirm"));
+    expect(request).toMatchObject({ command: "ls", grantKey: { kind: "shell_command", command: "ls" } });
   });
 
   it("auto 询问携带完全相同的原始命令字符串与 shell_command 授权键", async () => {
@@ -287,20 +283,20 @@ describe("判定依据是解析后的真实路径", () => {
     ]);
   });
 
-  it("真实目标不同则判定不同：链接目录走审批，区内普通文件自动允许", async () => {
+  it.each(["confirm", "auto"] as const)("%s 下链接目录走审批，区内普通文件自动允许", async (mode) => {
     if (!DIR_LINKS) return;
     const root = makeWorkspace();
     const outside = tempDir("shana-outside-");
     fs.mkdirSync(path.join(outside, "target"));
     createDirLink(path.join(outside, "target"), path.join(root, "escape"));
 
-    const viaLink = requireAsk(await verdictFor(root, "grep", { pattern: "x", path: "escape" }, "auto"));
+    const viaLink = requireAsk(await verdictFor(root, "grep", { pattern: "x", path: "escape" }, mode));
     expect(viaLink.access).toBe("read");
     expect(viaLink.touchesOutsideWorkspace).toBe(true);
-    expect(viaLink.grantKey).toBeNull();
+    expect(viaLink.grantKey).toMatchObject({ kind: "file", paths: viaLink.paths });
 
     writeFileAt(root, "plain.txt", "x");
-    expect(await verdictFor(root, "grep", { pattern: "x", path: "plain.txt" }, "auto")).toEqual({
+    expect(await verdictFor(root, "grep", { pattern: "x", path: "plain.txt" }, mode)).toEqual({
       outcome: "allow",
       basis: "workspace_read",
     });
@@ -341,7 +337,7 @@ describe("skills 只读区权限", () => {
     return { root, skills };
   }
 
-  it("read/glob/grep/view_image 命中 skills 区：readonly/auto skills_read，full mode_full", async () => {
+  it("read/glob/grep/view_image 命中 skills 区：confirm/auto skills_read，full mode_full", async () => {
     const { root, skills } = makeSkillsLayout();
     writeFileAt(skills, "review/SKILL.md", "needle");
     writeFileAt(skills, "review/img.png", "x");
@@ -351,8 +347,7 @@ describe("skills 只读区权限", () => {
       ["grep", { pattern: "needle", path: skills }, false],
       ["view_image", { path: path.join(skills, "review", "img.png") }, true],
     ] as const;
-    // 生产路径上 skills 读同样由 executor 跳过门控；full 的 mode_full 是 §3.1 顺序。
-    for (const mode of ["readonly", "auto"] as const) {
+    for (const mode of ["confirm", "auto"] as const) {
       for (const [toolName, args, imageInput] of cases) {
         expect(await verdictWithSkills(root, skills, toolName, args, mode, { imageInput })).toEqual({
           outcome: "allow",
@@ -386,7 +381,7 @@ describe("skills 只读区权限", () => {
     ).toEqual({ outcome: "allow", basis: "workspace_read" });
   });
 
-  it("skills 内 write/edit：readonly deny、auto ask（区外写入）、full mode_full（D1 全豁免）", async () => {
+  it("skills 内 write/edit：confirm/auto 逐次 ask，full mode_full", async () => {
     const { root, skills } = makeSkillsLayout();
     const target = writeFileAt(skills, "review/SKILL.md", "x");
     for (const toolName of ["write", "edit"] as const) {
@@ -394,13 +389,10 @@ describe("skills 只读区权限", () => {
         toolName === "write"
           ? { path: target, content: "y" }
           : { path: target, old_string: "x", new_string: "y" };
-      expect(await verdictWithSkills(root, skills, toolName, args, "readonly")).toEqual({
-        outcome: "deny",
-        reason: "denied_by_policy",
-      });
-      const request = requireAsk(await verdictWithSkills(root, skills, toolName, args, "auto"));
-      expect(request.touchesOutsideWorkspace).toBe(true);
-      expect(request.grantKey).toBeNull();
+      for (const mode of ["confirm", "auto"] as const) {
+        const request = requireAsk(await verdictWithSkills(root, skills, toolName, args, mode));
+        expect(request).toMatchObject({ touchesOutsideWorkspace: true, grantKey: { kind: "file" } });
+      }
       expect(await verdictWithSkills(root, skills, toolName, args, "full")).toEqual({
         outcome: "allow",
         basis: "mode_full",
@@ -431,4 +423,48 @@ describe("skills 只读区权限", () => {
     );
     expect(requireAsk(verdict).touchesOutsideWorkspace).toBe(true);
   });
+});
+
+it("区内授权按工具和工作区匹配，区外多目标需要逐一覆盖", async () => {
+  const { root, parent } = outsideLayout();
+  const other = makeWorkspace();
+  const key = requireAsk(await verdictFor(root, "write", { path: "a", content: "a" }, "confirm")).grantKey!;
+  let grants = withGrant(emptySessionGrants(), key);
+  expect(await verdictFor(root, "write", { path: "b", content: "b" }, "auto", grants)).toEqual({
+    outcome: "allow",
+    basis: "session_grant",
+  });
+  expect((await verdictFor(other, "write", { path: "b", content: "b" }, "confirm", grants)).outcome).toBe(
+    "ask",
+  );
+  expect(
+    (await verdictFor(root, "edit", { path: "b", old_string: "b", new_string: "c" }, "confirm", grants))
+      .outcome,
+  ).toBe("ask");
+  const policy = createPathPolicy(root);
+  const targets = ["a", "b"].map((name) => policy.resolve(path.join(parent, name)));
+  const read = (paths: typeof targets) =>
+    evaluatePermission(
+      { toolCallId: "r", toolName: "read", action: { type: "read", paths }, workspaceRoot: root },
+      grants,
+      "confirm",
+    );
+  for (const target of targets) {
+    expect(read(targets).outcome).toBe("ask");
+    grants = withGrant(grants, requireAsk(read([target])).grantKey!);
+  }
+  expect(read(targets)).toEqual({ outcome: "allow", basis: "session_grant" });
+});
+
+it("外部搜索授权仅覆盖同一工具的原始搜索根", async () => {
+  const { root, parent } = outsideLayout();
+  const dir = path.join(parent, "external");
+  fs.mkdirSync(path.join(dir, "sub"), { recursive: true });
+  const search = (tool: string, dir: string, grants = emptySessionGrants()) =>
+    verdictFor(root, tool, { path: dir, pattern: "needle" }, "confirm", grants);
+  const grants = withGrant(emptySessionGrants(), requireAsk(await search("glob", dir)).grantKey!);
+  expect(await search("glob", dir, grants)).toEqual({ outcome: "allow", basis: "session_grant" });
+  expect((await search("glob", parent, grants)).outcome).toBe("ask");
+  expect((await search("glob", path.join(dir, "sub"), grants)).outcome).toBe("ask");
+  expect((await search("grep", dir, grants)).outcome).toBe("ask");
 });

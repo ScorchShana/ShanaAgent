@@ -4,7 +4,8 @@
 
 - **修复**：首个 Run 发出即取消、或流式中途取消时状态栏 Context 变 0。Context 改为 Core 维护的单一权威值，经快照直供状态栏（展示层不再自读 usage 选值）：优先"最近一次可信实测 prompt + 未测量增量估算"，无可信锚点（取消的零占位 usage、压后、/resume 重建等）用全量估算（含系统提示词、工具 Schema 与全部消息）并加 `~` 前缀；未知显 `—`（不再把 null 伪装成 0）。每 Turn、Run 收尾（含取消）、压缩、`/new`、`/resume`、启动同步维护；压后纯估算、新实测落盘自动重新锚定。`compaction.finished` 的 `contextTokens` 估算字段与快照 `contextEstimateTokens`/`contextBaselineTokens` 随之退役；Cache/Speed 累计口径不变。
 
-- **新增**：三态审批模式 `readonly / auto / full`（每 Session 持久化，缺省 auto；Run 起点冻结，运行中切换只影响后续 Run）。readonly 拒绝一切非 read 调用（含只读命令的 bash），文案 `Denied by read-only mode.`（与用户拒绝 `User denied.` 严格区分）；auto 区内 write/edit 直接放行、区外写入逐次人工（会话授权不能豁免）、bash 经本地保守 analyzer（首命令白名单 `ls pwd echo cat head tail wc which whoami hostname uname true false` + 元字符/路径守卫）判定，判不了转人工；full 为用户显式全豁免（含区外与 skills 写入），路径复验/UTF-8/限额/取消边界不变。新增 `/mode [readonly|auto|full]` 命令（无参查询重载 meta），状态栏显示 `Mode:`（full 警示色）。bash analyzer 的区内 symlink 跟随为已声明残余风险（架构 §5）。
+- **新增**：三态审批模式 `confirm / auto / full`（每 Session 持久化，缺省 auto）。confirm 逐次审批区外读取（skills 只读豁免）、所有 write/edit 和所有 bash。auto 直接放行区内 write/edit，逐次审批区外写入，并使用 Bash 会话授权与本地保守 analyzer 判定 Bash 调用。full 免除审批，保留路径复验、UTF-8、限额与取消边界。使用 `/mode [confirm|auto|full]` 查询或切换，Run 起点冻结模式，状态栏显示当前模式。
+- **变更**：`/mode confirm` 取代 `/mode readonly`，原来由模式直接拒绝的工具调用改为逐次询问。旧 v6 Session 的 `readonly` 元数据在持锁打开时迁移为 `confirm`，历史记录保留。
 - **移除**：辅助决策模型子系统整体删除（decision-service / decision-model-config-store / `prompts/decision.md` / 生命周期探测）。`~/.shana/decision-model.json` 不再读取，用户文件保留不动。会话授权收缩为仅 bash 精确命令字符串——文件工具"本会话允许"不再产生授权（auto 区内写本就免审批，区外写逐次人工不可豁免）。
 - **破坏性变更**：Session 格式升级 v5 → v6（meta `autoDecisionEnabled` 布尔替换为可选 `approvalMode` 枚举，缺省 auto）。v2–v5 Session 不再可读（文件保留不删除，列表跳过），不迁移、不降级。**勿混跑新旧版本**：旧版二进制无法读取 v6 Session。
 - **破坏性变更**：`settings.json` 移除 `decisionTimeoutMs`。严格未知键拒绝保留：旧 settings 含该键将启动失败（报"未知字段"），**迁移方法：从 settings.json 删除该键**。

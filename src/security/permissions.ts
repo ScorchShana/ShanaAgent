@@ -1,3 +1,4 @@
+import type { PathPolicy, ResolvedToolPath } from "./path-policy.js";
 import {
   defaultNeedsApproval,
   type ReadToolAction,
@@ -9,19 +10,20 @@ export type ToolAccessKind = "read" | "write" | "shell" | "unknown";
 
 // 审批模式的权威定义。sessions/records.ts 因层边界禁止依赖 security，
 // 使用结构同一的本地联合（SESSION_APPROVAL_MODES）自行校验。
-export type ApprovalMode = "readonly" | "auto" | "full";
+export type ApprovalMode = "confirm" | "auto" | "full";
 
-// D10：文件工具不再有会话授权（auto 区内写直接放行，区外写逐次人工不可豁免），
-// 会话授权只剩 bash 精确命令字符串。
 export interface SessionGrants {
   shellCommands: ReadonlySet<string>;
+  fileScopes: ReadonlySet<string>;
 }
 
 export function emptySessionGrants(): SessionGrants {
-  return { shellCommands: new Set<string>() };
+  return { shellCommands: new Set<string>(), fileScopes: new Set<string>() };
 }
 
-export type ApprovalGrantKey = { kind: "shell_command"; command: string };
+export type ApprovalGrantKey =
+  | { kind: "shell_command"; command: string }
+  | { kind: "file"; toolName: string; workspace?: string; paths: string[] };
 
 export interface ApprovalRequest {
   toolCallId: string;
@@ -41,6 +43,8 @@ export interface ToolCallSubject {
   toolCallId: string;
   toolName: string;
   action: ToolAction;
+  workspaceRoot?: string;
+  pathPolicy?: PathPolicy;
 }
 
 export type PermissionVerdict =
@@ -48,7 +52,6 @@ export type PermissionVerdict =
       outcome: "allow";
       basis: "workspace_read" | "skills_read" | "session_grant" | "workspace_write" | "mode_full";
     }
-  | { outcome: "deny"; reason: "denied_by_policy" }
   | { outcome: "ask"; request: ApprovalRequest };
 
 function readFields(action: ReadToolAction) {
@@ -58,14 +61,42 @@ function readFields(action: ReadToolAction) {
   };
 }
 
+function fileGrant(subject: ToolCallSubject, targets: ResolvedToolPath[]): ApprovalGrantKey | null {
+  const includesWorkspace = targets.some((target) => target.insideWorkspace);
+  const workspace = subject.workspaceRoot ?? subject.pathPolicy?.workspaceRoot;
+  if (
+    !targets.length ||
+    targets.some((target) => target.danglingSymlink) ||
+    (includesWorkspace && !workspace)
+  )
+    return null;
+  return {
+    kind: "file",
+    toolName: subject.toolName,
+    ...(includesWorkspace ? { workspace } : {}),
+    paths: [...new Set(targets.filter((target) => !target.insideWorkspace).map((target) => target.realPath))],
+  };
+}
+
+function scopeIds(key: Extract<ApprovalGrantKey, { kind: "file" }>): string[] {
+  const ids = key.paths.map((path) => JSON.stringify([key.toolName, "path", path]));
+  if (key.workspace) ids.push(JSON.stringify([key.toolName, "workspace", key.workspace]));
+  return ids;
+}
+
 function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
   const base = { toolCallId: subject.toolCallId, toolName: subject.toolName };
   const action = subject.action;
 
   if (action.type === "read") {
     const { paths, touchesOutsideWorkspace } = readFields(action);
-    // 区外读取无法被会话授权豁免，区内读取本就自动允许，故不产生授权键。
-    return { ...base, access: "read", paths, touchesOutsideWorkspace, grantKey: null };
+    return {
+      ...base,
+      access: "read",
+      paths,
+      touchesOutsideWorkspace,
+      grantKey: fileGrant(subject, action.paths),
+    };
   }
 
   if (action.type === "write") {
@@ -75,8 +106,7 @@ function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
       operation: action.operation,
       paths: [action.path.realPath],
       touchesOutsideWorkspace: !action.path.insideWorkspace,
-      // 区外写入逐次人工审批，会话授权不能豁免（I7）。
-      grantKey: null,
+      grantKey: fileGrant(subject, [action.path]),
     };
   }
 
@@ -95,13 +125,11 @@ function buildApprovalRequest(subject: ToolCallSubject): ApprovalRequest {
 }
 
 export function withGrant(grants: SessionGrants, key: ApprovalGrantKey): SessionGrants {
-  return { shellCommands: new Set([...grants.shellCommands, key.command]) };
+  if (key.kind === "shell_command")
+    return { ...grants, shellCommands: new Set([...grants.shellCommands, key.command]) };
+  return { ...grants, fileScopes: new Set([...grants.fileScopes, ...scopeIds(key)]) };
 }
 
-/**
- * 三模式判定（纯函数；bash analyzer 在 ApprovalManager 层，不在此处）。
- * 顺序：unknown 防御 → full 放行 → readonly 非读拒绝 → read 分支 → auto 区内写放行 → bash 授权。
- */
 export function evaluatePermission(
   subject: ToolCallSubject,
   grants: SessionGrants,
@@ -114,13 +142,18 @@ export function evaluatePermission(
       request: { ...buildApprovalRequest(subject), access: "unknown", grantKey: null },
     };
   }
+  const request = buildApprovalRequest(subject);
+  const key = request.grantKey;
+  if (
+    key &&
+    (key.kind === "shell_command"
+      ? grants.shellCommands.has(key.command)
+      : scopeIds(key).every((id) => grants.fileScopes.has(id)))
+  ) {
+    return { outcome: "allow", basis: "session_grant" };
+  }
   // full 放行的是审批，不是安全校验：路径复验/UTF-8/限额/取消边界在 executor 层仍强制。
   if (mode === "full") return { outcome: "allow", basis: "mode_full" };
-  // readonly 判据是动态真实调用对象：bash 即使运行只读命令也整体拒绝（v1 不做命令级豁免）。
-  if (mode === "readonly" && subject.action.type !== "read") {
-    return { outcome: "deny", reason: "denied_by_policy" };
-  }
-
   if (subject.action.type === "read") {
     if (!defaultNeedsApproval(subject.action)) {
       // 含 skills 区路径的只读放行列 skills_read；纯区内仍 workspace_read。
@@ -129,20 +162,15 @@ export function evaluatePermission(
         : "workspace_read";
       return { outcome: "allow", basis };
     }
-    return { outcome: "ask", request: buildApprovalRequest(subject) };
+    return { outcome: "ask", request };
   }
+
+  if (mode === "confirm") return { outcome: "ask", request };
 
   if (subject.action.type === "write") {
     if (subject.action.path.insideWorkspace) return { outcome: "allow", basis: "workspace_write" };
-    return { outcome: "ask", request: buildApprovalRequest(subject) };
+    return { outcome: "ask", request };
   }
 
-  if (subject.action.type === "shell") {
-    if (grants.shellCommands.has(subject.action.command)) {
-      return { outcome: "allow", basis: "session_grant" };
-    }
-    return { outcome: "ask", request: buildApprovalRequest(subject) };
-  }
-
-  return { outcome: "ask", request: buildApprovalRequest(subject) };
+  return { outcome: "ask", request };
 }

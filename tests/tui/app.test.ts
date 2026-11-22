@@ -155,9 +155,9 @@ it("keeps Editor editing after mouse placement", async () => {
   } finally { await test.close(); }
 });
 
-function setup(approval = false, command = "echo approved", toolName = "bash") {
+function setup(approval = false, command = "echo approved", toolName = "bash", onceOnly = false) {
   const core = new SessionController({ driver: { execute: async (handle) => {
-    if (approval) await handle.requestApproval({ toolCallId: "call", toolName, summary: {
+    if (approval) await handle.requestApproval({ toolCallId: "call", toolName, onceOnly, summary: {
       paths: toolName === "write" ? ["preview-fixture.txt"] : [],
       command: toolName === "bash" ? command : undefined,
       parameters: toolName === "write" ? { content: command } : undefined,
@@ -434,6 +434,28 @@ it("keeps the selected approval action reachable in two rows and restores the dr
   } finally { await test.close(); await run; }
 });
 
+it.each([2, 40])("offers only one-time approval or rejection at height %s", async (height) => {
+  const test = setup(true, "echo approved", "bash", true);
+  const resolve = vi.spyOn(test.core, "resolveApproval");
+  const run = test.core.submitPrompt("approval");
+  try {
+    await vi.waitFor(() => expect(test.core.getSnapshot().pendingApproval).not.toBeNull());
+    test.terminal.resize(80, height);
+    test.tui.requestImmediateRender();
+    expect((await test.terminal.flushAndGetViewport()).join("\n")).toContain("允许一次");
+    test.terminal.sendInput("\x1b[B");
+    test.tui.requestImmediateRender();
+    const frame = (await test.terminal.flushAndGetViewport()).join("\n");
+    expect(frame).toContain("拒绝");
+    expect(frame).not.toContain("本会话允许");
+    test.terminal.sendInput("\r");
+    expect(resolve).toHaveBeenCalledWith(expect.any(String), "deny");
+  } finally {
+    await test.close();
+    await run;
+  }
+});
+
 it.each(["missing", "failure"])("keeps approval controls reachable after delayed preview %s", async (outcome) => {
   let release!: (error: NodeJS.ErrnoException) => void;
   const stat = vi.spyOn(fs, "stat").mockImplementation(() => new Promise((_resolve, reject) => { release = reject; }));
@@ -521,7 +543,7 @@ it("keeps a newer approval and its selected action when an effort save finishes"
       };
     }) },
     hooks: { getSessionView: () => ({ title: null, ref: null, model, models: [model], runModel: null,
-      contextTokens: null, contextEstimated: false, approvalMode: "readonly" }) },
+      contextTokens: null, contextEstimated: false, approvalMode: "confirm" }) },
   });
   vi.spyOn(core, "setReasoningEffort").mockImplementation(() => new Promise(resolve => { releaseSave = resolve; }));
   const decision = vi.spyOn(core, "resolveApproval");

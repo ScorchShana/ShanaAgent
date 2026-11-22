@@ -28,6 +28,7 @@ export interface ApprovalRequest {
   summary?: ApprovalSummary;
   toolCallId: string;
   toolName: string;
+  onceOnly?: boolean;
 }
 
 export interface RunHandle {
@@ -624,6 +625,7 @@ export class SessionController {
           id: this.createId("approval"),
           toolCallId: request.toolCallId,
           toolName: request.toolName,
+          ...(request.onceOnly ? { onceOnly: true } : {}),
           ...(request.summary ? { summary: structuredClone(request.summary) } : {}),
         };
         const pending = new Promise<ApprovalDecision>((resolve) => {

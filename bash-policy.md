@@ -1,0 +1,69 @@
+# Bash 调用审批策略
+
+工具参数校验和路径准备完成后，先检查当前会话对**原始命令字符串**的显式授权。命中后直接执行，命令包含的参数、空白和重定向均须完全相同。授权跨 confirm/auto 有效，即使工作树或文件内容发生变化，也按同一命令复用。权限总则见 [架构 §5](./ShanaAgentArchitecture.md#5-工具系统与权限)。
+
+## 未命中会话授权时的规则
+
+- `confirm` 自动放行可确认的只读调用。
+- `auto` 还允许可确认的区内普通写入。区内普通文件可以新建、追加、覆盖或截断。
+- 删除、移动、递归（含递归读取）、链接操作、区外访问、特殊文件和未知命令在以上两种模式下询问用户。
+- `full` 直接通过审批。会话授权命中或 full 均无需加载解析器。工具参数校验、超时和取消照常生效。
+
+## 判定表
+
+| Bash 调用 | 判定条件与示例 | `confirm` | `auto` | `full` |
+| --- | --- | --- | --- | --- |
+| 无文件目标的只读操作 | 已知命令和参数，如 `pwd`、`printf '%s\n' 'hello'` | 自动放行 | 自动放行 | 放行 |
+| 区内非递归读取 | 实际读取目标都在区内，如 `cat "docs/a b.md"`、`wc -l < input.txt`、`ls docs` | 自动放行 | 自动放行 | 放行 |
+| 区内切换工作目录 | 目标是可确认位于区内的现有目录，且同次调用中后续命令的工作目录可以跟踪 | 按只读规则判定 | 自动放行目录切换，后续命令按各自规则判定 | 放行 |
+| 创建目录 | 如 `mkdir -p out/a`。沿指定路径创建缺失的父目录，每一级都能确认在区内 | 询问 | 自动放行 | 放行 |
+| 创建、追加或覆盖普通文件 | 如 `touch out/a.txt`、`cat input.txt > out/result.txt`、`printf '%s\n' done >> out/log.txt`。所有源路径和最终落点都须确认在区内 | 询问 | 自动放行 | 放行 |
+| 删除、移动或递归操作 | 如 `rm a.txt`、`mv a.txt b.txt`、`cp -R src out`、`ls -R docs`。整个范围在区内也须审批 | 询问 | 询问 | 放行 |
+| 创建或替换链接 | 如 `ln`、`ln -s` | 询问 | 询问 | 放行 |
+| 区外读写或访问特殊文件 | 任一真实目标在区外，包括区内符号链接指向区外。设备、命名管道等特殊目标也询问 | 询问 | 询问 | 放行 |
+| 路径或操作范围无法确认 | 如尚未支持的通配符、变量生成的路径、无法跟踪的 `cd`，或当前平台无法明确解释的路径 | 询问 | 询问 | 放行 |
+| Git 提交、远端访问或仓库状态变更 | 如提交、拉取、推送、暂存、重置及直接写入 `.git` 路径 | 询问 | 询问 | 放行 |
+| 允许的只读 Git 查询 | `git rev-parse --show-toplevel`、`git ls-files --cached`，须符合下节的仓库和索引范围条件 | 按只读规则判定 | 自动放行 | 放行 |
+| 其他 Git 查询 | 如 `git status` 可能写回索引 | 询问 | 询问 | 放行 |
+| 命令效果未知或分析失败 | 如未知命令或选项、执行脚本、未支持的命令替换、语法树出现 `ERROR` 或 `MISSING`、分析器异常 | 询问 | 询问 | 放行 |
+
+## 首版自动放行的命令形式
+
+下表列出支持的命令和参数形式。可确认只读的形式在 `confirm` 和 `auto` 下自动放行。涉及普通文件写入的形式仅在 `auto` 下自动放行，并应用上表的路径与副作用规则。
+
+| 操作 | 示例 | 放行条件 |
+| --- | --- | --- |
+| 搜索指定文件 | `grep -nF -- TODO src/main.ts` | 输入是显式指定的区内普通文件。递归搜索询问 |
+| 比较文件 | `diff -u a.txt b.txt`、`cmp a.bin b.bin` | 两个目标都是区内普通文件 |
+| 校验文件和检查类型 | `sha256sum -- a.txt`、`test -f a.txt` | 核对实际目标位于区内。`test -f` 可检查路径已知但文件尚不存在的目标 |
+| 处理文本 | `cut -d , -f 1 data.csv`、`tr -d '\r' < input.txt`、`uniq input.txt` | 仅支持明确识别的参数。`uniq` 带第二个文件操作数时按写入处理，并核对输出目标 |
+| 非递归复制 | `cp -- input.txt out/result.txt`、`cp -- input.txt out/` | 源文件和最终落点均在区内。目标为已有目录时，检查最终落点 `out/input.txt`。`-R`、`-a`、`--remove-destination` 询问 |
+| 管道写入 | `printf '%s\n' done \| tee -a -- out/log.txt` | 核对管道的每一段，以及 `tee` 的每个输出目标。已有目标须为区内普通文件 |
+| 显式截断 | `truncate -s 0 -- out/result.txt` | 所有写入目标均可确认位于区内，已有目标须为普通文件 |
+
+`sort` 首版仍询问。即使省略 `-o`，较大的输入也可能让它写入临时文件。见 [GNU Coreutils 手册](https://www.gnu.org/software/coreutils/manual/coreutils.html)。
+
+### `auto` 下的目录切换与 Git 查询
+
+| 命令形式 | 自动放行条件 |
+| --- | --- |
+| `cd -- ./docs` | 字面量目标按 Bash 的路径规则解析为区内现有目录。`cd -- ./docs && wc -l guide.md` 中的 `guide.md` 以切换后的目录为基准核对。无法确定后续命令的工作目录时，整次调用询问 |
+| `git rev-parse --show-toplevel` | 实际工作树根目录和 Git 元数据目录均在工作区内 |
+| `git ls-files --cached` | 实际工作树根目录、Git 元数据目录和所用索引均在工作区内 |
+
+Git 查询核对真实工作树、工作树专属 Git 目录和公共元数据目录。列出索引时还核对实际索引（含 `GIT_INDEX_FILE`）和 split index 引用的共享文件。共享索引在区内且无其他硬链接时，auto 允许 Git 更新时间戳，confirm 询问。分析和复验均只读检查索引。超出分析大小预算、配置或索引格式无法确认时询问。查询行为见 [git-rev-parse](https://git-scm.com/docs/git-rev-parse) 和 [git-ls-files](https://git-scm.com/docs/git-ls-files)。
+
+## 整次调用的判定顺序
+
+1. 授权未命中且模式需要分析时，按需加载 `tree-sitter-bash`，解析整条原始命令。解析失败、缺失节点、未知语法或不支持的展开均询问。
+2. 合并各段命令和重定向的效果。任一部分需要审批，就在启动 Bash 前询问一次。例如 `cat input.txt && git fetch` 需在读取文件前询问；`cat input.txt | wc -l` 的两段都可确认只读时即可放行。
+3. 每个目标按实际效果核对。`cat input.txt > out/result.txt` 同时读写。管道或条件列表中的目录变化必须能跟踪，`cd -- ./docs && wc -l guide.md` 从 docs 解析 guide.md。
+4. 「允许一次」仅批准当前调用。「本会话允许」记录完整原始命令。自动分析放行的调用在启动前复验执行环境及已确定的目标，目标变化返回路径错误。
+
+## 实际路径的判定
+
+- 从 Bash 实际使用的工作目录出发，检查路径参数和重定向目标。`cp input.txt out/` 的最终写入目标是 `out/input.txt`。`echo '$HOME'` 的参数是字面文本，`cat "$HOME/a.txt"` 的参数是动态文件路径。
+- 已有目标核对真实路径和文件类型。新建目标从最近的现存父目录向下核对。拟自动执行的调用在启动前复验已确定的路径。
+- Windows 使用 Git Bash，Linux/WSL 使用系统 Bash。首版优先覆盖含义明确的字面量相对路径。绝对路径仅在可以按同一平台的 Bash 语义确认真实目标时，才适用相同的区内规则。
+
+命令与选项的具体识别范围见 [`src/security/bash-policy.ts`](./src/security/bash-policy.ts)，Git 范围核验见 [`src/security/bash-git-policy.ts`](./src/security/bash-git-policy.ts)。

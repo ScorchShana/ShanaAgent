@@ -4,7 +4,7 @@ import { expect, it, vi } from "vitest";
 import { ApprovalPanel, approvalSummaryLines } from "../../../src/tui/components/ApprovalDialog.js";
 import type { PendingApproval } from "../../../src/core/state.js";
 import { parseSettings } from "../../../src/llm/settings-store.js";
-import type { TuiStore } from "../../../src/tui/store.js";
+import { approvalChoices, type TuiStore } from "../../../src/tui/store.js";
 import { defaultSelectListTheme } from "../framework/test-themes.js";
 
 it("keeps the outside-workspace and preview snapshot warnings in the approval summary", () => {
@@ -80,4 +80,20 @@ it("keeps content out of the authorization panel and forwards navigation", () =>
  expect(panel.render(80).join("\n")).not.toContain("secret command");
  panel.handleInput("\x0c"); panel.handleInput("\x1b[6~");
  expect(navigate.mock.calls.map(call=>call[0])).toEqual(["reveal","down"]);
+});
+
+it("shows the session grant scope for workspace writes and outside search roots", () => {
+  const choices = (toolName: string, workspace: string | undefined, paths: string[]) =>
+    approvalChoices({
+      id: "a",
+      toolCallId: "c",
+      toolName,
+      summary: {
+        paths,
+        touchesOutsideWorkspace: !!paths.length,
+        grantKey: { kind: "file", toolName, workspace, paths },
+      },
+    });
+  expect(choices("write", "/workspace", [])[1]?.label).toContain("write · 工作区");
+  expect(choices("grep", undefined, ["/other"])[1]?.label).toContain("grep · /other");
 });

@@ -15,7 +15,7 @@ import { ApprovalPanel } from "./components/ApprovalDialog.js";
 import { MessageView } from "./components/Conversation.js";
 import { StatusBar, FOOTER_ROWS } from "./components/StatusBar.js";
 import { REASONING_EFFORTS } from "../llm/model-config-store.js";
-import { TuiStore, formatDuration, sanitizeDisplayText } from "./store.js";
+import { TuiStore, approvalChoices, formatDuration, sanitizeDisplayText } from "./store.js";
 import { theme, markdownTheme, selectTheme, editorTheme, MESSAGE_GAP } from "./theme.js";
 import { BottomSelector } from "./components/BottomSelector.js";
 const EDITOR_MIN_SIZE = 3;
@@ -285,12 +285,13 @@ export class TuiApp {
     else this.tui.requestRender();
   }
   private isCompactApproval(height = this.tui.terminal.rows): boolean {
-    if (this.store.getSnapshot().modal?.kind !== "approval") return false;
-    const headerRows = 1 + (this.store.getSnapshot().core.session.ref ? 2 : 0);
+    const { core, modal } = this.store.getSnapshot();
+    if (modal?.kind !== "approval") return false;
+    const headerRows = 1 + (core.session.ref ? 2 : 0);
     const editorRows = this.store.settings.promptVisibleRows + 2;
     const statusRows = FOOTER_ROWS;
     const chatRows = 1;
-    const actionRows = 3;
+    const actionRows = approvalChoices(core.pendingApproval).length;
     const hintRows = 1;
     return height < headerRows + editorRows + statusRows + chatRows + actionRows + hintRows;
   }
@@ -385,7 +386,7 @@ export class TuiApp {
     }
     const labels =
       modal.kind === "approval"
-        ? ["仅本次允许", "本会话允许", "拒绝"]
+        ? approvalChoices(state.core.pendingApproval).map((choice) => choice.label)
         : modal.kind === "models"
           ? modal.effortOnly
             ? [...REASONING_EFFORTS]

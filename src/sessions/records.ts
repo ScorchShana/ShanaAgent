@@ -56,7 +56,7 @@ export type SessionRunOutcome = (typeof SESSION_RUN_OUTCOMES)[number];
 
 // 与 security/permissions.ts 的 ApprovalMode 结构同一；sessions 禁止依赖 security，
 // 故在此自包含定义并校验（TS 结构类型下两处联合可互赋）。
-export const SESSION_APPROVAL_MODES = ["readonly", "auto", "full"] as const;
+export const SESSION_APPROVAL_MODES = ["confirm", "auto", "full"] as const;
 export type SessionApprovalMode = (typeof SESSION_APPROVAL_MODES)[number];
 
 export interface SessionMeta {
