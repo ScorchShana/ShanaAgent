@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 import { bindExitSignals, createApplication, renderTui } from "../src/main.js";
 import { bootstrap } from "../src/bootstrap.js";
 import { SessionController } from "../src/core/session-controller.js";
+import { SessionStore } from "../src/sessions/session-store.js";
 import { TuiStore } from "../src/tui/store.js";
 import { parseSettings } from "../src/llm/settings-store.js";
 import { VirtualTerminal } from "./tui/framework/virtual-terminal.js";
@@ -73,6 +74,59 @@ describe("main application", () => {
     } finally {
       view.unmount();
       await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("replays startup warnings to notice verbatim and in order (Task 0 baseline)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-warn-"));
+    // 触发 collectSettingsWarnings 的唯一告警：retained >= threshold。
+    await fs.mkdir(path.join(root, ".shana"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, ".shana", "settings.json"),
+      JSON.stringify({ compactionRetainedContextRatio: 0.9, compactionThresholdRatio: 0.8 }),
+    );
+    const result = bootstrap({ homeDir: root, cwd: root });
+    // 种一个尾部半行截断的 Session：接管后经 listSessions 触发 tail_truncated。
+    const sessions = new SessionStore({ sessionsDir: result.sessionsDir });
+    const ref = { workspaceId: result.workspace.id, sessionId: "baseline-s1" };
+    await sessions.createSession(ref);
+    await sessions.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "one" });
+    await sessions.appendRecord(ref, {
+      type: "run_finished",
+      runId: "run-1",
+      outcome: "completed",
+      persisted: true,
+    });
+    const messagesPath = path.join(result.sessionsDir, ref.workspaceId, ref.sessionId, "messages.jsonl");
+    const raw = await fs.readFile(messagesPath, "utf8");
+    await fs.writeFile(messagesPath, raw.slice(0, raw.length - 5));
+    // 逐字捕获自重构前旧 createApplication() 路径的启动 notice（Task 0 基线）。
+    const baseline =
+      'settings.json: "compactionRetainedContextRatio" (0.9) >= "compactionThresholdRatio" (0.8)，尾部保留 cap 松于压缩阈值、几乎不生效';
+    const truncatedNotice = `Session 尾部记录不完整，已读取完整前缀：末尾记录不完整（无换行终止符），已按前 1 条完整记录恢复；原始文件未修改: ${messagesPath}`;
+    const notices: Array<{ text: string; error: boolean }> = [];
+    const originalNotice = TuiStore.prototype.notice;
+    const spy = vi.spyOn(TuiStore.prototype, "notice").mockImplementation(function (
+      this: TuiStore,
+      text: string,
+      error = false,
+    ) {
+      notices.push({ text, error });
+      return originalNotice.call(this, text, error);
+    });
+    let store: TuiStore | undefined;
+    try {
+      store = await createApplication(result);
+      expect(notices).toEqual([{ text: baseline, error: false }]);
+      expect(store.getSnapshot().notice?.text).toBe(baseline);
+      // 接管后新告警直达 notice，文案映射（D3）逐字不变。
+      notices.length = 0;
+      await store.controller.listSessions();
+      expect(notices).toEqual([{ text: truncatedNotice, error: false }]);
+    } finally {
+      spy.mockRestore();
+      await store?.dispose();
       await fs.rm(root, { recursive: true, force: true });
     }
   });

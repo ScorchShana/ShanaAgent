@@ -158,7 +158,9 @@ System Prompt (<agent> + <core_rules>) + <environment> + <project_instructions>
 ├── package.json / tsconfig.json / build-assets.mjs
 ├── prompts/                      # 系统与专用提示词（英文，每词一个文件）+ tools/ 工具描述
 ├── src/
-│   ├── main.ts / bootstrap.ts / workspace.ts / diagnostics.ts
+│   ├── main.ts / bootstrap.ts / application.ts / workspace.ts / diagnostics.ts
+│   │                             # application：公共 Agent 运行时组装（createAgentRuntime，
+│   │                             # 结构化告警通道，无展示文案、不依赖 TUI 与 main）
 │   ├── core/                     # session-controller / agent-loop / context-builder / event-bus / events / state / skills
 │   ├── llm/                      # model-service / provider-adapter / model-config-store / settings-store
 │   │                             # argument-parser / history-replay
