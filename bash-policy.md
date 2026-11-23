@@ -33,7 +33,7 @@
 
 | 操作 | 示例 | 放行条件 |
 | --- | --- | --- |
-| 搜索指定文件 | `grep -nF -- TODO src/main.ts` | 输入是显式指定的区内普通文件。递归搜索询问 |
+| 搜索指定文件 | `grep -nF -- TODO src/main.ts`、`ls -la \| grep -i optim` | 输入是显式指定的区内普通文件，或无文件操作数（读 stdin；管道喂入或 EOF）。递归搜索询问 |
 | 比较文件 | `diff -u a.txt b.txt`、`cmp a.bin b.bin` | 两个目标都是区内普通文件 |
 | 校验文件和检查类型 | `sha256sum -- a.txt`、`test -f a.txt` | 核对实际目标位于区内。`test -f` 可检查路径已知但文件尚不存在的目标 |
 | 处理文本 | `cut -d , -f 1 data.csv`、`tr -d '\r' < input.txt`、`uniq input.txt` | 仅支持明确识别的参数。`uniq` 带第二个文件操作数时按写入处理，并核对输出目标 |

@@ -1,4 +1,4 @@
-﻿import { execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -28,6 +28,8 @@ describe("Bash 命令效果", () => {
     "wc -l < a.txt",
     "ls docs",
     "grep -nF -- TODO a.txt",
+    "grep -i optim",
+    "ls -la | grep -i optim",
     "diff -u a.txt b.txt",
     "cmp a.txt b.txt",
     "sha256sum -- a.txt",
@@ -74,6 +76,8 @@ describe("Bash 命令效果", () => {
     "tee --output-error=warn",
     "cat a.txt;",
     "cat a.txt | unknown",
+    "grep -i",
+    "grep -e pat a.txt",
   ])("人工 %s", async (command) => {
     expect((await analyze(command)).decision).toBe("ask");
   });

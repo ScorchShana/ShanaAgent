@@ -1,4 +1,4 @@
-﻿import { createRequire } from "node:module";
+import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { detectShell } from "../tools/shell.js";
@@ -220,7 +220,8 @@ export const analyzeBash: BashCommandAnalyzer = async (
         }
         case "grep": {
           const files = operands(args, /^-[nFi]+$/);
-          check(files.length >= 2);
+          // files[0] 恒为模式；无文件操作数时读 stdin（执行器 stdin ignore → EOF，无副作用）。
+          check(files.length >= 1);
           paths(files.slice(1));
           return;
         }
