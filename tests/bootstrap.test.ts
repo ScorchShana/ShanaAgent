@@ -114,6 +114,17 @@ describe("启动提示词", () => {
     expect(registry.get("edit")?.description).toContain("CRLF and standalone CR");
   });
 
+  it("CRLF checkout 归一：系统提示词与工具描述均为 LF", () => {
+    const read = vi.spyOn(fs, "readFileSync").mockReturnValue(Buffer.from("# System\r\n\r\nrule\r\n"));
+    try {
+      const bundle = loadPrompts();
+      expect(bundle.system).toBe("# System\n\nrule\n");
+      expect(bundle.tools.read).toBe("# System\n\nrule\n");
+    } finally {
+      read.mockRestore();
+    }
+  });
+
   it("任一提示词为空或编码损坏时拒载", () => {
     for (const content of [Buffer.from(" "), Buffer.from([0xc3, 0x28]), Buffer.from("a\0b")]) {
       const read = vi.spyOn(fs, "readFileSync").mockReturnValueOnce(content);

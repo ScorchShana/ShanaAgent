@@ -57,9 +57,10 @@ export interface CompactHistoryOptions {
 const TARGET_TOKENS_PLACEHOLDER = "{{TARGET_TOKENS}}";
 
 async function loadCompactionPrompt(): Promise<string> {
-  return new TextDecoder("utf-8", { fatal: true }).decode(
-    await fs.promises.readFile(new URL("../../prompts/compaction.md", import.meta.url)),
-  );
+  // CRLF checkout 归一（readPrompt 同款），保证摘要指令字节稳定。
+  return new TextDecoder("utf-8", { fatal: true })
+    .decode(await fs.promises.readFile(new URL("../../prompts/compaction.md", import.meta.url)))
+    .replaceAll("\r\n", "\n");
 }
 
 function cancelled(path: CompactionPath): CompactionOutcome {

@@ -488,7 +488,7 @@ describe("V8 AGENTS.md", () => {
       workspacePath: makeWorkspace(),
     });
     expect(built.agentsMd.present).toBe(false);
-    const prompt = (built.context.systemPrompt ?? "").replaceAll("\r\n", "\n");
+    const prompt = built.context.systemPrompt ?? "";
     expect(prompt).toContain("<agent>");
     expect(prompt).toContain("<core_rules>");
     expect(prompt).toContain("<agent>\nYou are");
@@ -509,7 +509,7 @@ describe("V8 AGENTS.md", () => {
       systemPrompt: "SYS",
       environment: "Workspace: W\nPlatform: P",
     });
-    const prompt = (built.context.systemPrompt ?? "").replaceAll("\r\n", "\n");
+    const prompt = built.context.systemPrompt ?? "";
     expect(prompt).toContain("SYS\n\n<environment>\nWorkspace: W\nPlatform: P\n</environment>");
     expect(prompt).not.toContain("<environment>\n\n");
     expect(prompt).not.toContain("\n\n</environment>");
@@ -528,6 +528,23 @@ it("默认系统提示词拒绝非法 UTF-8 编码", async () => {
         agentsMd: { path: "unused/AGENTS.md", present: false },
       }),
     ).rejects.toThrow(/encoded data.*valid/i);
+  } finally {
+    read.mockRestore();
+  }
+});
+
+it("默认系统提示词 CRLF checkout 归一为 LF", async () => {
+  const read = vi
+    .spyOn(fs.promises, "readFile")
+    .mockResolvedValueOnce(Buffer.from("<agent>\r\nrule\r\n</agent>\r\n"));
+  try {
+    const built = await buildContext({
+      records: [],
+      currentPrompt: "hi",
+      workspacePath: "unused",
+      agentsMd: { path: "unused/AGENTS.md", present: false },
+    });
+    expect(built.context.systemPrompt).toBe("<agent>\nrule\n</agent>\n");
   } finally {
     read.mockRestore();
   }

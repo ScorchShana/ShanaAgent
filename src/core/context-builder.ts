@@ -512,9 +512,10 @@ export async function buildContext(input: BuildContextInput): Promise<BuiltConte
   const sections: string[] = [];
   const systemPrompt =
     input.systemPrompt ??
-    new TextDecoder("utf-8", { fatal: true }).decode(
-      await fs.promises.readFile(new URL("../../prompts/constitution.md", import.meta.url)),
-    );
+    // CRLF checkout 归一（readPrompt 同款），与 bootstrap 注入路径字节一致。
+    new TextDecoder("utf-8", { fatal: true })
+      .decode(await fs.promises.readFile(new URL("../../prompts/constitution.md", import.meta.url)))
+      .replaceAll("\r\n", "\n");
   if (systemPrompt.trim().length === 0 || systemPrompt.includes("\0")) {
     throw new Error("System prompt is empty or contains NUL.");
   }

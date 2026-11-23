@@ -10,6 +10,7 @@
 - **破坏性变更**：Session 格式升级 v5 → v6（meta `autoDecisionEnabled` 布尔替换为可选 `approvalMode` 枚举，缺省 auto）。v2–v5 Session 不再可读（文件保留不删除，列表跳过），不迁移、不降级。**勿混跑新旧版本**：旧版二进制无法读取 v6 Session。
 - **破坏性变更**：`settings.json` 移除 `decisionTimeoutMs`。严格未知键拒绝保留：旧 settings 含该键将启动失败（报"未知字段"），**迁移方法：从 settings.json 删除该键**。
 - 变更：`/` 命令菜单直接列出 `~/.shana/skills` 下的全部 `/skill:<name>` 项（命令在前、skill 按名排序追加在后，前缀匹配过滤），不必先敲 `/skill:` 才加载。按需读目录、无缓存（运行期间新增 skill 立即可补全）；删除 `/skill:` 占位项（语法提示保留在未知命令提示中）；`/skill:` 前缀行为、两次 Enter 确认与运行中禁用门控不变。
+- **变更**：提示词与 skill 读取点代码侧 CRLF→LF 归一化（系统提示词、工具描述、skill 引导语模板、SKILL.md 快照、压缩指令及未注入时的 constitution 回退）。模型可见字节不再受 `core.autocrlf=true` checkout 影响；新 skill 快照恒存 LF，旧 CRLF 快照按原文渲染、不迁移。升级后旧会话首个 Run 因工具描述字节变化触发一次锚定回退，属预期。`read` 工具与 AGENTS.md 加载的逐字契约不变（edit 匹配依赖原文）。
 
 ## 0.4.0 — 2026-11-20
 
