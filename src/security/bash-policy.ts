@@ -219,6 +219,24 @@ export const analyzeBash: BashCommandAnalyzer = async (
         case "wc":
           paths(operands(args, /^-[lcwm]+$/));
           return;
+        case "head":
+        case "tail": {
+          // 显式位置解析（cut 先例）：operands() 的选项正则只认无值选项，-n N 的值会被误当文件。
+          // 白名单式天然排除 -f/--follow 族、合并 -n5 与 legacy -5；零文件读 stdin（EOF 安全）。
+          const files: string[] = [];
+          for (let i = 0; i < args.length; i++) {
+            const arg = args[i]!;
+            if (arg === "-n" || arg === "-c") {
+              const value = args[++i];
+              check(value !== undefined && /^\+?\d+$/.test(value));
+              continue;
+            }
+            check(!arg.startsWith("-"));
+            files.push(arg);
+          }
+          paths(files);
+          return;
+        }
         case "ls": {
           const files = operands(args, /^-[la]+$/);
           paths(files.length ? files : ["."], ["dir", "file"]);

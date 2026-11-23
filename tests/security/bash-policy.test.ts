@@ -38,6 +38,12 @@ describe("Bash 命令效果", () => {
     "tr -d '\\r' < a.txt",
     "uniq a.txt",
     "cat a.txt | wc -l",
+    "head -n 5 a.txt",
+    "tail -n 2 a.txt b.txt",
+    "tail -n +2 a.txt",
+    "tail -c 3 a.txt",
+    "cat a.txt | head -n 1",
+    "head",
     "ls docs; wc -l docs/guide.md",
     "cat a.txt; cat b.txt",
     "cat a.txt | wc -l; ls docs",
@@ -86,6 +92,15 @@ describe("Bash 命令效果", () => {
     "ls; cd docs",
     "sort a.txt; ls",
     "cat a.txt;; cat b.txt",
+    "tail -f a.txt",
+    "tail -F a.txt",
+    "head -n",
+    "head -n x a.txt",
+    "head -n5 a.txt",
+    "head -5 a.txt",
+    "head -q a.txt",
+    "head ../a.txt",
+    "head absent",
   ])("人工 %s", async (command) => {
     expect((await analyze(command)).decision).toBe("ask");
   });

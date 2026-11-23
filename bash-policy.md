@@ -36,7 +36,7 @@
 | 搜索指定文件 | `grep -nF -- TODO src/main.ts`、`ls -la \| grep -i optim` | 输入是显式指定的区内普通文件，或无文件操作数（读 stdin；管道喂入或 EOF）。递归搜索询问 |
 | 比较文件 | `diff -u a.txt b.txt`、`cmp a.bin b.bin` | 两个目标都是区内普通文件 |
 | 校验文件和检查类型 | `sha256sum -- a.txt`、`test -f a.txt` | 核对实际目标位于区内。`test -f` 可检查路径已知但文件尚不存在的目标 |
-| 处理文本 | `cut -d , -f 1 data.csv`、`tr -d '\r' < input.txt`、`uniq input.txt` | 仅支持明确识别的参数。`uniq` 带第二个文件操作数时按写入处理，并核对输出目标 |
+| 处理文本 | `cut -d , -f 1 data.csv`、`tr -d '\r' < input.txt`、`uniq input.txt`、`head -n 5 a.txt`、`tail -n +2 a.txt` | 仅支持明确识别的参数。`uniq` 带第二个文件操作数时按写入处理，并核对输出目标。`head`/`tail` 只收分离的 `-n N`/`-c N`（`+N` 允许）与区内文件，可无文件（读 stdin）；`-f`/`--follow` 族、合并与 legacy 数字形式询问 |
 | 非递归复制 | `cp -- input.txt out/result.txt`、`cp -- input.txt out/` | 源文件和最终落点均在区内。目标为已有目录时，检查最终落点 `out/input.txt`。`-R`、`-a`、`--remove-destination` 询问 |
 | 管道写入 | `printf '%s\n' done \| tee -a -- out/log.txt` | 核对管道的每一段，以及 `tee` 的每个输出目标。已有目标须为区内普通文件 |
 | 显式截断 | `truncate -s 0 -- out/result.txt` | 所有写入目标均可确认位于区内，已有目标须为普通文件 |
