@@ -157,10 +157,16 @@ export const analyzeBash: BashCommandAnalyzer = async (
       check(!node.hasError && !node.isMissing);
       const c = node.children;
       switch (node.type) {
-        case "program":
-          check(c.length === 1);
-          await visit(c[0]!, canCd);
+        case "program": {
+          // tree-sitter 把 `;` 分隔的语句挂在 program 层（list 节点只含 | && ||）。
+          check(c.length >= 1 && c.length % 2 === 1);
+          check(c.filter((_, i) => i % 2 === 1).every((n) => n.type === ";"));
+          // `;` 不保证前段成功：cd 失败时后段 cwd 不可信（与拒绝 `cd docs || …` 同理），
+          // 因此多段链一律禁用 cd 跟踪，含 cd 的 `;` 链整体询问。
+          const trackable = canCd && c.length === 1;
+          for (let i = 0; i < c.length; i += 2) await visit(c[i]!, trackable);
           return;
+        }
         case "pipeline":
         case "list": {
           check(c.length >= 3 && c.length % 2 === 1);

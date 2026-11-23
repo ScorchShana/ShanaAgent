@@ -683,7 +683,8 @@ it("freezes mode per Run: switches are blocked mid-Run and apply to the next Run
   const root = tempDir();
   const fake = fakeShellRun();
   const messages = [
-    makeAssistantMessage([{ id: "s", name: "bash", arguments: { command: "echo one; echo two" } }]),
+    // 夹具须是 auto 策略仍询问的 bash 形式（sort 未支持）；无 cd 的 `;` 链已放行。
+    makeAssistantMessage([{ id: "s", name: "bash", arguments: { command: "sort a.txt" } }]),
     makeAssistantMessage([{ id: "w", name: "write", arguments: { path: "a.txt", content: "x" } }]),
     makeAssistantMessage([], "done"),
     makeAssistantMessage([{ id: "w2", name: "write", arguments: { path: "b.txt", content: "y" } }]),

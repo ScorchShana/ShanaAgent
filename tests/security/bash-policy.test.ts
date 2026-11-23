@@ -38,6 +38,9 @@ describe("Bash 命令效果", () => {
     "tr -d '\\r' < a.txt",
     "uniq a.txt",
     "cat a.txt | wc -l",
+    "ls docs; wc -l docs/guide.md",
+    "cat a.txt; cat b.txt",
+    "cat a.txt | wc -l; ls docs",
     "cd -- ./docs && wc -l guide.md",
   ])("只读 %s", async (command) => {
     expect((await analyze(command, "confirm")).decision).toBe("allow");
@@ -78,6 +81,11 @@ describe("Bash 命令效果", () => {
     "cat a.txt | unknown",
     "grep -i",
     "grep -e pat a.txt",
+    "cd docs; wc -l guide.md",
+    "cd docs && cat a.txt; wc -l b.txt",
+    "ls; cd docs",
+    "sort a.txt; ls",
+    "cat a.txt;; cat b.txt",
   ])("人工 %s", async (command) => {
     expect((await analyze(command)).decision).toBe("ask");
   });
