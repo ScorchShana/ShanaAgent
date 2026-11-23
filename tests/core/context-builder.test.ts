@@ -1221,22 +1221,22 @@ describe("V15 回退消息裁剪与阶梯裁剪", () => {
 });
 
 describe("取消/中断 Turn 的上下文资格与标注", () => {
-  it("仅文本的 aborted Turn 进入上下文并附中断标注", async () => {
+  it("仅文本的 aborted Turn 按 truncated 排除，取消 Run 归为零 Turn", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
       makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
       makeRunFinishedRecord(3, "run-1", "cancelled"),
     ];
     const plan = planEffectiveContext(records);
-    expect(plan.runs[0]?.turns).toHaveLength(1);
+    expect(plan.runs[0]?.turns).toEqual([]);
+    expect(plan.runs[0]?.excludedTurns[0]?.reason).toBe("truncated");
     expect(plan.runs[0]?.promptIncluded).toBe(true);
+    expect(plan.nextPromptFollowsCancellation).toBe(true);
 
     const built = await buildContext({ records, workspacePath: makeWorkspace() });
-    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
-    expect(built.context.messages[2]).toMatchObject({
-      role: "user",
-      content: INTERRUPTED_RESPONSE_ANNOTATION,
-    });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user"]);
+    expect(built.context.messages[0]).toMatchObject({ content: "q" });
+    expect(JSON.stringify(built.context.messages)).not.toContain(INTERRUPTED_RESPONSE_ANNOTATION);
     expect(() => prepareReplay(built.context)).not.toThrow();
   });
 
@@ -1261,38 +1261,48 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
   it("aborted Turn 的半截 call 在上下文被剥离，History 原文不变", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
-      makeAssistantRecord(2, "run-1", [{ id: "", name: "read" }], {
-        text: "half",
-        stopReason: "aborted",
-      }),
-      makeRunFinishedRecord(3, "run-1", "cancelled"),
+      makeAssistantRecord(
+        2,
+        "run-1",
+        [
+          { id: "", name: "read" },
+          { id: "c1", name: "read" },
+        ],
+        { text: "half", stopReason: "aborted" },
+      ),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
     ];
     const built = await buildContext({ records, workspacePath: makeWorkspace() });
     const assistant = built.context.messages[1];
-    expect(assistant?.role === "assistant" && assistant.content.some((b) => b.type === "toolCall")).toBe(
-      false,
-    );
+    const calls =
+      assistant?.role === "assistant" ? assistant.content.filter((b) => b.type === "toolCall") : [];
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ id: "c1" });
     expect(() => prepareReplay(built.context)).not.toThrow();
-    // History 原文保留半截 call。
+    // History 原文保留半截 call 与合法 call。
     const original = records[1];
     expect(
-      original?.type === "assistant_message" &&
-        original.message.content.some((b) => b.type === "toolCall"),
-    ).toBe(true);
+      original?.type === "assistant_message" && original.message.content.filter((b) => b.type === "toolCall"),
+    ).toHaveLength(2);
   });
 
   it("旧记录的 aborted thinking 构建上下文时剥离，History 原文不变", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
-      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
-      makeRunFinishedRecord(3, "run-1", "cancelled"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
     ];
     const record = records[1]!;
     if (record.type === "assistant_message")
       record.message.content.unshift({ type: "thinking", thinking: "LEGACY_DRAFT" });
     const snapshot = JSON.stringify(records);
     const built = await buildContext({ records, workspacePath: makeWorkspace() });
-    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "assistant", "toolResult", "user"]);
     expect(JSON.stringify(built.context.messages)).not.toContain("LEGACY_DRAFT");
     expect(JSON.stringify(records)).toBe(snapshot);
     expect(() => prepareReplay(built.context)).not.toThrow();
@@ -1314,8 +1324,12 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
   it("aborted thinking 不计入上下文估算", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
-      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
-      makeRunFinishedRecord(3, "run-1", "cancelled"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
     ];
     const withDraft = structuredClone(records);
     const record = withDraft[1]!;
@@ -1331,8 +1345,12 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
   it("压缩摘要输入不含 aborted thinking（与正式请求同构）", () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
-      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
-      makeRunFinishedRecord(3, "run-1", "cancelled"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
     ];
     const record = records[1]!;
     if (record.type === "assistant_message")
@@ -1444,13 +1462,40 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
     expect(selection.messages[6]).toMatchObject({ content: UNKNOWN_RESULT_ANNOTATION });
   });
 
+  it("被排除的中断轮所在 Run 的 run_finished 可作压缩边界", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "cancelled task"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeRunFinishedRecord(3, "run-1", "cancelled"),
+      makeUserPromptRecord(4, "run-2", "next task"),
+      makeAssistantRecord(5, "run-2", [{ id: "c1", name: "read" }]),
+      makeToolResultRecord(6, "run-2", "c1", "success"),
+    ];
+    expect(() => assertCandidateCheckpointValid(records, 3)).not.toThrow();
+    const selection = expectSelection(
+      planCompaction(records, { trigger: "manual", retainedContextBudget: 0, tokenEstimate: ESTIMATE }),
+    );
+    expect(selection.coveredUpTo).toBe(3);
+    expect(selection.messages).toEqual([
+      expect.objectContaining({ role: "user", content: "cancelled task" }),
+    ]);
+    expect(selection.retainedMessages[0]).toMatchObject({
+      role: "user",
+      content: PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "next task",
+    });
+  });
+
   it("planCompaction 覆盖 aborted Turn 时携带中断标注", () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "q"),
       makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }]),
       makeToolResultRecord(3, "run-1", "c1", "success"),
-      makeAssistantRecord(4, "run-1", [], { text: "half", stopReason: "aborted" }),
-      makeRunFinishedRecord(5, "run-1", "cancelled"),
+      makeAssistantRecord(4, "run-1", [{ id: "c2", name: "read" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeToolResultRecord(5, "run-1", "c2", "not_executed"),
+      makeRunFinishedRecord(6, "run-1", "cancelled"),
     ];
     const selection = planCompaction(records, {
       trigger: "start" as const,
@@ -1460,9 +1505,7 @@ describe("取消/中断 Turn 的上下文资格与标注", () => {
     expect("messages" in selection).toBe(true);
     if (!("messages" in selection)) return;
     expect(
-      selection.messages.some(
-        (m) => m.role === "user" && m.content === INTERRUPTED_RESPONSE_ANNOTATION,
-      ),
+      selection.messages.some((m) => m.role === "user" && m.content === INTERRUPTED_RESPONSE_ANNOTATION),
     ).toBe(true);
   });
 });
@@ -1526,7 +1569,7 @@ describe("零 Turn 取消后的渲染期中断前缀", () => {
     expect(JSON.stringify(selection.messages)).not.toContain(PREVIOUS_REQUEST_INTERRUPTED_PREFIX);
   });
 
-  it("半截文本取消（aborted Turn）不触发前缀，中断标注照旧（作用域 A 护栏）", async () => {
+  it("纯文本中断轮被排除后，取消 Run 归为零 Turn，下一条 Prompt 前置前缀", async () => {
     const records: SessionRecord[] = [
       makeUserPromptRecord(1, "run-1", "first"),
       makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
@@ -1534,10 +1577,34 @@ describe("零 Turn 取消后的渲染期中断前缀", () => {
       makeUserPromptRecord(4, "run-2", "second"),
     ];
     const built = await buildContext({ records, workspacePath: makeWorkspace() });
-    expect(built.context.messages.at(-1)).toMatchObject({ content: "second" });
+    expect(built.context.messages.map((m) => m.role)).toEqual(["user", "user"]);
+    expect(built.context.messages.at(-1)).toMatchObject({
+      content: PREVIOUS_REQUEST_INTERRUPTED_PREFIX + "second",
+    });
+    expect(
+      built.context.messages.some((m) => m.content === INTERRUPTED_RESPONSE_ANNOTATION),
+    ).toBe(false);
+  });
+
+  it("有可配对 call 的中断轮仍附中断标注，不触发零 Turn 前缀", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "first"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], {
+        text: "half",
+        stopReason: "aborted",
+      }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
+      makeUserPromptRecord(5, "run-2", "second"),
+    ];
+    const plan = planEffectiveContext(records);
+    expect(plan.runs[0]?.turns).toHaveLength(1);
+    expect(plan.runs[1]?.followsCancelledZeroTurn).toBe(false);
+    const built = await buildContext({ records, workspacePath: makeWorkspace() });
     expect(
       built.context.messages.some((m) => m.content === INTERRUPTED_RESPONSE_ANNOTATION),
     ).toBe(true);
+    expect(built.context.messages.at(-1)).toMatchObject({ content: "second" });
     expect(JSON.stringify(built.context.messages)).not.toContain(
       PREVIOUS_REQUEST_INTERRUPTED_PREFIX,
     );

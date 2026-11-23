@@ -45,7 +45,8 @@ export function prepareReplay(input: StoredContext): {
   if (pending.size) throw new Error("Unpaired tool calls in context");
   // pi-ai transformMessages 整条丢弃 aborted/error 的 assistant 消息，却保留其 toolResult（成孤儿），
   // 下方 onPayload 的计数自检因此必然命中。stopReason 不进请求体，改写发送侧副本即可让 SDK 保留该轮；
-  // Context 与记录恒存原文。
+  // Context 与记录恒存原文。能走到这里的 aborted 轮必有已配对的 call——零 call 的形态已被
+  // responseExclusionReason 判为 truncated 排除，故终态恒为 toolUse。
   for (const [index, message] of messages.entries()) {
     if (message.role !== "assistant" || message.stopReason !== "aborted") continue;
     messages[index] = { ...message, stopReason: "toolUse" };

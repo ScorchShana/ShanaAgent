@@ -6,18 +6,22 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   CheckpointInvalidError,
   createRunStartGate,
+  findLatestCheckpoint,
   findUnknownSideEffects,
+  responseExclusionReason,
   resumeSession,
   UnknownSideEffectsError,
 } from "../../src/sessions/recovery.js";
-import type { SessionRecord } from "../../src/sessions/records.js";
+import type { AssistantMessageRecord, SessionRecord } from "../../src/sessions/records.js";
 import { SessionWriteError, type SessionRef, type SessionStore } from "../../src/sessions/session-store.js";
 import {
   cleanupTempDirs,
   fixedNow,
   makeAssistantMessage,
   makeAssistantRecord,
+  makeCheckpointRecord,
   makeModelSnapshot,
+  makeRunFinishedRecord,
   makeStore,
   makeToolResultRecord,
   makeUserPromptRecord,
@@ -154,6 +158,40 @@ describe("resume original Session", () => {
     await store.releaseSession(source);
     await expect(resumeSession(store, source)).rejects.toBeInstanceOf(CheckpointInvalidError);
     expect(fs.existsSync(path.join(sessionsDir, WORKSPACE_ID, "source", "source.session.lock"))).toBe(false);
+  });
+});
+
+describe("aborted 轮排除判据与旧检查点兼容", () => {
+  it.each([
+    ["纯文本 aborted", [], "half", "aborted", "truncated"],
+    ["空文本 aborted", [], "", "aborted", "truncated"],
+    ["仅半截 call 的 aborted", [{ id: "", name: "read" }], "", "aborted", "truncated"],
+    ["含合法 call 的 aborted", [{ id: "c1", name: "read" }], "", "aborted", null],
+    ["含合法 call 与文本的 aborted", [{ id: "c1", name: "read" }], "half", "aborted", null],
+    ["零 call 的 length", [], "half", "length", "truncated"],
+    ["error", [], "half", "error", "incomplete_response"],
+  ] as const)("%s 的排除判据", (_label, toolCalls, text, stopReason, expected) => {
+    const assistant = makeAssistantRecord(2, "run-1", [...toolCalls], { text, stopReason });
+    expect(responseExclusionReason(assistant)).toBe(expected);
+  });
+
+  it("仅 thinking 的 aborted 轮按 truncated 排除", () => {
+    const assistant = makeAssistantRecord(2, "run-1", [], { text: "", stopReason: "aborted" });
+    assistant.message.content.unshift({ type: "thinking", thinking: "draft" });
+    expect(responseExclusionReason(assistant)).toBe("truncated");
+  });
+
+  it("改动前写下的检查点可覆盖后来被排除的零 call aborted 轮", () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [], { text: "half", stopReason: "aborted" }),
+      makeCheckpointRecord(3, "legacy summary", 2),
+      makeRunFinishedRecord(4, "run-1", "cancelled"),
+      makeUserPromptRecord(5, "run-2", "next"),
+    ];
+    const interrupted = records[1] as AssistantMessageRecord;
+    expect(responseExclusionReason(interrupted)).toBe("truncated");
+    expect(findLatestCheckpoint(records)).toMatchObject({ recordSeq: 3, coveredUpTo: 2 });
   });
 });
 
