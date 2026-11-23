@@ -207,6 +207,92 @@ describe("main application", () => {
       await fs.rm(root, { recursive: true, force: true });
     }
   });
+
+  it("exits the controller exactly once when TuiStore construction fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-fail-"));
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const failure = new Error("store construction failed");
+    // TuiStore 构造器首句即 controller.subscribe；agent-loop 自身不订阅，Once 必中构造器。
+    const subscribe = vi
+      .spyOn(SessionController.prototype, "subscribe")
+      .mockImplementationOnce(() => {
+        throw failure;
+      });
+    const exit = vi.spyOn(SessionController.prototype, "exit");
+    try {
+      await expect(createApplication(result)).rejects.toBe(failure);
+      expect(exit).toHaveBeenCalledOnce();
+    } finally {
+      subscribe.mockRestore();
+      exit.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("disposes the store when a post-construction startup step fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-fail-"));
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const failure = new Error("acknowledgement wiring failed");
+    const ack = vi
+      .spyOn(TuiStore.prototype, "setUnknownAcknowledgement")
+      .mockImplementationOnce(() => {
+        throw failure;
+      });
+    const dispose = vi.spyOn(TuiStore.prototype, "dispose");
+    const exit = vi.spyOn(SessionController.prototype, "exit");
+    try {
+      await expect(createApplication(result)).rejects.toBe(failure);
+      expect(dispose).toHaveBeenCalledOnce();
+      // dispose 内部关 controller：不重复 exit。
+      expect(exit).toHaveBeenCalledOnce();
+    } finally {
+      ack.mockRestore();
+      dispose.mockRestore();
+      exit.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates a redacted cleanup failure with the original startup error", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-fail-"));
+    const key = "sk-main-cleanup-test-000000";
+    await fs.mkdir(path.join(root, ".shana"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, ".shana", "model.json"),
+      JSON.stringify({
+        current: { provider: "p", model: "A" },
+        providers: {
+          p: {
+            api: "openai-completions",
+            baseUrl: "https://fake.test",
+            apiKey: key,
+            models: [{ id: "A", contextWindow: 10000, maxTokens: 1000 }],
+          },
+        },
+      }),
+    );
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const original = new Error("store construction failed");
+    const subscribe = vi
+      .spyOn(SessionController.prototype, "subscribe")
+      .mockImplementationOnce(() => {
+        throw original;
+      });
+    const exit = vi
+      .spyOn(SessionController.prototype, "exit")
+      .mockRejectedValueOnce(new Error(`cleanup leaked ${key}`));
+    try {
+      const error = await createApplication(result).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(AggregateError);
+      const errors = (error as AggregateError).errors;
+      expect(errors[0]).toBe(original);
+      expect(errors[1]).toBe("cleanup leaked [REDACTED]");
+    } finally {
+      subscribe.mockRestore();
+      exit.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 it("awaits managed signal cancellation and cleanup before notifying the host", async () => {

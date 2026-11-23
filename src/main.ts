@@ -135,22 +135,38 @@ function formatWarning(warning: RuntimeWarning): string {
 
 export async function createApplication(result: BootstrapResult): Promise<TuiStore> {
   const runtime = await createAgentRuntime(result);
-  const store = new TuiStore(runtime.controller, result.settings, {
-    workspace: result.workspace.path,
-    redact: runtime.redact,
-    diagnostics: result.diagnostics,
-    // 菜单与 Controller 加载是两条独立注入链，必须同源 shanaDir。
-    skillsRoot: path.join(result.shanaDir, "skills"),
-  });
-  store.setUnknownAcknowledgement(runtime.acknowledgeUnknownSideEffects);
-  const noticeWarning = (warning: RuntimeWarning): void => {
-    store.notice(formatWarning(warning));
-  };
-  runtime.setWarningHandler(noticeWarning); // 先切换（不回放）
-  for (const warning of runtime.startupWarnings) {
-    noticeWarning(warning); // 再恰好一次回放
+  // runtime 建成后的任何启动失败都必须回收 controller（否则订阅/子进程泄漏）。
+  // store 已构造走 dispose（内部关 controller），否则直接 exit（exitPromise 幂等）。
+  let constructed: TuiStore | undefined;
+  try {
+    const store = new TuiStore(runtime.controller, result.settings, {
+      workspace: result.workspace.path,
+      redact: runtime.redact,
+      diagnostics: result.diagnostics,
+      // 菜单与 Controller 加载是两条独立注入链，必须同源 shanaDir。
+      skillsRoot: path.join(result.shanaDir, "skills"),
+    });
+    constructed = store;
+    store.setUnknownAcknowledgement(runtime.acknowledgeUnknownSideEffects);
+    const noticeWarning = (warning: RuntimeWarning): void => {
+      store.notice(formatWarning(warning));
+    };
+    runtime.setWarningHandler(noticeWarning); // 先切换（不回放）
+    for (const warning of runtime.startupWarnings) {
+      noticeWarning(warning); // 再恰好一次回放
+    }
+    return store;
+  } catch (error) {
+    const failures: unknown[] = [error];
+    try {
+      if (constructed) await constructed.dispose();
+      else await runtime.controller.exit();
+    } catch (failure) {
+      failures.push(runtime.redact(failure instanceof Error ? failure.message : String(failure)));
+    }
+    if (failures.length === 1) throw error;
+    throw new AggregateError(failures, "Application startup failed");
   }
-  return store;
 }
 
 const entry = process.argv[1] ? realpathSync(process.argv[1]) : undefined;
