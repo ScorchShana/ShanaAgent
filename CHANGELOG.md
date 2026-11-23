@@ -11,6 +11,7 @@
 - **破坏性变更**：`settings.json` 移除 `decisionTimeoutMs`。严格未知键拒绝保留：旧 settings 含该键将启动失败（报"未知字段"），**迁移方法：从 settings.json 删除该键**。
 - 变更：`/` 命令菜单直接列出 `~/.shana/skills` 下的全部 `/skill:<name>` 项（命令在前、skill 按名排序追加在后，前缀匹配过滤），不必先敲 `/skill:` 才加载。按需读目录、无缓存（运行期间新增 skill 立即可补全）；删除 `/skill:` 占位项（语法提示保留在未知命令提示中）；`/skill:` 前缀行为、两次 Enter 确认与运行中禁用门控不变。
 - **变更**：提示词与 skill 读取点代码侧 CRLF→LF 归一化（系统提示词、工具描述、skill 引导语模板、SKILL.md 快照、压缩指令及未注入时的 constitution 回退）。模型可见字节不再受 `core.autocrlf=true` checkout 影响；新 skill 快照恒存 LF，旧 CRLF 快照按原文渲染、不迁移。升级后旧会话首个 Run 因工具描述字节变化触发一次锚定回退，属预期。`read` 工具与 AGENTS.md 加载的逐字契约不变（edit 匹配依赖原文）。
+- **修复**：取消一轮之后，该 Session 的每个后续请求都失败于 `SDK dropped or synthesized tool history`。pi-ai 的共享 `transformMessages` 按设计整条丢弃 `stopReason` 为 `error`/`aborted` 的 assistant 消息，却保留其工具结果，使结果成为孤儿并必然命中回放完整性自检；该 aborted 记录永久存在，故障因此不可自愈（此前只能靠 `/compact` 覆盖或 `/new` 绕开）。回放收口 `prepareReplay` 现在在配对校验通过后，把发送侧副本的 `stopReason` 对齐为 `toolUse`：该字段从不进 OpenAI 请求体，模型可见字节、KV-cache 前缀与 usage 锚定比较均不变，Context 与 Session 记录恒存原文。修复位于读取/发送侧，已 brick 的 Session 升级后自动恢复。Session v6 Schema 零变更。
 
 ## 0.4.0 — 2026-11-20
 

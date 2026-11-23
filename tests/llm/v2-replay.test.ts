@@ -6,6 +6,7 @@ import { createConfiguredModels } from "../../src/llm/provider-adapter.js";
 import { prepareReplay } from "../../src/llm/history-replay.js";
 import { buildContext } from "../../src/core/context-builder.js";
 import { resumeSession } from "../../src/sessions/recovery.js";
+import type { SessionRecord } from "../../src/sessions/records.js";
 import {
   cleanupTempDirs,
   makeAssistantRecord,
@@ -141,6 +142,46 @@ describe("SDK v2 replay", () => {
       ],
     });
     expect(() => replay.onPayload({ messages: [] })).toThrow(/dropped/);
+  });
+  it("replays a cancelled Turn end to end without rewriting Context or records", async () => {
+    const records: SessionRecord[] = [
+      makeUserPromptRecord(1, "run-1", "q"),
+      makeAssistantRecord(2, "run-1", [{ id: "c1", name: "read" }], { stopReason: "aborted" }),
+      makeToolResultRecord(3, "run-1", "c1", "not_executed"),
+    ];
+    const snapshot = JSON.stringify(records);
+    const built = await buildContext({ records, workspacePath: tempDir() });
+    built.context.tools = createToolRegistry()
+      .list()
+      .map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      }));
+    const stopReasonOf = (message: (typeof built.context.messages)[number]) =>
+      message.role === "assistant" ? message.stopReason : undefined;
+    const sent = prepareReplay(built.context).context.messages[1];
+    expect(stopReasonOf(sent!)).toBe("toolUse");
+    // 改写只作用于发送侧副本：Context 与记录恒存原文（锚定同一性与 I5）。
+    expect(stopReasonOf(built.context.messages[1]!)).toBe("aborted");
+    expect(JSON.stringify(records)).toBe(snapshot);
+
+    // 发送侧不改写时，pi-ai 丢弃该 assistant 却保留其工具结果，回放自检必然命中。
+    let payload: Record<string, unknown> = {};
+    await new ModelService(createConfiguredModels([model]), []).streamTurn({
+      model,
+      context: built.context,
+      fetch: async (_url, init) => {
+        payload = JSON.parse(String(init?.body));
+        return response(undefined, "stop");
+      },
+    });
+    const wire = payload.messages as { role: string; tool_calls?: { id: string }[]; tool_call_id?: string }[];
+    const calls = wire.flatMap((message) => message.tool_calls ?? []);
+    expect(calls).toHaveLength(1);
+    expect(wire.filter((message) => message.role === "tool").map((message) => message.tool_call_id)).toEqual(
+      calls.map((call) => call.id),
+    );
   });
   it("isolates raw arguments between network retries", async () => {
     const service = new ModelService(createConfiguredModels([model]), []);

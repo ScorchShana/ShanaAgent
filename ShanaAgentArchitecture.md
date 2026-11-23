@@ -72,7 +72,7 @@ flowchart TD
 - Run 路径：提交 → 同步预留 → 模型/settings 快照 → 初始化或追加 Session（初始记录 fsync 后才发布身份）→ ContextBuilder → 流式请求 → 完整 Assistant 消息持久化 → 工具逐个「校验 → 权限 → 执行 → 结果持久化」→ 下一 Turn → 统一收尾。
 - Turn = 一次逻辑 LLM 响应及其完整工具批次；同批顺序执行，单项被拒不阻断其余；重试不计 Turn；`maxTurns` 命中时最后完整批次照常执行后以 `turn_limit` 收尾。工具普通错误不自动导致 Run 失败。
 - 重试：可重试错误有限次指数退避（每 Turn 单独计算）；SDK 客户端自带重试必须关闭或受控；错误分类依赖 pi-ai 字符串启发式，不假设稳定错误码。失败尝试片段仅临时展示、不拼接、不入 Context。
-- 执行与回放门控：流式片段只供展示；`stopReason=length` 整批不执行，为可配对调用返回未执行结果；仅整条消息可合法回放且所有调用闭合才进下一 Turn。参数解析与有限修复白名单见代码（`src/llm/argument-parser.ts`）。
+- 执行与回放门控：流式片段只供展示；`stopReason=length` 整批不执行，为可配对调用返回未执行结果；仅整条消息可合法回放且所有调用闭合才进下一 Turn。参数解析与有限修复白名单见代码（`src/llm/argument-parser.ts`）。pi-ai 按设计整条丢弃 `stopReason` 为 `error`/`aborted` 的 assistant 消息、却保留其工具结果（成孤儿），故回放收口把发送侧副本的 `stopReason` 对齐为可回放终态；该字段不进请求体，Context 与记录恒存原文。
 - 溢出：Context Length Exceeded 不可重试；每 Run 至多一次自动压缩补救并在同一 Turn 重发，失败则 Run failed 并建议 `/compact`；补救必须 TUI 可见，不得静默。
 - 跨模型继续：保证**可见上下文连续**，不保证思考连续（pi-ai 按设计丢弃其他模型 thinking 块）；适配失败明确报错，不静默丢可见历史。
 
