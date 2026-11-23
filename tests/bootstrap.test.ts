@@ -1,4 +1,5 @@
 import { loadPrompts } from "../src/tools/prompts.js";
+import { createToolRegistry } from "../src/tools/registry.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -102,13 +103,15 @@ describe("启动提示词", () => {
     const result = bootstrap({ homeDir: makeTempDir(), cwd: makeTempDir() });
     expect(result.prompts.system).toContain("<agent>");
     expect(result.prompts.system).toContain("<core_rules>");
-    expect(result.toolRegistry.names()).toEqual(["read", "glob", "grep", "write", "edit", "bash"]);
-    expect(result.toolRegistry.get("bash")?.parameters.properties.timeout).toMatchObject({
+    // bootstrap 不再携带 registry（agent-loop 按模型 input 能力自建），此处直接构造核对声明。
+    const registry = createToolRegistry(process.platform, result.settings, result.prompts);
+    expect(registry.names()).toEqual(["read", "glob", "grep", "write", "edit", "bash"]);
+    expect(registry.get("bash")?.parameters.properties.timeout).toMatchObject({
       default: 120,
       minimum: 1,
       maximum: 1200,
     });
-    expect(result.toolRegistry.get("edit")?.description).toContain("CRLF and standalone CR");
+    expect(registry.get("edit")?.description).toContain("CRLF and standalone CR");
   });
 
   it("任一提示词为空或编码损坏时拒载", () => {

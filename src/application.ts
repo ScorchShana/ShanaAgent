@@ -26,7 +26,7 @@ export interface AgentRuntime {
   setWarningHandler(handler: (warning: RuntimeWarning) => void): void;
 }
 
-// 公共运行时组装：不创建终端、不注册信号、不消费 result.toolRegistry
+// 公共运行时组装：不创建终端、不注册信号
 // （工具定义由 agent-loop 按模型 input 能力自建）。
 export async function createAgentRuntime(result: BootstrapResult): Promise<AgentRuntime> {
   const sessions = new SessionStore({ sessionsDir: result.sessionsDir });
