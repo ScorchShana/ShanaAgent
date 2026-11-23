@@ -46,6 +46,8 @@ export async function createAgentRuntime(result: BootstrapResult): Promise<Agent
     store: sessions,
     workspaceId: result.workspace.id,
     workspaceRoot: result.workspace.path,
+    // 随注入 home 传导（与 model.json 同源 shanaDir）；缺省会落回真实 home，测试注入失效。
+    skillsRoot: path.join(result.shanaDir, "skills"),
     // getModel 与 modelConfigPath 都必须传：Core 优先自加载配置（切换模型/
     // Reasoning Effort 依赖内部重载），getModel 仅作无 path 回退与 error 态列表。
     modelConfigPath: path.join(result.shanaDir, "model.json"),

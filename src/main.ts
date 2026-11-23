@@ -3,6 +3,7 @@ import { theme } from "./tui/theme.js";
 import { ProcessTerminal, TuiAltScreen, getKeybindings, getNativeClipboard, setImageTranscoder, type Terminal } from "./tui/framework/index.js";
 import { pathToFileURL } from "node:url";
 import { realpathSync } from "node:fs";
+import path from "node:path";
 import os from "node:os";
 import { bootstrap, type BootstrapResult } from "./bootstrap.js";
 import { createAgentRuntime, type RuntimeWarning } from "./application.js";
@@ -138,6 +139,8 @@ export async function createApplication(result: BootstrapResult): Promise<TuiSto
     workspace: result.workspace.path,
     redact: runtime.redact,
     diagnostics: result.diagnostics,
+    // 菜单与 Controller 加载是两条独立注入链，必须同源 shanaDir。
+    skillsRoot: path.join(result.shanaDir, "skills"),
   });
   store.setUnknownAcknowledgement(runtime.acknowledgeUnknownSideEffects);
   const noticeWarning = (warning: RuntimeWarning): void => {

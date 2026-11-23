@@ -9,9 +9,26 @@ import { SessionController } from "../src/core/session-controller.js";
 import { SessionStore } from "../src/sessions/session-store.js";
 import { TuiStore } from "../src/tui/store.js";
 import { parseSettings } from "../src/llm/settings-store.js";
+import type { StreamTurnOptions, TurnResult } from "../src/llm/model-service.js";
+import { makeAssistantMessage } from "./sessions/helpers.js";
 import { VirtualTerminal } from "./tui/framework/virtual-terminal.js";
 import { Text, ScrollView } from "../src/tui/framework/index.js";
 import * as framework from "../src/tui/framework/index.js";
+
+// 受控 fake stream（不触网）；本文件其余用例不构造 ModelService，mock 对它们无影响。
+const modelServiceMock = vi.hoisted(() => ({
+  streamTurn: undefined as undefined | ((options: StreamTurnOptions) => Promise<TurnResult>),
+}));
+vi.mock("../src/llm/model-service.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/llm/model-service.js")>();
+  class FakeModelService {
+    streamTurn(options: StreamTurnOptions): Promise<TurnResult> {
+      if (!modelServiceMock.streamTurn) throw new Error("streamTurn impl not set");
+      return modelServiceMock.streamTurn(options);
+    }
+  }
+  return { ...actual, ModelService: FakeModelService };
+});
 
 it("copies selected Unicode text through the native clipboard callback", async () => {
   const setText = vi.fn().mockResolvedValue(undefined);
@@ -127,6 +144,66 @@ describe("main application", () => {
     } finally {
       spy.mockRestore();
       await store?.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("injects skillsRoot from the bootstrap home into both the menu and Controller loading", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-skill-"));
+    const skillDir = path.join(root, ".shana", "skills", "demo");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "# Demo\n\nfollow the demo steps");
+    await fs.writeFile(
+      path.join(root, ".shana", "model.json"),
+      JSON.stringify({
+        current: { provider: "p", model: "A" },
+        providers: {
+          p: {
+            api: "openai-completions",
+            baseUrl: "https://fake.test",
+            apiKey: "sk-main-skill-test-000000",
+            models: [{ id: "A", contextWindow: 10000, maxTokens: 1000 }],
+          },
+        },
+      }),
+    );
+    modelServiceMock.streamTurn = async () => {
+      const message = makeAssistantMessage([], "done");
+      return {
+        attempts: 1,
+        message,
+        stopReason: message.stopReason,
+        usage: message.usage,
+        text: "",
+        thinking: "",
+        truncated: false,
+        toolCalls: [],
+      };
+    };
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const store = await createApplication(result);
+    try {
+      // 菜单链：/ 菜单列出注入 home 下的 skill（而非真实 home）。
+      store.setDraft("/");
+      expect(store.commandOptions().map((option) => option.name)).toContain("/skill:demo");
+      // Controller 加载链：/skill:demo 加载成功，快照随 user_prompt 落盘。
+      await expect(store.controller.submitPrompt("/skill:demo fix the bug")).resolves.toBe("completed");
+      const ref = store.controller.getSnapshot().session.ref;
+      if (!ref) throw new Error("session ref missing");
+      const raw = await fs.readFile(
+        path.join(result.sessionsDir, ref.workspaceId, ref.sessionId, "messages.jsonl"),
+        "utf8",
+      );
+      const first = JSON.parse(raw.split("\n")[0]!) as {
+        type: string;
+        skill?: { name: string; content: string };
+      };
+      expect(first.type).toBe("user_prompt");
+      expect(first.skill?.name).toBe("demo");
+      expect(first.skill?.content).toBe("# Demo\n\nfollow the demo steps");
+    } finally {
+      modelServiceMock.streamTurn = undefined;
+      await store.dispose();
       await fs.rm(root, { recursive: true, force: true });
     }
   });
