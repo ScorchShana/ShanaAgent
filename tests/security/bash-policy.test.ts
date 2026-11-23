@@ -116,6 +116,43 @@ describe("Bash 命令效果", () => {
   });
 });
 
+describe("ls 通配符（仅列名字/元数据）", () => {
+  it.each(["ls *.md", "ls docs/*", "ls .*", "ls docs/*.md", "ls *.nomatch", "ls a?b"])(
+    "只读放行 %s",
+    async (command) => {
+      expect((await analyze(command, "confirm")).decision).toBe("allow");
+      expect((await analyze(command)).decision).toBe("allow");
+    },
+  );
+  it.each(["ls ../*", "ls */x", "ls {a,b}", "ls /*", "ls -R *", 'ls "*.md"', "ls '*.md'"])(
+    "询问 %s",
+    async (command) => {
+      expect((await analyze(command)).decision).toBe("ask");
+    },
+  );
+  it("前缀目录含 - 开头目录项时询问（选项注入缓解）", async () => {
+    await fs.writeFile(path.join(root, "-R"), "x");
+    expect((await analyze("ls *")).decision).toBe("ask");
+    await fs.writeFile(path.join(root, "docs", "-L"), "x");
+    expect((await analyze("ls docs/*")).decision).toBe("ask");
+  });
+  it("revalidate 期间新增 - 开头目录项报路径错误", async () => {
+    const result = await analyze("ls *");
+    expect(result.decision).toBe("allow");
+    await fs.writeFile(path.join(root, "-R"), "x");
+    if (result.decision === "allow") await expect(result.revalidate()).rejects.toThrow("Path target changed");
+  });
+  it("匹配项是指向区外的符号链接时放行（ls 只读链接本体）", async () => {
+    const external = await fs.mkdtemp(path.join(os.tmpdir(), "shana-bash-glob-external-"));
+    try {
+      await fs.symlink(external, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
+      expect((await analyze("ls *")).decision).toBe("allow");
+    } finally {
+      await fs.rm(external, { recursive: true, force: true });
+    }
+  });
+});
+
 it("checks the final copy destination and every tee operand", async () => {
   expect((await analyze("printf '%s' hi | tee -- new ../other")).decision).toBe("ask");
   await fs.mkdir(path.join(root, "docs", "a.txt"));

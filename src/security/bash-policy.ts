@@ -46,11 +46,22 @@ function check(condition: unknown): asserts condition {
   if (!condition) throw new Unsupported();
 }
 
-function literal(node: Node): string {
+function literal(node: Node, glob = false): string {
   if (node.type === "command_name" && node.children.length === 1) return literal(node.children[0]!);
-  if (node.type === "raw_string" && /^'[^']*'$/.test(node.text)) return node.text.slice(1, -1);
-  if (node.type === "string" && /^"[^"$`\\]*"$/.test(node.text)) return node.text.slice(1, -1);
-  check(["word", "number"].includes(node.type) && /^[a-zA-Z0-9_./,:+%@=-]+$/.test(node.text));
+  // 引号阻止 bash 展开：含通配符的引号操作数不按 glob 分析，保持询问（仅 ls 提取会传 glob）。
+  if (node.type === "raw_string" && /^'[^']*'$/.test(node.text)) {
+    check(!glob || !/[*?]/.test(node.text));
+    return node.text.slice(1, -1);
+  }
+  if (node.type === "string" && /^"[^"$`\\]*"$/.test(node.text)) {
+    check(!glob || !/[*?]/.test(node.text));
+    return node.text.slice(1, -1);
+  }
+  // glob 仅对 ls 的操作数放宽 *?（bash 展开未引号通配符）；其余命令保持严格字面量。
+  check(
+    ["word", "number"].includes(node.type) &&
+      (glob ? /^[a-zA-Z0-9_./,:+%@=*?-]+$/ : /^[a-zA-Z0-9_./,:+%@=-]+$/).test(node.text),
+  );
   return node.text;
 }
 
@@ -136,6 +147,35 @@ export const analyzeBash: BashCommandAnalyzer = async (
       });
       return { absolute, kind: initial.kind };
     }
+    // ls 通配符操作数：不逐匹配展开（避免匹配项竞态），只校验字面前缀目录。
+    // 匹配项是指向区外的符号链接时也放行：ls 无 -L/-H 只 lstat/readlink 链接本体。
+    function inspectGlob(raw: string): void {
+      check(!/[{}~$[\]\\]/.test(raw) && !raw.split("/").includes(".."));
+      const first = raw.search(/[*?]/);
+      // 首个通配符之后不得再出现 /：否则匹配深度不可控（如 */x 递归进子目录）。
+      check(first >= 0 && !raw.slice(first).includes("/"));
+      if (policy.platform === "win32")
+        check(
+          !/[:"<>|]|^\//.test(raw) &&
+            !/(?:^|\/)(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|\/|$)/i.test(raw) &&
+            raw.split("/").every((part) => part === "." || !/[ .]$/.test(part)),
+        );
+      const prefixPart = raw.slice(0, first);
+      const slash = prefixPart.lastIndexOf("/");
+      const dir = inspect(slash >= 0 ? prefixPart.slice(0, slash) : ".", ["dir"]);
+      // 选项注入缓解：名为 -R/-L 的目录项被裸 * 匹配后会成为 ls 选项（-R -L 可递归跟随链接读区外）。
+      // 存在任何 - 开头目录项即询问；revalidate 同款检查。残余 TOCTOU 窗口与 cat symlink 声明同级。
+      const real = policy.resolve(dir.absolute).realPath;
+      const noDashEntries = () => check(!fs.readdirSync(real).some((entry) => entry.startsWith("-")));
+      noDashEntries();
+      checks.push(async () => {
+        try {
+          noDashEntries();
+        } catch {
+          throw new PathTargetChangedError();
+        }
+      });
+    }
     function operands(args: string[], options: RegExp) {
       const files: string[] = [];
       let explicit = false;
@@ -193,7 +233,8 @@ export const analyzeBash: BashCommandAnalyzer = async (
       }
       check(c[0]?.type === "command_name");
       const name = literal(c[0]);
-      const args = c.slice(1).map(literal);
+      // 先取命令名再提取操作数：只有 ls 放宽通配符，其余命令的 glob 词在此即拒。
+      const args = c.slice(1).map((n) => literal(n, name === "ls"));
       matched.push(node.text);
       const names = commands.get(cwd) ?? new Set<string>();
       names.add(name);
@@ -239,7 +280,10 @@ export const analyzeBash: BashCommandAnalyzer = async (
         }
         case "ls": {
           const files = operands(args, /^-[la]+$/);
-          paths(files.length ? files : ["."], ["dir", "file"]);
+          for (const f of files.length ? files : ["."]) {
+            if (/[*?]/.test(f)) inspectGlob(f);
+            else inspect(f, ["dir", "file"]);
+          }
           return;
         }
         case "grep": {
