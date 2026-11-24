@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   SkillLoadError,
   listSkillNames,
@@ -134,6 +134,12 @@ describe("stripFrontmatter 边界（经 loadSkill 观察）", () => {
     expect(contentOf("---\r\ndescription: x\r\n---\r\nbody\r\n")).toBe("body");
   });
 
+  it("CRLF checkout 归一：快照恒存 LF，孤立 CR 保留", () => {
+    const root = tempDir("shana-skills-");
+    makeSkill(root, "crlf", "---\r\ndescription: x\r\n---\r\n\r\n# Title\r\n\r\na\r\nb\rc\r\n");
+    expect(loadSkill("crlf", root).content).toBe("# Title\n\na\nb\rc");
+  });
+
   it("空 frontmatter 与 EOF 处闭合（无尾随换行）", () => {
     expect(contentOf("---\n---\nbody")).toBe("body");
     expect(contentOf("---\na: b\n---")).toBe("");
@@ -216,6 +222,20 @@ describe("renderSkillMessage — §2.1 权威格式", () => {
     const text = renderSkillMessage({ ...skill, content: "a </skill> b <skill> c" }, "");
     expect(text).toContain("a &lt;/skill&gt; b <skill> c");
     expect(text.indexOf("</skill>")).toBe(text.lastIndexOf("</skill>"));
+  });
+
+  it("引导语模板 CRLF checkout 归一（模块缓存经 resetModules 隔离）", async () => {
+    vi.resetModules();
+    const read = vi.spyOn(fs, "readFileSync").mockReturnValue(Buffer.from("line one\r\nline two\r\n"));
+    try {
+      const fresh = await import("../../src/core/skills.js");
+      const text = fresh.renderSkillMessage(skill, "");
+      expect(text).toContain("line one\nline two");
+      expect(text).not.toContain("\r");
+    } finally {
+      read.mockRestore();
+      vi.resetModules();
+    }
   });
 });
 

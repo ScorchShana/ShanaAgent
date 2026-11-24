@@ -6,11 +6,29 @@ import { describe, expect, it, vi } from "vitest";
 import { bindExitSignals, createApplication, renderTui } from "../src/main.js";
 import { bootstrap } from "../src/bootstrap.js";
 import { SessionController } from "../src/core/session-controller.js";
+import { SessionStore } from "../src/sessions/session-store.js";
 import { TuiStore } from "../src/tui/store.js";
 import { parseSettings } from "../src/llm/settings-store.js";
+import type { StreamTurnOptions, TurnResult } from "../src/llm/model-service.js";
+import { makeAssistantMessage } from "./sessions/helpers.js";
 import { VirtualTerminal } from "./tui/framework/virtual-terminal.js";
 import { Text, ScrollView } from "../src/tui/framework/index.js";
 import * as framework from "../src/tui/framework/index.js";
+
+// 受控 fake stream（不触网）；本文件其余用例不构造 ModelService，mock 对它们无影响。
+const modelServiceMock = vi.hoisted(() => ({
+  streamTurn: undefined as undefined | ((options: StreamTurnOptions) => Promise<TurnResult>),
+}));
+vi.mock("../src/llm/model-service.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/llm/model-service.js")>();
+  class FakeModelService {
+    streamTurn(options: StreamTurnOptions): Promise<TurnResult> {
+      if (!modelServiceMock.streamTurn) throw new Error("streamTurn impl not set");
+      return modelServiceMock.streamTurn(options);
+    }
+  }
+  return { ...actual, ModelService: FakeModelService };
+});
 
 it("copies selected Unicode text through the native clipboard callback", async () => {
   const setText = vi.fn().mockResolvedValue(undefined);
@@ -73,6 +91,205 @@ describe("main application", () => {
     } finally {
       view.unmount();
       await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("replays startup warnings to notice verbatim and in order (Task 0 baseline)", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-warn-"));
+    // 触发 collectSettingsWarnings 的唯一告警：retained >= threshold。
+    await fs.mkdir(path.join(root, ".shana"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, ".shana", "settings.json"),
+      JSON.stringify({ compactionRetainedContextRatio: 0.9, compactionThresholdRatio: 0.8 }),
+    );
+    const result = bootstrap({ homeDir: root, cwd: root });
+    // 种一个尾部半行截断的 Session：接管后经 listSessions 触发 tail_truncated。
+    const sessions = new SessionStore({ sessionsDir: result.sessionsDir });
+    const ref = { workspaceId: result.workspace.id, sessionId: "baseline-s1" };
+    await sessions.createSession(ref);
+    await sessions.appendRecord(ref, { type: "user_prompt", runId: "run-1", text: "one" });
+    await sessions.appendRecord(ref, {
+      type: "run_finished",
+      runId: "run-1",
+      outcome: "completed",
+      persisted: true,
+    });
+    const messagesPath = path.join(result.sessionsDir, ref.workspaceId, ref.sessionId, "messages.jsonl");
+    const raw = await fs.readFile(messagesPath, "utf8");
+    await fs.writeFile(messagesPath, raw.slice(0, raw.length - 5));
+    // 逐字捕获自重构前旧 createApplication() 路径的启动 notice（Task 0 基线）。
+    const baseline =
+      'settings.json: "compactionRetainedContextRatio" (0.9) >= "compactionThresholdRatio" (0.8)，尾部保留 cap 松于压缩阈值、几乎不生效';
+    const truncatedNotice = `Session 尾部记录不完整，已读取完整前缀：末尾记录不完整（无换行终止符），已按前 1 条完整记录恢复；原始文件未修改: ${messagesPath}`;
+    const notices: Array<{ text: string; error: boolean }> = [];
+    const originalNotice = TuiStore.prototype.notice;
+    const spy = vi.spyOn(TuiStore.prototype, "notice").mockImplementation(function (
+      this: TuiStore,
+      text: string,
+      error = false,
+    ) {
+      notices.push({ text, error });
+      return originalNotice.call(this, text, error);
+    });
+    let store: TuiStore | undefined;
+    try {
+      store = await createApplication(result);
+      expect(notices).toEqual([{ text: baseline, error: false }]);
+      expect(store.getSnapshot().notice?.text).toBe(baseline);
+      // 接管后新告警直达 notice，文案映射（D3）逐字不变。
+      notices.length = 0;
+      await store.controller.listSessions();
+      expect(notices).toEqual([{ text: truncatedNotice, error: false }]);
+    } finally {
+      spy.mockRestore();
+      await store?.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("injects skillsRoot from the bootstrap home into both the menu and Controller loading", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-skill-"));
+    const skillDir = path.join(root, ".shana", "skills", "demo");
+    await fs.mkdir(skillDir, { recursive: true });
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "# Demo\n\nfollow the demo steps");
+    await fs.writeFile(
+      path.join(root, ".shana", "model.json"),
+      JSON.stringify({
+        current: { provider: "p", model: "A" },
+        providers: {
+          p: {
+            api: "openai-completions",
+            baseUrl: "https://fake.test",
+            apiKey: "sk-main-skill-test-000000",
+            models: [{ id: "A", contextWindow: 10000, maxTokens: 1000 }],
+          },
+        },
+      }),
+    );
+    modelServiceMock.streamTurn = async () => {
+      const message = makeAssistantMessage([], "done");
+      return {
+        attempts: 1,
+        message,
+        stopReason: message.stopReason,
+        usage: message.usage,
+        text: "",
+        thinking: "",
+        truncated: false,
+        toolCalls: [],
+      };
+    };
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const store = await createApplication(result);
+    try {
+      // 菜单链：/ 菜单列出注入 home 下的 skill（而非真实 home）。
+      store.setDraft("/");
+      expect(store.commandOptions().map((option) => option.name)).toContain("/skill:demo");
+      // Controller 加载链：/skill:demo 加载成功，快照随 user_prompt 落盘。
+      await expect(store.controller.submitPrompt("/skill:demo fix the bug")).resolves.toBe("completed");
+      const ref = store.controller.getSnapshot().session.ref;
+      if (!ref) throw new Error("session ref missing");
+      const raw = await fs.readFile(
+        path.join(result.sessionsDir, ref.workspaceId, ref.sessionId, "messages.jsonl"),
+        "utf8",
+      );
+      const first = JSON.parse(raw.split("\n")[0]!) as {
+        type: string;
+        skill?: { name: string; content: string };
+      };
+      expect(first.type).toBe("user_prompt");
+      expect(first.skill?.name).toBe("demo");
+      expect(first.skill?.content).toBe("# Demo\n\nfollow the demo steps");
+    } finally {
+      modelServiceMock.streamTurn = undefined;
+      await store.dispose();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("exits the controller exactly once when TuiStore construction fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-fail-"));
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const failure = new Error("store construction failed");
+    // TuiStore 构造器首句即 controller.subscribe；agent-loop 自身不订阅，Once 必中构造器。
+    const subscribe = vi
+      .spyOn(SessionController.prototype, "subscribe")
+      .mockImplementationOnce(() => {
+        throw failure;
+      });
+    const exit = vi.spyOn(SessionController.prototype, "exit");
+    try {
+      await expect(createApplication(result)).rejects.toBe(failure);
+      expect(exit).toHaveBeenCalledOnce();
+    } finally {
+      subscribe.mockRestore();
+      exit.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("disposes the store when a post-construction startup step fails", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-fail-"));
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const failure = new Error("acknowledgement wiring failed");
+    const ack = vi
+      .spyOn(TuiStore.prototype, "setUnknownAcknowledgement")
+      .mockImplementationOnce(() => {
+        throw failure;
+      });
+    const dispose = vi.spyOn(TuiStore.prototype, "dispose");
+    const exit = vi.spyOn(SessionController.prototype, "exit");
+    try {
+      await expect(createApplication(result)).rejects.toBe(failure);
+      expect(dispose).toHaveBeenCalledOnce();
+      // dispose 内部关 controller：不重复 exit。
+      expect(exit).toHaveBeenCalledOnce();
+    } finally {
+      ack.mockRestore();
+      dispose.mockRestore();
+      exit.mockRestore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("aggregates a redacted cleanup failure with the original startup error", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "shana-main-fail-"));
+    const key = "sk-main-cleanup-test-000000";
+    await fs.mkdir(path.join(root, ".shana"), { recursive: true });
+    await fs.writeFile(
+      path.join(root, ".shana", "model.json"),
+      JSON.stringify({
+        current: { provider: "p", model: "A" },
+        providers: {
+          p: {
+            api: "openai-completions",
+            baseUrl: "https://fake.test",
+            apiKey: key,
+            models: [{ id: "A", contextWindow: 10000, maxTokens: 1000 }],
+          },
+        },
+      }),
+    );
+    const result = bootstrap({ homeDir: root, cwd: root });
+    const original = new Error("store construction failed");
+    const subscribe = vi
+      .spyOn(SessionController.prototype, "subscribe")
+      .mockImplementationOnce(() => {
+        throw original;
+      });
+    const exit = vi
+      .spyOn(SessionController.prototype, "exit")
+      .mockRejectedValueOnce(new Error(`cleanup leaked ${key}`));
+    try {
+      const error = await createApplication(result).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(AggregateError);
+      const errors = (error as AggregateError).errors;
+      expect(errors[0]).toBe(original);
+      expect(errors[1]).toBe("cleanup leaked [REDACTED]");
+    } finally {
+      subscribe.mockRestore();
+      exit.mockRestore();
       await fs.rm(root, { recursive: true, force: true });
     }
   });

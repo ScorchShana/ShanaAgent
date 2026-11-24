@@ -113,5 +113,19 @@ export default tseslint.config(
       ],
     },
   },
+  {
+    files: ["src/application.ts"],
+    rules: {
+      "@typescript-eslint/no-restricted-imports": [
+        "error",
+        {
+          patterns: [
+            { group: ["**/tui/**"], message: "公共运行时不得依赖 TUI（含内置框架）。" },
+            { group: ["**/main.js"], message: "公共运行时不得依赖 TUI 入口。" },
+          ],
+        },
+      ],
+    },
+  },
   prettier,
 );

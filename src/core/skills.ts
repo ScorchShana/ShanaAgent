@@ -90,7 +90,10 @@ export function loadSkill(name: string, root: string = DEFAULT_SKILLS_ROOT): Ski
   }
   let raw: string;
   try {
-    raw = new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(location));
+    // CRLF checkout 归一（readPrompt 同款）：新快照恒存 LF，旧 CRLF 快照按原文渲染不迁移。
+    raw = new TextDecoder("utf-8", { fatal: true })
+      .decode(fs.readFileSync(location))
+      .replaceAll("\r\n", "\n");
   } catch (error) {
     throw new SkillLoadError(`读取 Skill "${name}" 失败：${(error as Error).message}`, "io", name);
   }
@@ -107,7 +110,9 @@ function loadInvocationTemplate(): string {
   if (invocationTemplate === undefined) {
     // prompts/ 不进 dist，相对源码/编译产物同深度加载（tools/prompts.ts 同款）。
     const url = new URL("../../prompts/skill-invocation.md", import.meta.url);
-    const text = new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(url));
+    const text = new TextDecoder("utf-8", { fatal: true })
+      .decode(fs.readFileSync(url))
+      .replaceAll("\r\n", "\n"); // CRLF checkout 归一（readPrompt 同款）
     if (text.trim().length === 0 || text.includes("\0")) {
       throw new Error(`Invalid prompt file: ${url.pathname}`);
     }

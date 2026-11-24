@@ -1,4 +1,3 @@
-import { createToolRegistry, type ToolRegistry } from "./tools/registry.js";
 import { loadPrompts, type PromptBundle } from "./tools/prompts.js";
 import fs from "node:fs";
 import os from "node:os";
@@ -22,7 +21,6 @@ export interface BootstrapResult {
   workspace: WorkspaceIdentity;
   diagnostics: Diagnostics;
   prompts: PromptBundle;
-  toolRegistry: ToolRegistry;
 }
 
 function ensureDir(dir: string): void {
@@ -51,7 +49,6 @@ export function bootstrap(options: BootstrapOptions = {}): BootstrapResult {
   const secrets = modelConfig.status === "ok" ? modelConfig.secrets : [];
   const redact = (text: string) => redactSecrets(text, secrets);
   const diagnostics = createDiagnostics({ logsDir, minLevel: settings.logLevel, redact });
-  const toolRegistry = createToolRegistry(process.platform, settings, prompts);
   const workspace = deriveWorkspaceIdentity(options.cwd ?? process.cwd());
 
   return {
@@ -63,6 +60,5 @@ export function bootstrap(options: BootstrapOptions = {}): BootstrapResult {
     workspace,
     diagnostics,
     prompts,
-    toolRegistry,
   };
 }

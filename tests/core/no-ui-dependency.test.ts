@@ -59,3 +59,11 @@ it("embedded framework does not import application business modules", () => {
     expect(forbidden, file).toEqual([]);
   }
 });
+
+it("application runtime stays independent of TUI and the TUI entry", () => {
+  const file = path.resolve("src/application.ts");
+  const forbidden = imports(fs.readFileSync(file, "utf8")).filter((specifier) =>
+    /^(?:react|ink|shana-tui)(?:\/|$)|(?:^|\/)tui(?:\/|$)|(?:^|\/)main(?:\.js)?$/.test(specifier),
+  );
+  expect(forbidden, file).toEqual([]);
+});

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { afterEach, describe, expect, it } from "vitest";
+import fs from "node:fs";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { StopReason, Usage } from "@earendil-works/pi-ai";
 import {
   CONTEXT_SAFETY_MARGIN_TOKENS,
@@ -332,6 +333,22 @@ describe("摘要校验", () => {
     // 模板自身结尾换行被 trimEnd，focus 段前恰一个空行。
     expect(last.content).toContain("\n\nAdditional focus:\n关注认证流程");
     expect(last.content).not.toContain("\n\n\nAdditional focus:\n");
+  });
+
+  it("默认加载器 CRLF checkout 归一为 LF", async () => {
+    const read = vi
+      .spyOn(fs.promises, "readFile")
+      .mockResolvedValueOnce(Buffer.from("Summarize in {{TARGET_TOKENS}} tokens.\r\n"));
+    try {
+      const h = harness({ loadPrompt: undefined });
+      const outcome = await compactHistory(h.options);
+      expect(outcome.status).toBe("completed");
+      const last = h.requests[0]!.context.messages.at(-1)!;
+      // 无 focus 不 trimEnd：尾部 CRLF 归一为单个 LF 原样保留。
+      expect(last.content).toBe("Summarize in 4096 tokens.\n");
+    } finally {
+      read.mockRestore();
+    }
   });
 });
 

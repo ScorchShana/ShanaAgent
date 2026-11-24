@@ -7,7 +7,11 @@ export interface PromptBundle {
 }
 
 function readPrompt(url: URL): string {
-  const text = new TextDecoder("utf-8", { fatal: true }).decode(fs.readFileSync(url));
+  // autocrlf=true 的 checkout 会使提示词为 CRLF；归一保证模型可见字节与逐字锚定稳定。
+  // 只归一 CRLF，孤立 CR 不动（read 工具与 AGENTS.md 的逐字契约不在此列）。
+  const text = new TextDecoder("utf-8", { fatal: true })
+    .decode(fs.readFileSync(url))
+    .replaceAll("\r\n", "\n");
   if (text.trim().length === 0 || text.includes("\0")) {
     throw new Error(`Invalid prompt file: ${url.pathname}`);
   }

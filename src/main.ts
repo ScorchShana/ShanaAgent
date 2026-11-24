@@ -6,12 +6,8 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { bootstrap, type BootstrapResult } from "./bootstrap.js";
-import { createAgentSession } from "./core/agent-loop.js";
-import { ModelService } from "./llm/model-service.js";
-import { createConfiguredModels } from "./llm/provider-adapter.js";
+import { createAgentRuntime, type RuntimeWarning } from "./application.js";
 import { redactSecrets } from "./llm/model-config-store.js";
-import { collectSettingsWarnings } from "./llm/settings-store.js";
-import { SessionStore } from "./sessions/session-store.js";
 import { TuiStore } from "./tui/store.js";
 import { TuiApp } from "./tui/app.js";
 import { onTranscodeReady, transcodeToPng } from "./tui/image-transcoder.js";
@@ -117,58 +113,60 @@ export function bindExitSignals(
   };
 }
 
+// 展示文案归 TUI 侧（D3）：公共运行时只传结构化告警，这里逐字保留原映射。
+function formatWarning(warning: RuntimeWarning): string {
+  switch (warning.kind) {
+    case "settings_warning":
+      return warning.message;
+    case "temporary_file_cleanup_failed":
+      return `未能清理临时文件：${warning.path}`;
+    case "shell_cleanup_unconfirmed":
+      return "Shell 终止无法确认，可能仍有子进程运行。";
+    case "tail_truncated":
+      return `Session 尾部记录不完整，已读取完整前缀：${warning.message}`;
+    case "compaction_failed":
+      return `自动压缩失败，本次继续使用原上下文：${warning.message}`;
+    case "agents_md_read_failed":
+      return `AGENTS.md 读取失败，本会话省略项目规则：${warning.path}`;
+    default:
+      return "未识别的警告。";
+  }
+}
+
 export async function createApplication(result: BootstrapResult): Promise<TuiStore> {
-  const sessions = new SessionStore({ sessionsDir: result.sessionsDir });
-  const secrets = new Set(result.modelConfig.secrets);
-  const startupWarnings: string[] = [];
-  startupWarnings.push(...collectSettingsWarnings(result.settings));
-  let reportWarning = (message: string): void => {
-    startupWarnings.push(message);
-  };
-  const session = await createAgentSession({
-    store: sessions,
-    workspaceId: result.workspace.id,
-    workspaceRoot: result.workspace.path,
-    modelConfigPath: path.join(result.shanaDir, "model.json"),
-    getModel: () => {
-      if (result.modelConfig.status !== "ok") throw new Error(result.modelConfig.message);
-      return result.modelConfig.current;
-    },
-    getSettings: () => result.settings,
-    modelService: {
-      streamTurn: (options) => {
-        if (options.model.apiKey) secrets.add(options.model.apiKey);
-        return new ModelService(createConfiguredModels([options.model]), [...secrets]).streamTurn(options);
-      },
-    },
-    diagnostics: result.diagnostics,
-    systemPrompt: result.prompts.system,
-    environment: `Workspace: ${result.workspace.path}\nPlatform: ${process.platform === "win32" ? "Windows (Git Bash)" : "Linux (bash)"}`,
-    onWarning: (warning) => {
-      const text =
-        warning.kind === "temporary_file_cleanup_failed"
-          ? `未能清理临时文件：${warning.path}`
-          : warning.kind === "shell_cleanup_unconfirmed"
-            ? "Shell 终止无法确认，可能仍有子进程运行。"
-            : warning.kind === "tail_truncated"
-              ? `Session 尾部记录不完整，已读取完整前缀：${warning.message}`
-              : warning.kind === "compaction_failed"
-                ? `自动压缩失败，本次继续使用原上下文：${warning.message}`
-                : warning.kind === "agents_md_read_failed"
-                  ? `AGENTS.md 读取失败，本会话省略项目规则：${warning.path}`
-                  : "未识别的警告。";
-      reportWarning(text);
-    },
-  });
-  const store = new TuiStore(session.controller, result.settings, {
-    workspace: result.workspace.path,
-    redact: (text) => redactSecrets(text, [...secrets]),
-    diagnostics: result.diagnostics,
-  });
-  store.setUnknownAcknowledgement(session.acknowledgeUnknownSideEffects);
-  reportWarning = (message) => store.notice(message);
-  for (const warning of startupWarnings) store.notice(warning);
-  return store;
+  const runtime = await createAgentRuntime(result);
+  // runtime 建成后的任何启动失败都必须回收 controller（否则订阅/子进程泄漏）。
+  // store 已构造走 dispose（内部关 controller），否则直接 exit（exitPromise 幂等）。
+  let constructed: TuiStore | undefined;
+  try {
+    const store = new TuiStore(runtime.controller, result.settings, {
+      workspace: result.workspace.path,
+      redact: runtime.redact,
+      diagnostics: result.diagnostics,
+      // 菜单与 Controller 加载是两条独立注入链，必须同源 shanaDir。
+      skillsRoot: path.join(result.shanaDir, "skills"),
+    });
+    constructed = store;
+    store.setUnknownAcknowledgement(runtime.acknowledgeUnknownSideEffects);
+    const noticeWarning = (warning: RuntimeWarning): void => {
+      store.notice(formatWarning(warning));
+    };
+    runtime.setWarningHandler(noticeWarning); // 先切换（不回放）
+    for (const warning of runtime.startupWarnings) {
+      noticeWarning(warning); // 再恰好一次回放
+    }
+    return store;
+  } catch (error) {
+    const failures: unknown[] = [error];
+    try {
+      if (constructed) await constructed.dispose();
+      else await runtime.controller.exit();
+    } catch (failure) {
+      failures.push(runtime.redact(failure instanceof Error ? failure.message : String(failure)));
+    }
+    if (failures.length === 1) throw error;
+    throw new AggregateError(failures, "Application startup failed");
+  }
 }
 
 const entry = process.argv[1] ? realpathSync(process.argv[1]) : undefined;

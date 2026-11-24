@@ -1,4 +1,4 @@
-﻿import { execFileSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs/promises";
 import os from "node:os";
@@ -28,6 +28,8 @@ describe("Bash 命令效果", () => {
     "wc -l < a.txt",
     "ls docs",
     "grep -nF -- TODO a.txt",
+    "grep -i optim",
+    "ls -la | grep -i optim",
     "diff -u a.txt b.txt",
     "cmp a.txt b.txt",
     "sha256sum -- a.txt",
@@ -36,6 +38,15 @@ describe("Bash 命令效果", () => {
     "tr -d '\\r' < a.txt",
     "uniq a.txt",
     "cat a.txt | wc -l",
+    "head -n 5 a.txt",
+    "tail -n 2 a.txt b.txt",
+    "tail -n +2 a.txt",
+    "tail -c 3 a.txt",
+    "cat a.txt | head -n 1",
+    "head",
+    "ls docs; wc -l docs/guide.md",
+    "cat a.txt; cat b.txt",
+    "cat a.txt | wc -l; ls docs",
     "cd -- ./docs && wc -l guide.md",
   ])("只读 %s", async (command) => {
     expect((await analyze(command, "confirm")).decision).toBe("allow");
@@ -74,6 +85,22 @@ describe("Bash 命令效果", () => {
     "tee --output-error=warn",
     "cat a.txt;",
     "cat a.txt | unknown",
+    "grep -i",
+    "grep -e pat a.txt",
+    "cd docs; wc -l guide.md",
+    "cd docs && cat a.txt; wc -l b.txt",
+    "ls; cd docs",
+    "sort a.txt; ls",
+    "cat a.txt;; cat b.txt",
+    "tail -f a.txt",
+    "tail -F a.txt",
+    "head -n",
+    "head -n x a.txt",
+    "head -n5 a.txt",
+    "head -5 a.txt",
+    "head -q a.txt",
+    "head ../a.txt",
+    "head absent",
   ])("人工 %s", async (command) => {
     expect((await analyze(command)).decision).toBe("ask");
   });
@@ -86,6 +113,43 @@ describe("Bash 命令效果", () => {
   it("继承启动脚本时询问", async () => {
     vi.stubEnv("BASH_ENV", "startup");
     expect((await analyze("pwd")).decision).toBe("ask");
+  });
+});
+
+describe("ls 通配符（仅列名字/元数据）", () => {
+  it.each(["ls *.md", "ls docs/*", "ls .*", "ls docs/*.md", "ls *.nomatch", "ls a?b"])(
+    "只读放行 %s",
+    async (command) => {
+      expect((await analyze(command, "confirm")).decision).toBe("allow");
+      expect((await analyze(command)).decision).toBe("allow");
+    },
+  );
+  it.each(["ls ../*", "ls */x", "ls {a,b}", "ls /*", "ls -R *", 'ls "*.md"', "ls '*.md'"])(
+    "询问 %s",
+    async (command) => {
+      expect((await analyze(command)).decision).toBe("ask");
+    },
+  );
+  it("前缀目录含 - 开头目录项时询问（选项注入缓解）", async () => {
+    await fs.writeFile(path.join(root, "-R"), "x");
+    expect((await analyze("ls *")).decision).toBe("ask");
+    await fs.writeFile(path.join(root, "docs", "-L"), "x");
+    expect((await analyze("ls docs/*")).decision).toBe("ask");
+  });
+  it("revalidate 期间新增 - 开头目录项报路径错误", async () => {
+    const result = await analyze("ls *");
+    expect(result.decision).toBe("allow");
+    await fs.writeFile(path.join(root, "-R"), "x");
+    if (result.decision === "allow") await expect(result.revalidate()).rejects.toThrow("Path target changed");
+  });
+  it("匹配项是指向区外的符号链接时放行（ls 只读链接本体）", async () => {
+    const external = await fs.mkdtemp(path.join(os.tmpdir(), "shana-bash-glob-external-"));
+    try {
+      await fs.symlink(external, path.join(root, "linked"), process.platform === "win32" ? "junction" : "dir");
+      expect((await analyze("ls *")).decision).toBe("allow");
+    } finally {
+      await fs.rm(external, { recursive: true, force: true });
+    }
   });
 });
 

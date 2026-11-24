@@ -969,8 +969,9 @@ it("keeps cancelled partial as a persisted aborted Turn with retry failures and 
     // 半截响应保留为持久化 aborted 项（cancelled streaming attempt 去重，不重复）。
     const partials = items.filter((item) => item.text === "partial answer");
     expect(partials).toHaveLength(1);
-    expect(partials[0]).toMatchObject({ role: "assistant", cancelled: true });
-    expect(items.some((item) => item.text === INTERRUPTED_RESPONSE_ANNOTATION)).toBe(true);
+    expect(partials[0]).toMatchObject({ role: "assistant", cancelled: true, failed: true });
+    expect(items.some((item) => item.text === INTERRUPTED_RESPONSE_ANNOTATION)).toBe(false);
+    expect(items.some((item) => item.text === "此轮未进入有效上下文")).toBe(true);
     expect(items.find((item) => item.text === "retry fragment")).toMatchObject({ failed: true });
     expect(items.filter((item) => item.text === "✗ 已取消")).toHaveLength(1);
     expect(items.find((item) => item.text === "✗ 已取消")).toMatchObject({ cancelled: true });

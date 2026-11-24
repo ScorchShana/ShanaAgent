@@ -21,7 +21,9 @@ const tools = visionRegistry
 
 function renderedPrompt(name: string): string {
   const raw = fs.readFileSync(path.join(PROMPTS_DIR, `${name}.md`), "utf8");
+  // 与 readPrompt 同款 CRLF 归一：确认稿的权威字节是 LF（autocrlf checkout 不改变语义）。
   return raw
+    .replaceAll("\r\n", "\n")
     .replaceAll("{editMaxFileBytes}", String(DEFAULT_EDIT_MAX_FILE_BYTES))
     .replaceAll("{viewImageMaxBytes}", String(DEFAULT_VIEW_IMAGE_MAX_BYTES));
 }

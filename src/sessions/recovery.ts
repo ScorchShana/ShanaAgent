@@ -50,6 +50,14 @@ export type ResponseExclusionReason = "truncated" | "incomplete_response";
 export function responseExclusionReason(assistant: AssistantMessageRecord): ResponseExclusionReason | null {
   if (assistant.message.stopReason === "length" && toolCallsOfMessage(assistant.message).length === 0)
     return "truncated";
+  // 零 call 的 aborted 轮没有可回放内容：pi-ai 会整条丢弃它，上下文里只剩孤立的中断标注。按 truncated
+  // 排除后取消 Run 归为"无可回放 Turn"，中断信号由下一条 Prompt 的渲染期前缀承载（§6）。
+  if (
+    assistant.message.stopReason === "aborted" &&
+    toolCallsOfMessage(normalizeAbortedMessage(assistant.message)).length === 0
+  ) {
+    return "truncated";
+  }
   if (
     assistant.message.stopReason !== "toolUse" &&
     assistant.message.stopReason !== "stop" &&
@@ -133,13 +141,20 @@ function assertCheckpointValid(records: readonly SessionRecord[], checkpoint: Ch
   );
 
   const eligible = new Set<number>();
+  // 可回放 = 完整且未被排除，与 planEffectiveContext 同判据：run_finished 只有在其 Run 无可回放 Turn 时
+  // 才是合法边界（planCompaction 对零 Turn 的 Run 会退到 run_finished）。可作审计边界与可回放是两件事——
+  // 边界轮自身不可回放不影响它界定覆盖范围，故 tool_result / assistant_message 两个边界分支仍用 eligible，
+  // 改动前写下的检查点（coveredUpTo 正落在被排除轮上）保持有效。
+  const replayable = new Set<number>();
   let blocked = false;
   for (const record of records) {
     if (record.recordSeq > coveredUpTo) break;
     if (record.type === "user_prompt") blocked = false;
     if (record.type !== "assistant_message") continue;
     if (!isTurnContextComplete(record, toolResults)) blocked = true;
-    if (!blocked) eligible.add(record.recordSeq);
+    if (blocked) continue;
+    eligible.add(record.recordSeq);
+    if (responseExclusionReason(record) === null) replayable.add(record.recordSeq);
   }
 
   if (boundary.type === "run_finished") {
@@ -148,7 +163,7 @@ function assertCheckpointValid(records: readonly SessionRecord[], checkpoint: Ch
     );
     if (
       prompt?.type === "user_prompt" && prompt.runId === boundary.runId &&
-      !assistants.some((record) => record.runId === boundary.runId && eligible.has(record.recordSeq)) &&
+      !assistants.some((record) => record.runId === boundary.runId && replayable.has(record.recordSeq)) &&
       !records.some((record) => record.recordSeq > coveredUpTo &&
         (record.type === "assistant_message" || record.type === "tool_result") && record.runId === boundary.runId)
     ) return;
